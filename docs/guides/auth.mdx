@@ -248,6 +248,76 @@ profiles above, or complete login through REST/RPC with explicit `realm_id`,
 `binding_id`, and `profile_id`. CLI login never populates a `prod` managed-store
 profile; the host/RPC/REST write paths require the true owner.
 
+### Copilot PATs in CI
+
+Fine-grained GitHub PATs use `github_copilot_pat`, not the managed OAuth
+exchange. The account must have Copilot access, and the PAT must have the
+account-level **Copilot Requests** permission. Classic PATs are not supported.
+
+Add these nonsecret declarations to `~/.rkat/config.toml`:
+
+```toml
+[realm.global.backend.copilot_ci]
+provider = "openai"
+backend_kind = "copilot"
+
+[realm.global.auth.copilot_ci]
+provider = "openai"
+auth_method = "github_copilot_pat"
+source = { kind = "env", env = "COPILOT_GITHUB_TOKEN" }
+
+[realm.global.binding.copilot_ci]
+backend_profile = "copilot_ci"
+auth_profile = "copilot_ci"
+default_model = "gpt-5.5"
+```
+
+Inject `COPILOT_GITHUB_TOKEN` through the CI secret store.
+Select the binding with `rkat run --auth-binding global:copilot_ci "Reply with OK"`.
+Choose a model available to the Copilot account.
+
+The PAT stays in process memory. This path requires no device login, saved
+OAuth credential, credential store, or OAuth token exchange.
+
+Meerkat first queries `https://api.github.com/copilot_internal/user` with the PAT.
+Account lookup must succeed before inference. Meerkat uses the account-advertised
+API base for model discovery, routing, and inference, without a hard-coded fallback.
+The API base must use HTTPS on `githubcopilot.com` or a subdomain, with port 443.
+User information, query strings, and fragments are not permitted.
+Credential-bearing requests never follow redirects.
+
+Meerkat sends the PAT directly and defaults to the `copilot-developer-cli`
+integration header. An explicit `integration_id` overrides this default.
+
+Model discovery is best-effort. An initial transient failure leaves model
+availability unknown. A transient refresh failure preserves the previous
+snapshot. Neither failure invalidates authentication.
+
+Successful snapshots refresh on demand after five minutes.
+A retry occurs on the next request after its deadline: 30 seconds by default,
+or `Retry-After`, capped at one hour. Concurrent requests share one discovery
+attempt instead of starting separate requests.
+
+PAT bindings require an environment source and omit `credential_account`.
+They do not share the managed `github_copilot` account or its OAuth lifecycle.
+Separate PAT bindings can use `provider = "anthropic"` or `provider = "gemini"`
+in both profiles, with a matching model.
+
+The usual environment-source rule applies: `RKAT_COPILOT_GITHUB_TOKEN` overrides
+`COPILOT_GITHUB_TOKEN`. This example does not fall back to `GH_TOKEN`,
+`GITHUB_TOKEN`, or a saved account. A missing, empty, expired, or rejected PAT
+fails the request. Meerkat does not refresh the PAT.
+An HTTP 401 or 403 from account lookup, model discovery, or inference requires
+reauthentication. Meerkat does not treat credential rejection as a transient
+model-discovery failure or fall back to another credential.
+
+To rotate the PAT, replace the CI secret and start a fresh process.
+For Docker, pass the environment variable into the container explicitly.
+Keep this credential separate from the GitHub Enterprise token for repository
+access and review comments. Do not write the PAT into config, image layers,
+command arguments, or logs. The provisional native-integration warning also
+applies to this path.
+
 ### Use the binding
 
 ```bash
