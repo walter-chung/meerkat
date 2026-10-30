@@ -440,6 +440,40 @@ impl ProviderErrorObject {
 }
 
 impl LlmError {
+    /// Redact decoded diagnostic fields without changing error classification.
+    pub fn redact_diagnostics(&mut self, mut redact: impl FnMut(&mut String)) {
+        match self {
+            Self::ServerError { message, .. }
+            | Self::InvalidRequest { message }
+            | Self::RequestTooLarge { message, .. }
+            | Self::InvalidInputShape { message }
+            | Self::InvalidConfig { message }
+            | Self::AuthenticationFailed { message }
+            | Self::AuthorizationRouteChanged { message }
+            | Self::QuotaExhausted { message }
+            | Self::Unknown { message }
+            | Self::StreamParseError { message }
+            | Self::IncompleteResponse { message } => redact(message),
+            Self::PolicyStop { code, message } => {
+                redact(code);
+                redact(message);
+            }
+            Self::ContentFiltered { reason } => redact(reason),
+            Self::ModelNotFound { model } => redact(model),
+            Self::OperationRefused { .. }
+            | Self::OperationObservationUnavailable
+            | Self::OperationAuthorizationUnavailable
+            | Self::OperationReviewRefused { .. }
+            | Self::RateLimited { .. }
+            | Self::ServerOverloaded
+            | Self::NetworkTimeout { .. }
+            | Self::ConnectionReset
+            | Self::ContextLengthExceeded { .. }
+            | Self::InvalidApiKey
+            | Self::ToolChoiceUnsupported { .. } => {}
+        }
+    }
+
     pub fn operation_refused(kind: meerkat_core::authorization::OperationRefusalKind) -> Self {
         Self::OperationRefused {
             refusal: meerkat_core::authorization::OperationRefused::new(kind),

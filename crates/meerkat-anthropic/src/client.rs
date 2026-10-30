@@ -1428,7 +1428,7 @@ impl AnthropicClient {
                         }
                     }
                 } else {
-                    request = request.header(name, value);
+                    request = request.header(name, http::sensitive_header_value(&value)?);
                 }
             }
             receipt
@@ -1460,6 +1460,16 @@ impl AnthropicClient {
                 LlmError::NetworkTimeout { duration_ms: 30000 }
             })
             .await?;
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(authorizer) = &self.authorizer {
+            authorizer
+                .observe_response_status(&meerkat_core::HttpAuthorizationResponse {
+                    method: "POST",
+                    url,
+                    status: response.status().as_u16(),
+                })
+                .map_err(LlmError::from_authorizer)?;
+        }
         Ok((response, receipt))
     }
 
@@ -1741,7 +1751,12 @@ impl AnthropicClient {
                 Ok(response.bytes_stream())
             } else {
                 let headers = response.headers().clone();
-                let text = response.text().await.unwrap_or_default();
+                #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+                let mut text = response.text().await.unwrap_or_default();
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(authorizer) = &self.authorizer {
+                    authorizer.redact_response_diagnostic(&mut text);
+                }
                 Err(
                     crate::request_support::provider_forced_tool_choice_rejection(
                         request,
@@ -2094,16 +2109,25 @@ impl AnthropicClient {
                         }
                         "error" => {
                             // Anthropic streaming error (e.g. overloaded_error mid-stream)
-                            let error_msg = $event.error
+                            #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+                            let mut error_msg = $event.error
                                 .as_ref()
                                 .and_then(|e| e.get("message"))
                                 .and_then(|m| m.as_str())
-                                .unwrap_or("unknown streaming error");
-                            let error_type = $event.error
+                                .unwrap_or("unknown streaming error").to_string();
+                            #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+                            let mut error_type = $event.error
                                 .as_ref()
                                 .and_then(|e| e.get("type"))
                                 .and_then(|t| t.as_str())
-                                .unwrap_or("unknown");
+                                .unwrap_or("unknown").to_string();
+                            #[cfg(not(target_arch = "wasm32"))]
+                            if let Some(authorizer) = &self.authorizer {
+                                authorizer.redact_response_diagnostic(&mut error_msg);
+                                authorizer.redact_response_diagnostic(&mut error_type);
+                            }
+                            let error_msg = error_msg.as_str();
+                            let error_type = error_type.as_str();
 
                             tracing::error!(
                                 error_type,
@@ -2190,6 +2214,16 @@ impl AnthropicClient {
                                     Ok(Some(event)) => { handle_event!(event); }
                                     Ok(None) => {}
                                     Err(error) => {
+                                        #[cfg(not(target_arch = "wasm32"))]
+                                        let error = {
+                                            let mut error = error;
+                                            if let LlmError::StreamParseError { message } = &mut error
+                                                && let Some(authorizer) = &self.authorizer
+                                            {
+                                                authorizer.redact_response_diagnostic(message);
+                                            }
+                                            error
+                                        };
                                         if !saw_done {
                                             chunk_yielded.set(true);
                                             yield LlmEvent::Done {
@@ -2252,7 +2286,10 @@ impl AnthropicClient {
 
         });
 
-        streaming::ensure_terminal_done(inner)
+        streaming::redact_stream_diagnostics(
+            streaming::ensure_terminal_done(inner),
+            self.authorizer.as_deref(),
+        )
     }
 }
 
@@ -4983,6 +5020,65 @@ mod tests {
         fn label(&self) -> &'static str {
             "anthropic-retry-test"
         }
+
+        fn redact_response_diagnostic(&self, diagnostic: &mut String) {
+            *diagnostic = diagnostic.replace("synthetic-pat-canary", "[redacted]");
+        }
+    }
+
+    #[tokio::test]
+    async fn protected_messages_error_redacts_echoed_credentials() {
+        for (status, body) in [
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"error":{"type":"api_error","message":"echoed synthetic-pat-canary"}}"#,
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                r#"{"error":{"code":"misalignment_policy_violation","message":"\u0073ynthetic-pat-canary"}}"#,
+            ),
+        ] {
+            let app =
+                Router::new().route("/v1/messages", post(move || async move { (status, body) }));
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let client = AnthropicClient::builder(String::new())
+                .base_url(base_url)
+                .authorizer(Arc::new(AnthropicRetryAuthorizer {
+                    authorizations: std::sync::atomic::AtomicUsize::new(0),
+                }))
+                .build()
+                .unwrap();
+            let request = LlmRequest::new(
+                "claude-sonnet-4-5",
+                vec![Message::User(UserMessage::text("hello"))],
+            );
+            let error = match client.stream(&request).next().await.unwrap() {
+                Err(error)
+                | Ok(LlmEvent::Done {
+                    outcome: LlmDoneOutcome::Error { error },
+                }) => error,
+                other => panic!("expected provider error, got {other:?}"),
+            };
+            server.abort();
+            if status == StatusCode::BAD_REQUEST {
+                assert!(matches!(&error, LlmError::PolicyStop { code, .. }
+                if code == "misalignment_policy_violation"));
+                assert!(!error.is_retryable());
+            } else {
+                assert!(matches!(error, LlmError::ServerError { status: 500, .. }));
+            }
+            assert!(
+                !format!(
+                    "{error} {error:?} {}",
+                    serde_json::to_string(&error).unwrap()
+                )
+                .contains("synthetic-pat-canary")
+            );
+        }
     }
 
     #[tokio::test]
@@ -5035,6 +5131,88 @@ mod tests {
             2
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn protected_messages_stream_error_redacts_echoed_credentials() {
+        let (base_url, server) = spawn_anthropic_stub_server(
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"synthetic-pat-canary\"}}\n\n".into(),
+        ).await;
+        let client = AnthropicClient::builder(String::new())
+            .base_url(base_url)
+            .authorizer(Arc::new(AnthropicRetryAuthorizer {
+                authorizations: std::sync::atomic::AtomicUsize::new(0),
+            }))
+            .build()
+            .unwrap();
+        let request = LlmRequest::new(
+            "claude-sonnet-4-5",
+            vec![Message::User(UserMessage::text("hello"))],
+        );
+        let events = client.stream(&request).collect::<Vec<_>>().await;
+        server.abort();
+        let error = events
+            .into_iter()
+            .find_map(|event| match event {
+                Err(error)
+                | Ok(LlmEvent::Done {
+                    outcome: LlmDoneOutcome::Error { error },
+                }) => Some(error),
+                _ => None,
+            })
+            .expect("stream contains a terminal error");
+        assert!(matches!(error, LlmError::ServerError { status: 500, .. }));
+        assert!(
+            !format!(
+                "{error} {error:?} {}",
+                serde_json::to_string(&error).unwrap()
+            )
+            .contains("synthetic-pat-canary")
+        );
+    }
+
+    #[tokio::test]
+    async fn protected_messages_terminal_diagnostics_are_redacted() {
+        for payload in [
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"synthetic-pat-canary\"}}\n\n",
+            concat!(
+                "data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"id\":\"synthetic-pat-canary\",\"name\":\"example\"}}\n\n",
+                "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"[\"}}\n\n",
+                "data: {\"type\":\"content_block_stop\"}\n\n",
+            ),
+        ] {
+            let (base_url, server) = spawn_anthropic_stub_server(payload.into()).await;
+            let client = AnthropicClient::builder(String::new())
+                .base_url(base_url)
+                .authorizer(Arc::new(AnthropicRetryAuthorizer {
+                    authorizations: std::sync::atomic::AtomicUsize::new(0),
+                }))
+                .build()
+                .unwrap();
+            let request = LlmRequest::new(
+                "claude-sonnet-4-5",
+                vec![Message::User(UserMessage::text("hello"))],
+            );
+            let events = client.stream(&request).collect::<Vec<_>>().await;
+            server.abort();
+            let error = events
+                .into_iter()
+                .find_map(|event| match event {
+                    Err(error)
+                    | Ok(LlmEvent::Done {
+                        outcome: LlmDoneOutcome::Error { error },
+                    }) => Some(error),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(
+                !format!(
+                    "{error} {error:?} {}",
+                    serde_json::to_string(&error).unwrap()
+                )
+                .contains("synthetic-pat-canary")
+            );
+        }
     }
 
     /// A base URL whose HTTP client could not be built fails each unchecked

@@ -4,6 +4,17 @@ use crate::error::LlmError;
 #[cfg(not(target_arch = "wasm32"))]
 use std::net::IpAddr;
 
+/// Preserve credential redaction when authorizer strings enter HTTP headers.
+pub fn sensitive_header_value(value: &str) -> Result<reqwest::header::HeaderValue, LlmError> {
+    let mut value = reqwest::header::HeaderValue::from_str(value).map_err(|_| {
+        LlmError::AuthenticationFailed {
+            message: "invalid authorization header value".to_string(),
+        }
+    })?;
+    value.set_sensitive(true);
+    Ok(value)
+}
+
 /// Execute the already-built immutable request at its actual HTTP boundary.
 /// Auth/header awaits belong before this call. Entry failure prevents sending;
 /// outcome failure appends one safe diagnostic and preserves the exact result.

@@ -697,7 +697,7 @@ impl OpenAiCompatibleClient {
                 .await
                 .map_err(LlmError::from_authorizer)?;
             for (name, value) in headers {
-                request = request.header(name, value);
+                request = request.header(name, http::sensitive_header_value(&value)?);
             }
             receipt
         } else {
@@ -833,6 +833,15 @@ impl OpenAiCompatibleClient {
             Self::map_send_error,
         )
         .await?;
+        if let Some(authorizer) = &self.authorizer {
+            authorizer
+                .observe_response_status(&meerkat_core::HttpAuthorizationResponse {
+                    method: "POST",
+                    url,
+                    status: response.status().as_u16(),
+                })
+                .map_err(LlmError::from_authorizer)?;
+        }
         Ok((response, receipt))
     }
 
@@ -880,7 +889,10 @@ impl OpenAiCompatibleClient {
                         }
                     }
                 });
-                streaming::ensure_terminal_done(inner)
+                streaming::redact_stream_diagnostics(
+                    streaming::ensure_terminal_done(inner),
+                    self.authorizer.as_deref(),
+                )
             }
             OpenAiCompatibleMode::ChatCompletions => {
                 let inner: LlmStream<'a> = Box::pin(async_stream::try_stream! {
@@ -941,7 +953,10 @@ impl OpenAiCompatibleClient {
                         Ok(response.bytes_stream())
                     } else {
                         let headers = response.headers().clone();
-                        let text = response.text().await.unwrap_or_default();
+                        let mut text = response.text().await.unwrap_or_default();
+                        if let Some(authorizer) = &self.authorizer {
+                            authorizer.redact_response_diagnostic(&mut text);
+                        }
                         Err(LlmError::from_http_response(status_code, text, &headers))
                     };
                     let mut stream = stream_result?;
@@ -1074,7 +1089,14 @@ impl OpenAiCompatibleClient {
                             let parsed = match parsed {
                                 Ok(parsed) => parsed,
                                 Err(_) if latched_stop.is_some() => break 'consume,
-                                Err(err) => Err(err)?,
+                                Err(mut err) => {
+                                    if let LlmError::StreamParseError { message } = &mut err
+                                        && let Some(authorizer) = &self.authorizer
+                                    {
+                                        authorizer.redact_response_diagnostic(message);
+                                    }
+                                    Err(err)?
+                                },
                             };
                             let event = match parsed {
                                 ChatCompletionsLine::Ignored => continue,
@@ -1087,9 +1109,12 @@ impl OpenAiCompatibleClient {
                                 // landed, so a late server error - an engine
                                 // tearing down after completing the request -
                                 // invalidates nothing and ends the stream.
-                                ChatCompletionsLine::ServerError { message } => {
+                                ChatCompletionsLine::ServerError { mut message } => {
                                     if latched_stop.is_some() {
                                         break 'consume;
+                                    }
+                                    if let Some(authorizer) = &self.authorizer {
+                                        authorizer.redact_response_diagnostic(&mut message);
                                     }
                                     Err(LlmError::StreamParseError {
                                         message: format!("provider error event: {message}"),
@@ -1322,7 +1347,10 @@ impl OpenAiCompatibleClient {
                     };
                 });
 
-                streaming::ensure_terminal_done(inner)
+                streaming::redact_stream_diagnostics(
+                    streaming::ensure_terminal_done(inner),
+                    self.authorizer.as_deref(),
+                )
             }
         }
     }
@@ -1432,23 +1460,44 @@ impl LlmClient for OpenAiCompatibleClient {
     }
 
     async fn health_check(&self) -> Result<(), LlmError> {
-        let url = format!("{}/models", self.base_url);
-        let response = self
-            .apply_dynamic_auth(self.http()?.get(&url), "GET", &url, "application/json")
-            .await?
-            .send()
-            .await
-            .map_err(|e| LlmError::Unknown {
-                message: e.to_string(),
-            })?;
-        let status = response.status().as_u16();
-        if (200..=299).contains(&status) {
-            Ok(())
-        } else {
-            let headers = response.headers().clone();
-            let text = response.text().await.unwrap_or_default();
-            Err(LlmError::from_http_response(status, text, &headers))
+        let result = async {
+            let url = format!("{}/models", self.base_url);
+            let response = self
+                .apply_dynamic_auth(self.http()?.get(&url), "GET", &url, "application/json")
+                .await?
+                .send()
+                .await
+                .map_err(|e| LlmError::Unknown {
+                    message: e.to_string(),
+                })?;
+            let status = response.status().as_u16();
+            if let Some(authorizer) = &self.authorizer {
+                authorizer
+                    .observe_response_status(&meerkat_core::HttpAuthorizationResponse {
+                        method: "GET",
+                        url: &url,
+                        status,
+                    })
+                    .map_err(LlmError::from_authorizer)?;
+            }
+            if (200..=299).contains(&status) {
+                Ok(())
+            } else {
+                let headers = response.headers().clone();
+                let mut text = response.text().await.unwrap_or_default();
+                if let Some(authorizer) = &self.authorizer {
+                    authorizer.redact_response_diagnostic(&mut text);
+                }
+                Err(LlmError::from_http_response(status, text, &headers))
+            }
         }
+        .await;
+        result.map_err(|mut error| {
+            if let Some(authorizer) = &self.authorizer {
+                error.redact_diagnostics(|message| authorizer.redact_response_diagnostic(message));
+            }
+            error
+        })
     }
 
     fn compile_schema(&self, output_schema: &OutputSchema) -> Result<CompiledSchema, SchemaError> {
@@ -2114,6 +2163,70 @@ mod tests {
         fn label(&self) -> &'static str {
             "chat-retry-test"
         }
+
+        fn redact_response_diagnostic(&self, diagnostic: &mut String) {
+            *diagnostic = diagnostic.replace("synthetic-pat-canary", "[redacted]");
+        }
+    }
+
+    #[tokio::test]
+    async fn protected_chat_error_redacts_echoed_credentials() {
+        for (status, body) in [
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"error":{"message":"echoed synthetic-pat-canary"}}"#,
+            ),
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                r#"{"error":{"code":"misalignment_policy_violation","message":"\u0073ynthetic-pat-canary"}}"#,
+            ),
+        ] {
+            let app = Router::new().route(
+                "/chat/completions",
+                post(move || async move { (status, body) }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let client = OpenAiCompatibleClient::new_with_options(
+                OpenAiCompatibleMode::ChatCompletions,
+                "remote-model".into(),
+                base_url,
+                None,
+                options(true, true, true, true),
+            )
+            .with_authorizer(Arc::new(ChatRetryAuthorizer {
+                authorizations: std::sync::atomic::AtomicUsize::new(0),
+            }));
+            let request = LlmRequest::new(
+                "catalog-model",
+                vec![Message::User(UserMessage::text("hello"))],
+            );
+            let error = match client.stream(&request).next().await.unwrap() {
+                Err(error)
+                | Ok(LlmEvent::Done {
+                    outcome: LlmDoneOutcome::Error { error },
+                }) => error,
+                other => panic!("expected provider error, got {other:?}"),
+            };
+            server.abort();
+            if status == axum::http::StatusCode::BAD_REQUEST {
+                assert!(matches!(&error, LlmError::PolicyStop { code, .. }
+                if code == "misalignment_policy_violation"));
+                assert!(!error.is_retryable());
+            } else {
+                assert!(matches!(error, LlmError::ServerError { status: 500, .. }));
+            }
+            assert!(
+                !format!(
+                    "{error} {error:?} {}",
+                    serde_json::to_string(&error).unwrap()
+                )
+                .contains("synthetic-pat-canary")
+            );
+        }
     }
 
     #[tokio::test]
@@ -2158,6 +2271,220 @@ mod tests {
             2
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn protected_chat_stream_error_redacts_echoed_credentials() {
+        let (base_url, server) = spawn_chat_stub_server(
+            "data: {\"error\":{\"message\":\"synthetic-pat-canary\"}}\n\n".into(),
+        )
+        .await;
+        let client = OpenAiCompatibleClient::new_with_options(
+            OpenAiCompatibleMode::ChatCompletions,
+            "remote-model".into(),
+            base_url,
+            None,
+            options(true, true, true, true),
+        )
+        .with_authorizer(Arc::new(ChatRetryAuthorizer {
+            authorizations: std::sync::atomic::AtomicUsize::new(0),
+        }));
+        let request = LlmRequest::new(
+            "catalog-model",
+            vec![Message::User(UserMessage::text("hello"))],
+        );
+        let events = client.stream(&request).collect::<Vec<_>>().await;
+        server.abort();
+        let error = events
+            .into_iter()
+            .find_map(|event| match event {
+                Err(error)
+                | Ok(LlmEvent::Done {
+                    outcome: LlmDoneOutcome::Error { error },
+                }) => Some(error),
+                _ => None,
+            })
+            .expect("stream contains a terminal error");
+        assert!(matches!(error, LlmError::StreamParseError { .. }));
+        assert!(
+            !format!(
+                "{error} {error:?} {}",
+                serde_json::to_string(&error).unwrap()
+            )
+            .contains("synthetic-pat-canary")
+        );
+    }
+
+    #[tokio::test]
+    async fn protected_chat_terminal_diagnostics_are_redacted() {
+        for payload in [
+            "data: {\"error\":{\"message\":\"synthetic-pat-canary",
+            "data: {\"choices\":[{\"finish_reason\":\"synthetic-pat-canary\"}]}\n\n",
+        ] {
+            let (base_url, server) = spawn_chat_stub_server(payload.into()).await;
+            let client = OpenAiCompatibleClient::new_with_options(
+                OpenAiCompatibleMode::ChatCompletions,
+                "remote-model".into(),
+                base_url,
+                None,
+                options(true, true, true, true),
+            )
+            .with_authorizer(Arc::new(ChatRetryAuthorizer {
+                authorizations: std::sync::atomic::AtomicUsize::new(0),
+            }));
+            let request = LlmRequest::new(
+                "catalog-model",
+                vec![Message::User(UserMessage::text("hello"))],
+            );
+            let events = client.stream(&request).collect::<Vec<_>>().await;
+            server.abort();
+            let error = events
+                .into_iter()
+                .find_map(|event| match event {
+                    Err(error)
+                    | Ok(LlmEvent::Done {
+                        outcome: LlmDoneOutcome::Error { error },
+                    }) => Some(error),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(matches!(&error, LlmError::IncompleteResponse { .. }));
+            assert!(
+                !format!(
+                    "{error} {error:?} {}",
+                    serde_json::to_string(&error).unwrap()
+                )
+                .contains("synthetic-pat-canary")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn protected_chat_health_transport_diagnostics_are_redacted() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!(
+            "http://{}/synthetic-pat-canary",
+            listener.local_addr().unwrap()
+        );
+        let mut client = OpenAiCompatibleClient::new_with_options(
+            OpenAiCompatibleMode::ChatCompletions,
+            "remote-model".into(),
+            base_url,
+            None,
+            options(true, true, true, true),
+        );
+        client.http = Ok(reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_millis(100))
+            .build()
+            .unwrap());
+        let unprotected = client.health_check().await.unwrap_err();
+        assert!(matches!(&unprotected, LlmError::Unknown { .. }));
+        assert!(unprotected.to_string().contains("synthetic-pat-canary"));
+        let client = client.with_authorizer(Arc::new(ChatRetryAuthorizer {
+            authorizations: std::sync::atomic::AtomicUsize::new(0),
+        }));
+        let error = client.health_check().await.unwrap_err();
+        assert!(matches!(&error, LlmError::Unknown { .. }));
+        assert!(
+            !format!(
+                "{error} {error:?} {}",
+                serde_json::to_string(&error).unwrap()
+            )
+            .contains("synthetic-pat-canary")
+        );
+    }
+
+    #[tokio::test]
+    async fn protected_chat_health_observes_status_and_redacts_errors() {
+        struct HealthAuthorizer(std::sync::atomic::AtomicU16);
+        #[async_trait::async_trait]
+        impl HttpAuthorizer for HealthAuthorizer {
+            async fn authorize(
+                &self,
+                _: &mut HttpAuthorizationRequest<'_>,
+            ) -> Result<(), meerkat_core::AuthError> {
+                Ok(())
+            }
+            fn observe_response_status(
+                &self,
+                response: &meerkat_core::HttpAuthorizationResponse<'_>,
+            ) -> Result<(), meerkat_core::AuthError> {
+                self.0
+                    .store(response.status, std::sync::atomic::Ordering::SeqCst);
+                if matches!(response.status, 401 | 403) {
+                    return Err(meerkat_core::AuthError::UserReauthRequired);
+                }
+                Ok(())
+            }
+            fn redact_response_diagnostic(&self, diagnostic: &mut String) {
+                *diagnostic = diagnostic.replace("synthetic-pat-canary", "[redacted]");
+            }
+            fn label(&self) -> &'static str {
+                "health-test"
+            }
+        }
+        for status in [
+            axum::http::StatusCode::OK,
+            axum::http::StatusCode::UNAUTHORIZED,
+            axum::http::StatusCode::FORBIDDEN,
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            let app = Router::new().route(
+                "/models",
+                axum::routing::get(move || async move {
+                    let body = if matches!(status.as_u16(), 401 | 403) {
+                        axum::body::Body::from_stream(
+                            futures::stream::pending::<Result<String, std::convert::Infallible>>(),
+                        )
+                    } else if status == axum::http::StatusCode::BAD_REQUEST {
+                        axum::body::Body::from(
+                            r#"{"error":{"code":"misalignment_policy_violation","message":"\u0073ynthetic-pat-canary"}}"#,
+                        )
+                    } else {
+                        axum::body::Body::from("synthetic-pat-canary")
+                    };
+                    (status, body)
+                }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let authorizer = Arc::new(HealthAuthorizer(std::sync::atomic::AtomicU16::new(0)));
+            let client = OpenAiCompatibleClient::new_with_options(
+                OpenAiCompatibleMode::ChatCompletions,
+                "remote-model".into(),
+                base_url,
+                None,
+                options(true, true, true, true),
+            )
+            .with_authorizer(authorizer.clone());
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(1), client.health_check())
+                    .await;
+            server.abort();
+            let result = result.expect("status observation must not wait for a rejection body");
+            assert_eq!(
+                authorizer.0.load(std::sync::atomic::Ordering::SeqCst),
+                status.as_u16()
+            );
+            if status.is_success() {
+                result.unwrap();
+                continue;
+            }
+            let error = result.unwrap_err();
+            assert!(!format!("{error} {error:?}").contains("synthetic-pat-canary"));
+            if status == axum::http::StatusCode::INTERNAL_SERVER_ERROR {
+                assert!(matches!(error, LlmError::ServerError { status: 500, .. }));
+            } else if status == axum::http::StatusCode::BAD_REQUEST {
+                assert!(matches!(&error, LlmError::PolicyStop { code, .. }
+                    if code == "misalignment_policy_violation"));
+                assert!(!error.is_retryable());
+            } else {
+                assert!(matches!(error, LlmError::AuthenticationFailed { .. }));
+            }
+        }
     }
 
     /// What the raw stub does after the scripted head bytes are on the wire.

@@ -2,6 +2,28 @@ use crate::error::LlmError;
 use crate::types::{LlmDoneOutcome, LlmEvent, LlmStream};
 use futures::StreamExt;
 
+/// Protect diagnostics after decoding, leaving successful content untouched.
+pub fn redact_stream_diagnostics<'a>(
+    stream: LlmStream<'a>,
+    authorizer: Option<&'a dyn meerkat_core::HttpAuthorizer>,
+) -> LlmStream<'a> {
+    let Some(authorizer) = authorizer else {
+        return stream;
+    };
+    Box::pin(stream.map(move |mut item| {
+        match &mut item {
+            Err(error)
+            | Ok(LlmEvent::Done {
+                outcome: LlmDoneOutcome::Error { error },
+            }) => {
+                error.redact_diagnostics(|message| authorizer.redact_response_diagnostic(message));
+            }
+            Ok(_) => {}
+        }
+        item
+    }))
+}
+
 pub fn ensure_terminal_done(mut stream: LlmStream<'_>) -> LlmStream<'_> {
     Box::pin(async_stream::stream! {
         while let Some(item) = stream.next().await {
@@ -118,6 +140,59 @@ mod utf8_line_tests {
     use super::*;
 
     const TEXT: &str = "data: don\u{2019}t panic \u{1F642}\n\ndata: next\n";
+
+    #[tokio::test]
+    async fn diagnostic_redaction_preserves_successful_content_and_error_class() {
+        struct Redactor;
+        #[async_trait::async_trait]
+        impl meerkat_core::HttpAuthorizer for Redactor {
+            async fn authorize(
+                &self,
+                _: &mut meerkat_core::HttpAuthorizationRequest<'_>,
+            ) -> Result<(), meerkat_core::AuthError> {
+                Ok(())
+            }
+            fn redact_response_diagnostic(&self, message: &mut String) {
+                *message = message.replace("synthetic-canary", "[redacted]");
+            }
+            fn label(&self) -> &'static str {
+                "redaction-test"
+            }
+        }
+        let content = LlmEvent::ToolCallComplete {
+            id: "synthetic-canary".into(),
+            name: "example".into(),
+            args: serde_json::json!({"value": "synthetic-canary"}),
+            meta: None,
+        };
+        for authorizer in [None, Some(&Redactor as &dyn meerkat_core::HttpAuthorizer)] {
+            let input = futures::stream::iter([
+                Ok(LlmEvent::TextDelta {
+                    delta: "synthetic-canary".into(),
+                    meta: None,
+                }),
+                Ok(content.clone()),
+                Err(LlmError::PolicyStop {
+                    code: "misalignment_policy_violation".into(),
+                    message: "synthetic-canary".into(),
+                }),
+            ]);
+            let events =
+                redact_stream_diagnostics(ensure_terminal_done(Box::pin(input)), authorizer)
+                    .collect::<Vec<_>>()
+                    .await;
+            assert!(matches!(&events[0], Ok(LlmEvent::TextDelta { delta, .. })
+                if delta == "synthetic-canary"));
+            assert_eq!(
+                serde_json::to_value(events[1].as_ref().unwrap()).unwrap(),
+                serde_json::to_value(&content).unwrap()
+            );
+            assert!(matches!(&events[2], Ok(LlmEvent::Done {
+                outcome: LlmDoneOutcome::Error { error: LlmError::PolicyStop { code, message } },
+            }) if code == "misalignment_policy_violation"
+                && message == if authorizer.is_some() { "[redacted]" } else { "synthetic-canary" }));
+        }
+    }
 
     /// Lines come out whole and exact however the bytes were chunked, a
     /// chunk boundary inside a character included.

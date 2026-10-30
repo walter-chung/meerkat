@@ -1072,7 +1072,8 @@ impl OpenAiClient {
                 .await
                 .map_err(LlmError::from_authorizer)?;
             for (name, value) in extra {
-                request_builder = request_builder.header(name, value);
+                request_builder =
+                    request_builder.header(name, http::sensitive_header_value(&value)?);
             }
             receipt
         } else if let Some(api_key) = &self.api_key {
@@ -1600,6 +1601,15 @@ impl OpenAiClient {
                 }
             })
             .await?;
+        if let Some(authorizer) = &self.authorizer {
+            authorizer
+                .observe_response_status(&meerkat_core::HttpAuthorizationResponse {
+                    method: "POST",
+                    url: endpoint,
+                    status: response.status().as_u16(),
+                })
+                .map_err(LlmError::from_authorizer)?;
+        }
         Ok((response, receipt))
     }
 
@@ -1624,13 +1634,20 @@ impl OpenAiClient {
                 return Ok(response);
             }
             let headers = response.headers().clone();
-            let text = response
+            let mut text = response
                 .text()
                 .await
                 .map_err(|error| LlmError::StreamParseError {
                     message: format!("cannot read Responses rejection body: {error}"),
                 })?;
-            let rejection = LlmError::from_http_response(status, text.clone(), &headers);
+            if let Some(authorizer) = &self.authorizer {
+                authorizer.redact_response_diagnostic(&mut text);
+            }
+            let rejection = self.redact_terminal_error(LlmError::from_http_response(
+                status,
+                text.clone(),
+                &headers,
+            ));
             // A policy stop must reach the recovery owner before auth refresh
             // or stateless continuation fallback can issue another request.
             if matches!(rejection, LlmError::PolicyStop { .. }) {
@@ -2085,12 +2102,14 @@ impl OpenAiClient {
         Ok((items, instructions, authored_boundaries))
     }
 
-    /// Parse an SSE event from the Responses API stream.
-    ///
-    /// Returns `Ok(None)` when the line is not a `data:` event or is the
-    /// `[DONE]` sentinel, and `Err(LlmError::StreamParseError)` when it IS a
-    /// real `data:` event whose JSON fails to parse — a malformed-but-present
-    /// event is a typed fault, not a silently skippable non-event.
+    fn redact_terminal_error(&self, mut error: LlmError) -> LlmError {
+        if let Some(authorizer) = &self.authorizer {
+            error.redact_diagnostics(|message| authorizer.redact_response_diagnostic(message));
+        }
+        error
+    }
+
+    /// Parse an SSE event, rejecting malformed JSON in real data events.
     fn parse_responses_sse_line(line: &str) -> Result<Option<ResponsesStreamEvent>, LlmError> {
         let Some(data) = line
             .strip_prefix("data: ")
@@ -2856,7 +2875,8 @@ impl OpenAiClient {
                     }
                     let should_process = !line.is_empty() && !line.starts_with(':');
                     let parsed_event = if should_process {
-                        Self::parse_responses_sse_line(line)?
+                        Self::parse_responses_sse_line(line)
+                            .map_err(|error| self.redact_terminal_error(error))?
                     } else {
                         None
                     };
@@ -2897,7 +2917,9 @@ impl OpenAiClient {
                                     done_emitted = true;
                                     chunk_yielded.set(true);
                                     yield LlmEvent::Done {
-                                        outcome: LlmDoneOutcome::Error { error },
+                                        outcome: LlmDoneOutcome::Error {
+                                            error: self.redact_terminal_error(error),
+                                        },
                                     };
                                     continue;
                                 }
@@ -3068,7 +3090,11 @@ impl OpenAiClient {
                                                         continue;
                                                     }
                                                     let Some(name) = item.get("name").and_then(|n| n.as_str()) else {
-                                                        tracing::warn!(call_id, "function_call missing name");
+                                                        let mut diagnostic_id = call_id.to_string();
+                                                        if let Some(authorizer) = &self.authorizer {
+                                                            authorizer.redact_response_diagnostic(&mut diagnostic_id);
+                                                        }
+                                                        tracing::warn!(call_id = diagnostic_id, "function_call missing name");
                                                         continue;
                                                     };
                                                     // arguments is a JSON string. Missing arguments
@@ -3132,13 +3158,17 @@ impl OpenAiClient {
 
                                 done_emitted = true;
                                 chunk_yielded.set(true);
-                                yield LlmEvent::Done {
-                                    outcome: responses_terminal_outcome(
-                                        &event.event_type,
-                                        response_obj,
-                                        &streamed_refusal,
-                                    ),
+                                let outcome = match responses_terminal_outcome(
+                                    &event.event_type,
+                                    response_obj,
+                                    &streamed_refusal,
+                                ) {
+                                    LlmDoneOutcome::Error { error } => LlmDoneOutcome::Error {
+                                        error: self.redact_terminal_error(error),
+                                    },
+                                    outcome => outcome,
                                 };
+                                yield LlmEvent::Done { outcome };
                             }
                         }
                         // Handle streaming delta events
@@ -3335,7 +3365,11 @@ impl OpenAiClient {
                                     continue;
                                 }
                                 let Some(name) = item.get("name").and_then(Value::as_str) else {
-                                    tracing::warn!(call_id, "function_call output item missing name");
+                                    let mut diagnostic_id = call_id.to_string();
+                                    if let Some(authorizer) = &self.authorizer {
+                                        authorizer.redact_response_diagnostic(&mut diagnostic_id);
+                                    }
+                                    tracing::warn!(call_id = diagnostic_id, "function_call output item missing name");
                                     continue;
                                 };
                                 let (_, args_value) = match item
@@ -3442,7 +3476,7 @@ impl OpenAiClient {
                             };
                         }
                         else if event.event_type == "response.failed" {
-                            let error_msg = event.response
+                            let mut error_msg = event.response
                                 .as_ref()
                                 .and_then(responses_error_object)
                                 .and_then(|e| e.get("message"))
@@ -3453,13 +3487,19 @@ impl OpenAiClient {
                                     .and_then(|d| d.get("error"))
                                     .and_then(|e| e.get("message"))
                                     .and_then(|m| m.as_str()))
-                                .unwrap_or("response failed");
-                            let error_code = event.response
+                                .unwrap_or("response failed").to_string();
+                            let mut error_code = event.response
                                 .as_ref()
                                 .and_then(responses_error_object)
                                 .and_then(|e| e.get("code"))
                                 .and_then(|c| c.as_str())
-                                .unwrap_or("server_error");
+                                .unwrap_or("server_error").to_string();
+                            if let Some(authorizer) = &self.authorizer {
+                                authorizer.redact_response_diagnostic(&mut error_msg);
+                                authorizer.redact_response_diagnostic(&mut error_code);
+                            }
+                            let error_msg = error_msg.as_str();
+                            let error_code = error_code.as_str();
 
                             tracing::error!(
                                 code = error_code,
@@ -3477,18 +3517,24 @@ impl OpenAiClient {
                         }
                         else if event.event_type == "error" {
                             // Streaming error event from OpenAI
-                            let error_msg = event.error
+                            let mut error_msg = event.error
                                 .as_ref()
                                 .and_then(|e| e.get("message"))
                                 .and_then(|m| m.as_str())
                                 .or(event.message.as_deref())
-                                .unwrap_or("unknown streaming error");
-                            let error_code = event.error
+                                .unwrap_or("unknown streaming error").to_string();
+                            let mut error_code = event.error
                                 .as_ref()
                                 .and_then(|e| e.get("code"))
                                 .and_then(|c| c.as_str())
                                 .or(event.code.as_deref())
-                                .unwrap_or("unknown");
+                                .unwrap_or("unknown").to_string();
+                            if let Some(authorizer) = &self.authorizer {
+                                authorizer.redact_response_diagnostic(&mut error_msg);
+                                authorizer.redact_response_diagnostic(&mut error_code);
+                            }
+                            let error_msg = error_msg.as_str();
+                            let error_code = error_code.as_str();
 
                             tracing::error!(
                                 code = error_code,
@@ -3516,7 +3562,10 @@ impl OpenAiClient {
             }
         });
 
-        streaming::ensure_terminal_done(inner)
+        streaming::redact_stream_diagnostics(
+            streaming::ensure_terminal_done(inner),
+            self.authorizer.as_deref(),
+        )
     }
 }
 
@@ -4897,6 +4946,184 @@ mod tests {
         server.abort();
     }
 
+    struct ProtectedAuthorizer;
+
+    #[async_trait::async_trait]
+    impl meerkat_core::HttpAuthorizer for ProtectedAuthorizer {
+        async fn authorize(
+            &self,
+            request: &mut meerkat_core::HttpAuthorizationRequest<'_>,
+        ) -> Result<(), meerkat_core::AuthError> {
+            request
+                .headers
+                .push(("Authorization".into(), "Bearer synthetic-pat-canary".into()));
+            Ok(())
+        }
+
+        fn observe_response_status(
+            &self,
+            response: &meerkat_core::HttpAuthorizationResponse<'_>,
+        ) -> Result<(), meerkat_core::AuthError> {
+            if matches!(response.status, 401 | 403) {
+                Err(meerkat_core::AuthError::UserReauthRequired)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn redact_response_diagnostic(&self, diagnostic: &mut String) {
+            *diagnostic = diagnostic.replace("synthetic-pat-canary", "[redacted]");
+        }
+
+        fn label(&self) -> &'static str {
+            "protected-test"
+        }
+    }
+
+    #[tokio::test]
+    async fn protected_authorization_headers_remain_sensitive() {
+        let client =
+            OpenAiClient::new("unused".into()).with_authorizer(Arc::new(ProtectedAuthorizer));
+        let endpoint = client.responses_endpoint();
+        let (builder, _) = client
+            .apply_request_headers_with_receipt(
+                reqwest::Client::new().post(&endpoint),
+                &endpoint,
+                &[],
+            )
+            .await
+            .unwrap();
+        let request = builder.build().unwrap();
+        assert_eq!(
+            request.headers()["authorization"],
+            "Bearer synthetic-pat-canary"
+        );
+        assert!(request.headers()["authorization"].is_sensitive());
+        assert!(!format!("{request:?}").contains("synthetic-pat-canary"));
+    }
+
+    #[tokio::test]
+    async fn protected_responses_reject_before_body_read_or_policy_handling() {
+        for (status, broken_body) in [
+            (StatusCode::UNAUTHORIZED, true),
+            (StatusCode::FORBIDDEN, false),
+        ] {
+            let app = Router::new().route("/v1/responses", post(move || async move {
+                let body = if broken_body {
+                    axum::body::Body::from_stream(async_stream::stream! {
+                        yield Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"{"));
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        yield Err(std::io::Error::other("broken body"));
+                    })
+                } else {
+                    axum::body::Body::from(
+                        r#"{"error":{"code":"misalignment_policy_violation","message":"synthetic-pat-canary"}}"#
+                    )
+                };
+                (status, body)
+            }));
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let client = OpenAiClient::new_with_base_url("unused".into(), base_url)
+                .with_authorizer(Arc::new(ProtectedAuthorizer));
+            let error = client
+                .responses_response_with_fallback(
+                    &client.responses_endpoint(),
+                    &serde_json::json!({}),
+                    None,
+                    false,
+                    None,
+                    &mut Vec::new(),
+                )
+                .await
+                .unwrap_err();
+            server.abort();
+            assert!(
+                matches!(error, LlmError::AuthenticationFailed { .. }),
+                "{error:?}"
+            );
+            assert!(!format!("{error} {error:?}").contains("synthetic-pat-canary"));
+        }
+    }
+
+    #[tokio::test]
+    async fn protected_responses_redact_echoed_credentials_without_changing_error_class() {
+        let app = Router::new().route(
+            "/v1/responses",
+            post(|| async {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    r#"{"error":{"message":"echoed synthetic-pat-canary"}}"#,
+                )
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = OpenAiClient::new_with_base_url("unused".into(), base_url)
+            .with_authorizer(Arc::new(ProtectedAuthorizer));
+        let error = client
+            .responses_response_with_fallback(
+                &client.responses_endpoint(),
+                &serde_json::json!({}),
+                None,
+                false,
+                None,
+                &mut Vec::new(),
+            )
+            .await
+            .unwrap_err();
+        server.abort();
+        assert!(matches!(error, LlmError::ServerError { status: 500, .. }));
+        assert!(
+            !format!(
+                "{error} {error:?} {}",
+                serde_json::to_string(&error).unwrap()
+            )
+            .contains("synthetic-pat-canary")
+        );
+    }
+
+    #[tokio::test]
+    async fn protected_responses_redact_decoded_policy_errors() {
+        let app = Router::new().route("/v1/responses", post(|| async {
+            (StatusCode::BAD_REQUEST,
+             r#"{"error":{"code":"misalignment_policy_violation","message":"\u0073ynthetic-pat-canary"}}"#)
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = OpenAiClient::new_with_base_url("unused".into(), base_url)
+            .with_authorizer(Arc::new(ProtectedAuthorizer));
+        let error = client
+            .responses_response_with_fallback(
+                &client.responses_endpoint(),
+                &serde_json::json!({}),
+                None,
+                false,
+                None,
+                &mut Vec::new(),
+            )
+            .await
+            .unwrap_err();
+        server.abort();
+        assert!(matches!(&error, LlmError::PolicyStop { code, .. }
+            if code == "misalignment_policy_violation"));
+        assert!(!error.is_retryable());
+        assert!(
+            !format!(
+                "{error} {error:?} {}",
+                serde_json::to_string(&error).unwrap()
+            )
+            .contains("synthetic-pat-canary")
+        );
+    }
+
     #[tokio::test]
     async fn responses_never_retries_unauthorized_more_than_once() {
         let (base_url, calls, server) = spawn_auth_retry_server(true).await;
@@ -4926,6 +5153,59 @@ mod tests {
             2
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn protected_responses_stream_errors_redact_echoed_credentials() {
+        for event in [
+            serde_json::json!({"type":"response.output_item.added","item":{"type":"synthetic-pat-canary"}}),
+            serde_json::json!({"type":"response.function_call_arguments.done",
+                "call_id":"synthetic-pat-canary","arguments":"[]"}),
+            serde_json::json!({"type":"error","code":"server_error","message":"synthetic-pat-canary"}),
+            serde_json::json!({"type":"response.failed","response":{"error":{
+                "code":"server_error","message":"synthetic-pat-canary"
+            }}}),
+            serde_json::json!({"type":"error","output_index":"synthetic-pat-canary"}),
+            serde_json::json!({"type":"response.incomplete","response":{
+                "status":"incomplete","error":{"code":"misalignment_policy_violation",
+                "message":"synthetic-pat-canary"}
+            }}),
+            serde_json::json!({"type":"response.completed","response":{
+                "status":"synthetic-pat-canary"
+            }}),
+            serde_json::json!({"type":"response.incomplete","response":{
+                "status":"incomplete","incomplete_details":{"reason":"synthetic-pat-canary"}
+            }}),
+        ] {
+            let (base_url, server) = spawn_openai_stub_server(format!("data: {event}\n\n")).await;
+            let client = OpenAiClient::new_with_base_url("unused".into(), base_url)
+                .with_authorizer(Arc::new(ProtectedAuthorizer));
+            let request =
+                LlmRequest::new("gpt-5.4", vec![Message::User(UserMessage::text("hello"))]);
+            let events = client.stream(&request).collect::<Vec<_>>().await;
+            server.abort();
+            let error = events
+                .into_iter()
+                .find_map(|event| match event {
+                    Err(error)
+                    | Ok(LlmEvent::Done {
+                        outcome: LlmDoneOutcome::Error { error },
+                    }) => Some(error),
+                    _ => None,
+                })
+                .expect("stream contains a terminal error");
+            if event["response"]["error"]["code"] == "misalignment_policy_violation" {
+                assert!(matches!(&error, LlmError::PolicyStop { code, .. }
+                    if code == "misalignment_policy_violation"));
+            }
+            assert!(
+                !format!(
+                    "{error} {error:?} {}",
+                    serde_json::to_string(&error).unwrap()
+                )
+                .contains("synthetic-pat-canary")
+            );
+        }
     }
 
     #[tokio::test]
