@@ -20,6 +20,7 @@ pub enum OpenAiAuthMethod {
     ExternalChatGptTokens,
     ExternalAuthorizer,
     GitHubCopilotOauth,
+    GitHubCopilotPat,
 }
 
 impl OpenAiAuthMethod {
@@ -31,6 +32,7 @@ impl OpenAiAuthMethod {
         Self::ExternalChatGptTokens,
         Self::ExternalAuthorizer,
         Self::GitHubCopilotOauth,
+        Self::GitHubCopilotPat,
     ];
 
     pub fn parse(raw: &str) -> Option<Self> {
@@ -42,6 +44,7 @@ impl OpenAiAuthMethod {
             "external_chatgpt_tokens" => Some(Self::ExternalChatGptTokens),
             "external_authorizer" => Some(Self::ExternalAuthorizer),
             "github_copilot_oauth" => Some(Self::GitHubCopilotOauth),
+            "github_copilot_pat" => Some(Self::GitHubCopilotPat),
             _ => None,
         }
     }
@@ -55,6 +58,7 @@ impl OpenAiAuthMethod {
             Self::ExternalChatGptTokens => "external_chatgpt_tokens",
             Self::ExternalAuthorizer => "external_authorizer",
             Self::GitHubCopilotOauth => "github_copilot_oauth",
+            Self::GitHubCopilotPat => "github_copilot_pat",
         }
     }
 
@@ -69,7 +73,7 @@ impl OpenAiAuthMethod {
             Self::StaticBearer => Some(PersistedAuthMode::StaticBearer),
             Self::ManagedChatGptOauth => Some(PersistedAuthMode::ChatgptOauth),
             Self::ExternalChatGptTokens => Some(PersistedAuthMode::ExternalTokens),
-            Self::ExternalAuthorizer => None,
+            Self::ExternalAuthorizer | Self::GitHubCopilotPat => None,
             Self::GitHubCopilotOauth => Some(PersistedAuthMode::GithubCopilotOauth),
         }
     }

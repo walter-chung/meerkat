@@ -24,7 +24,7 @@
 #[cfg(all(meerkat_internal_generated_authority_bridge, not(test)))]
 use std::any::Any;
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use crate::LoopState;
 use crate::auth::{RefreshFailureDisposition, RefreshFailureObservation};
@@ -2253,6 +2253,13 @@ impl GeneratedAuthLeaseHandle {
         Arc::clone(&self.inner)
     }
 
+    /// Keep a reference to this owner without extending its lifetime.
+    pub fn downgrade(&self) -> WeakGeneratedAuthLeaseHandle {
+        WeakGeneratedAuthLeaseHandle {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+
     /// Whether `other` is this exact lifecycle owner (a clone of the same
     /// generated handle), not merely an equal or equivalent one.
     pub fn same_owner(&self, other: &Self) -> bool {
@@ -2286,6 +2293,22 @@ impl std::ops::Deref for GeneratedAuthLeaseHandle {
 impl AsRef<dyn AuthLeaseHandle> for GeneratedAuthLeaseHandle {
     fn as_ref(&self) -> &dyn AuthLeaseHandle {
         self.inner.as_ref()
+    }
+}
+
+/// A weak reference to a certified auth lifecycle owner.
+/// Only a generated handle can create this reference.
+#[derive(Clone, Debug)]
+pub struct WeakGeneratedAuthLeaseHandle {
+    inner: Weak<dyn AuthLeaseHandle>,
+}
+
+impl WeakGeneratedAuthLeaseHandle {
+    /// Return the same certified handle while the owner is alive.
+    pub fn upgrade(&self) -> Option<GeneratedAuthLeaseHandle> {
+        self.inner
+            .upgrade()
+            .map(|inner| GeneratedAuthLeaseHandle { inner })
     }
 }
 

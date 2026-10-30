@@ -82,6 +82,33 @@ test('generated realm connection parser round-trips valid connection payloads', 
   assert.deepEqual(JSON.parse(JSON.stringify(result)), payload);
 });
 
+test('Auth accepts environment PAT profiles without rejecting mixed profile lists', async () => {
+  for (const provider of ['openai', 'anthropic', 'gemini']) {
+    const profile = {
+      id: `copilot_${provider}`,
+      provider,
+      auth_method: 'github_copilot_pat',
+      source_kind: 'env',
+    };
+    const payload = {
+      realm_id: 'dev',
+      auth_profiles: [authProfile, profile],
+      backend_profiles: [],
+      bindings: [],
+    };
+    assert.deepEqual(await authWithResponse(payload).auth.listProfiles('dev'), payload);
+    assert.deepEqual(parseWireAuthProfile(profile), profile);
+  }
+  assert.throws(
+    () => parseWireAuthProfile({
+      ...authProfile,
+      provider: 'self_hosted',
+      auth_method: 'github_copilot_pat',
+    }),
+    /auth_method/,
+  );
+});
+
 test('Auth helpers fail closed before transport for unknown provider and auth method strings', async () => {
   let called = false;
   const auth = new Auth({

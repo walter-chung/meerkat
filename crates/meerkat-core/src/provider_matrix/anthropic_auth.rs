@@ -18,6 +18,7 @@ pub enum AnthropicAuthMethod {
     /// Foundry Bearer token via Azure AD (DefaultAzureCredential equivalent).
     FoundryAzureAd,
     GitHubCopilotOauth,
+    GitHubCopilotPat,
 }
 
 impl AnthropicAuthMethod {
@@ -33,6 +34,7 @@ impl AnthropicAuthMethod {
         Self::FoundryApiKey,
         Self::FoundryAzureAd,
         Self::GitHubCopilotOauth,
+        Self::GitHubCopilotPat,
     ];
 
     pub fn parse(raw: &str) -> Option<Self> {
@@ -48,6 +50,7 @@ impl AnthropicAuthMethod {
             "foundry_api_key" => Some(Self::FoundryApiKey),
             "foundry_azure_ad" => Some(Self::FoundryAzureAd),
             "github_copilot_oauth" => Some(Self::GitHubCopilotOauth),
+            "github_copilot_pat" => Some(Self::GitHubCopilotPat),
             _ => None,
         }
     }
@@ -64,6 +67,7 @@ impl AnthropicAuthMethod {
             Self::FoundryApiKey => "foundry_api_key",
             Self::FoundryAzureAd => "foundry_azure_ad",
             Self::GitHubCopilotOauth => "github_copilot_oauth",
+            Self::GitHubCopilotPat => "github_copilot_pat",
         }
     }
 
@@ -79,6 +83,7 @@ impl AnthropicAuthMethod {
             Self::ClaudeAiOauth => Some(PersistedAuthMode::ClaudeAiOauth),
             Self::OauthToApiKey => Some(PersistedAuthMode::OauthToApiKey),
             Self::ExternalAuthorizer
+            | Self::GitHubCopilotPat
             | Self::BedrockAwsSigv4
             | Self::VertexGoogleAuth
             | Self::FoundryAzureAd => None,
