@@ -200,6 +200,15 @@ pub struct HttpAuthorizationContent {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait HttpAuthorizer: Send + Sync {
+    /// Reconcile retained credential observations after a host publishes its
+    /// generic lease. This must not refresh credentials or perform I/O.
+    fn observe_lease_publication(
+        &self,
+        _publication: &crate::handles::AuthLeasePublication,
+    ) -> Result<(), AuthError> {
+        Ok(())
+    }
+
     /// Refresh any derived credential/routing metadata required before a
     /// provider selects its concrete request endpoint.
     async fn prepare_request(&self) -> Result<(), AuthError> {
@@ -227,6 +236,20 @@ pub trait HttpAuthorizer: Send + Sync {
     ) -> Result<HttpAuthorizationResponseAction, AuthError> {
         self.observe_response(response).await
     }
+
+    /// Observe headers before reading a response body. This must not refresh
+    /// credentials; body-aware recovery remains in `observe_response`.
+    fn observe_response_status(
+        &self,
+        _response: &HttpAuthorizationResponse<'_>,
+    ) -> Result<(), AuthError> {
+        Ok(())
+    }
+
+    /// Remove echoed credentials before response diagnostics are parsed,
+    /// logged, or returned to the caller.
+    fn redact_response_diagnostic(&self, _diagnostic: &mut String) {}
+
     fn label(&self) -> &str;
 
     fn append_content_headers(

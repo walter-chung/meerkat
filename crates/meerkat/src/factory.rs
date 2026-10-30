@@ -6581,23 +6581,20 @@ impl AgentFactory {
             .expires_at()
             .map(|ts| ts.timestamp().max(0) as u64)
             .unwrap_or(u64::MAX);
-        let snapshot = handle.snapshot(&lease_key);
-        let snapshot_expires_at = snapshot.expires_at.unwrap_or(u64::MAX);
-        if snapshot.credential_present
-            && snapshot_expires_at == expires_at
-            && matches!(
-                snapshot.phase,
-                Some(
-                    meerkat_core::handles::AuthLeasePhase::Valid
-                        | meerkat_core::handles::AuthLeasePhase::Expiring
-                )
-            )
-        {
-            return Ok(());
-        }
-        handle.acquire_lease(&lease_key, expires_at).map_err(|e| {
+        let publication = handle.publish_lease(&lease_key, expires_at).map_err(|e| {
             FactoryError::ClientCreationFailed(format!("AuthMachine lifecycle acquire failed: {e}"))
         })?;
+        if let meerkat_core::ResolvedAuthKind::DynamicAuthorizer(authorizer) =
+            connection.auth_lease.kind()
+        {
+            authorizer
+                .observe_lease_publication(&publication)
+                .map_err(|error| {
+                    FactoryError::ProviderAuth(
+                        meerkat_llm_core::provider_runtime::ProviderAuthError::Auth(error),
+                    )
+                })?;
+        }
         Ok(())
     }
 
@@ -18360,7 +18357,7 @@ mod tests {
     #[tokio::test]
     async fn publish_auth_lease_does_not_reacquire_existing_matching_credential() {
         use meerkat_llm_core::provider_runtime::{
-            NormalizedBackendKind, ResolvedConnection, StaticLease,
+            DynamicLease, NormalizedBackendKind, ResolvedConnection, StaticLease,
         };
 
         let runtime = meerkat_runtime::MeerkatMachine::ephemeral();
@@ -18376,7 +18373,7 @@ mod tests {
             origin: meerkat_core::BindingOrigin::Configured,
         };
         let expires_at = chrono::Utc::now() + chrono::Duration::hours(1);
-        let connection = ResolvedConnection {
+        let mut connection = ResolvedConnection {
             provider: Provider::OpenAI,
             backend: NormalizedBackendKind::OpenAi(
                 meerkat_core::provider_matrix::OpenAiBackendKind::OpenAiApi,
@@ -18413,6 +18410,74 @@ mod tests {
             second_snapshot, first_snapshot,
             "factory must not advance AuthMachine publication for an already-visible matching credential"
         );
+
+        struct RejectedAuthorizer {
+            handle: meerkat_core::handles::GeneratedAuthLeaseHandle,
+            key: meerkat_core::handles::LeaseKey,
+            fail_publication: Arc<std::sync::atomic::AtomicBool>,
+        }
+        #[async_trait::async_trait]
+        impl meerkat_core::HttpAuthorizer for RejectedAuthorizer {
+            async fn authorize(
+                &self,
+                _: &mut meerkat_core::HttpAuthorizationRequest<'_>,
+            ) -> Result<(), meerkat_core::AuthError> {
+                Ok(())
+            }
+            fn observe_lease_publication(
+                &self,
+                publication: &meerkat_core::handles::AuthLeasePublication,
+            ) -> Result<(), meerkat_core::AuthError> {
+                if self
+                    .fail_publication
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(meerkat_core::AuthError::Other(
+                        "synthetic publication failure".into(),
+                    ));
+                }
+                self.handle
+                    .mark_reauth_required_for_publication(&self.key, publication)
+                    .map_err(|error| meerkat_core::AuthError::Other(error.to_string()))?;
+                Err(meerkat_core::AuthError::UserReauthRequired)
+            }
+            fn label(&self) -> &'static str {
+                "rejected-publication-test"
+            }
+        }
+        let fail_publication = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        connection.auth_lease = Arc::new(DynamicLease::new(
+            Arc::new(RejectedAuthorizer {
+                handle: bindings.auth_lease().clone(),
+                key: lease_key.clone(),
+                fail_publication: fail_publication.clone(),
+            }),
+            meerkat_core::AuthMetadata::default(),
+            Some(expires_at),
+            "test",
+        ));
+        assert!(
+            AgentFactory::publish_auth_lease(bindings.auth_lease(), &auth_binding, &connection,)
+                .is_err()
+        );
+        assert_eq!(
+            bindings.auth_lease().snapshot(&lease_key).phase,
+            Some(meerkat_core::handles::AuthLeasePhase::ReauthRequired)
+        );
+        assert!(
+            AgentFactory::publish_auth_lease(bindings.auth_lease(), &auth_binding, &connection,)
+                .is_err()
+        );
+        assert_eq!(
+            bindings.auth_lease().snapshot(&lease_key).phase,
+            Some(meerkat_core::handles::AuthLeasePhase::ReauthRequired)
+        );
+        fail_publication.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(AgentFactory::publish_auth_lease(
+            bindings.auth_lease(), &auth_binding, &connection,
+        ), Err(FactoryError::ProviderAuth(
+            meerkat_llm_core::provider_runtime::ProviderAuthError::Auth(meerkat_core::AuthError::Other(message)),
+        )) if message == "synthetic publication failure"));
     }
 
     #[test]

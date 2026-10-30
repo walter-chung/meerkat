@@ -2374,8 +2374,55 @@ fn validate_runtime_generated_authority_bridge_token(
 /// that input, not whether the transition is legal.
 pub const AUTH_LEASE_TTL_REFRESH_WINDOW_SECS: u64 = 60;
 
+/// Process-local correlation token, valid only while registered by its issuer.
+/// Constructing a token does not publish credentials or grant mutation authority.
+#[derive(Clone, Debug, Default)]
+pub struct AuthLeasePublication(Arc<()>);
+
+impl AuthLeasePublication {
+    pub fn same_publication(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 /// Auth lease lifecycle DSL handle.
 pub trait AuthLeaseHandle: Send + Sync + std::any::Any {
+    /// Acquire or reuse the matching lease and atomically register its current
+    /// request-observation owner. Reuse does not advance credential generation.
+    fn publish_lease(
+        &self,
+        lease_key: &LeaseKey,
+        expires_at: u64,
+    ) -> Result<AuthLeasePublication, DslTransitionError> {
+        let _ = (lease_key, expires_at);
+        Err(DslTransitionError::no_matching(
+            "AuthLeaseHandle::publish_lease",
+            "publication correlation requires generated AuthMachine authority",
+        ))
+    }
+
+    fn is_current_publication(
+        &self,
+        lease_key: &LeaseKey,
+        publication: &AuthLeasePublication,
+    ) -> bool {
+        let _ = (lease_key, publication);
+        false
+    }
+
+    /// Ignore stale observations; route a current rejection through AuthMachine.
+    fn mark_reauth_required_for_publication(
+        &self,
+        lease_key: &LeaseKey,
+        publication: &AuthLeasePublication,
+    ) -> Result<(), DslTransitionError> {
+        let _ = (lease_key, publication);
+        Err(DslTransitionError::no_matching(
+            "AuthLeaseHandle::mark_reauth_required_for_publication",
+            "correlated rejection requires generated AuthMachine authority",
+        ))
+    }
+
     /// Fire `AcquireAuthLease { lease_key, expires_at }` — unconditional.
     ///
     /// Moves the binding into `auth_valid_leases` and records its expiry.

@@ -25,8 +25,8 @@ use meerkat_core::AuthCredentialIdentity;
 use meerkat_core::auth::{RefreshFailureDisposition, RefreshFailureObservation};
 use meerkat_core::generated::auth_lease_durable_lifecycle_marker::AuthLeaseDurableRestorePublication;
 use meerkat_core::handles::{
-    AuthLeaseHandle, AuthLeasePhase, AuthLeaseRestoreSnapshot, AuthLeaseSnapshot,
-    AuthLeaseTransition, DslTransitionError, LeaseKey,
+    AuthLeaseHandle, AuthLeasePhase, AuthLeasePublication, AuthLeaseRestoreSnapshot,
+    AuthLeaseSnapshot, AuthLeaseTransition, DslTransitionError, LeaseKey,
 };
 use meerkat_core::time_compat::{SystemTime, UNIX_EPOCH};
 
@@ -564,6 +564,23 @@ fn run_release_before_commit_hook(lease_key: &LeaseKey) {
 #[derive(Default)]
 struct AuthLeaseRegistry {
     authorities: HashMap<LeaseKey, auth_dsl::AuthMachineAuthority>,
+    publications: HashMap<LeaseKey, (u64, AuthLeasePublication)>,
+    #[cfg(feature = "test-support")]
+    fail_next_reauth_required: Option<LeaseKey>,
+}
+
+impl AuthLeaseRegistry {
+    fn is_current_publication(&self, key: &LeaseKey, publication: &AuthLeasePublication) -> bool {
+        self.publications
+            .get(key)
+            .is_some_and(|(generation, current)| {
+                current.same_publication(publication)
+                    && self.authorities.get(key).is_some_and(|entry| {
+                        entry.state().credential_present
+                            && entry.state().credential_generation == *generation
+                    })
+            })
+    }
 }
 
 impl std::fmt::Debug for RuntimeAuthLeaseHandle {
@@ -579,6 +596,14 @@ impl std::fmt::Debug for RuntimeAuthLeaseHandle {
 }
 
 impl RuntimeAuthLeaseHandle {
+    #[cfg(feature = "test-support")]
+    pub fn fail_next_reauth_required_for_test(&self, lease_key: &LeaseKey) {
+        self.machines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .fail_next_reauth_required = Some(lease_key.clone());
+    }
+
     pub fn new() -> Self {
         Self {
             machines: Arc::new(Mutex::new(AuthLeaseRegistry::default())),
@@ -861,19 +886,44 @@ impl RuntimeAuthLeaseHandle {
         context: &'static str,
         create_if_missing: bool,
     ) -> Result<AuthLeaseTransition, DslTransitionError> {
+        let mut guard = self
+            .machines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::apply_locked(&mut guard, lease_key, input, context, create_if_missing)
+    }
+
+    fn apply_locked(
+        guard: &mut AuthLeaseRegistry,
+        lease_key: &LeaseKey,
+        input: auth_dsl::AuthMachineInput,
+        context: &'static str,
+        create_if_missing: bool,
+    ) -> Result<AuthLeaseTransition, DslTransitionError> {
         let action = Self::audit_action_for(&input);
         let freshness_observation = matches!(
             &input,
             auth_dsl::AuthMachineInput::ObserveCredentialFreshness { .. }
         );
-        let mut guard = self
-            .machines
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let replaces_credential = matches!(
+            &input,
+            auth_dsl::AuthMachineInput::Acquire { .. }
+                | auth_dsl::AuthMachineInput::CompleteRefresh { .. }
+        );
         if !create_if_missing && !guard.authorities.contains_key(lease_key) {
             return Err(DslTransitionError::no_matching(
                 context,
                 format!("no auth lease registered for lease_key `{lease_key}`"),
+            ));
+        }
+        #[cfg(feature = "test-support")]
+        if matches!(&input, auth_dsl::AuthMachineInput::MarkReauthRequired)
+            && guard.fail_next_reauth_required.as_ref() == Some(lease_key)
+        {
+            guard.fail_next_reauth_required = None;
+            return Err(DslTransitionError::guard_rejected(
+                context,
+                "injected AuthMachine reauth publication failure",
             ));
         }
         let (from_phase, to_phase, auth_transition, changed_observation) = {
@@ -932,6 +982,9 @@ impl RuntimeAuthLeaseHandle {
         };
         if changed_observation {
             emit_audit(lease_key, action, from_phase, to_phase);
+        }
+        if replaces_credential {
+            guard.publications.remove(lease_key);
         }
         Ok(auth_transition)
     }
@@ -1350,6 +1403,83 @@ impl Default for RuntimeAuthLeaseHandle {
 }
 
 impl AuthLeaseHandle for RuntimeAuthLeaseHandle {
+    fn publish_lease(
+        &self,
+        lease_key: &LeaseKey,
+        expires_at: u64,
+    ) -> Result<AuthLeasePublication, DslTransitionError> {
+        let mut guard = self
+            .machines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let existing_generation = guard.authorities.get(lease_key).and_then(|entry| {
+            let state = entry.state();
+            (state.credential_present
+                && state.expires_at.unwrap_or(u64::MAX) == expires_at
+                && matches!(
+                    state.lifecycle_phase,
+                    auth_dsl::AuthLifecyclePhase::Valid | auth_dsl::AuthLifecyclePhase::Expiring
+                ))
+            .then_some(state.credential_generation)
+        });
+        let generation = match existing_generation {
+            Some(generation) => generation,
+            None => Self::apply_locked(
+                &mut guard,
+                lease_key,
+                auth_dsl::AuthMachineInput::Acquire {
+                    expires_at_ts: (expires_at != u64::MAX).then_some(expires_at),
+                    credential_published_at_millis: current_time_millis(),
+                },
+                "AuthLeaseHandle::publish_lease",
+                true,
+            )?
+            .generation(),
+        };
+        let publication = AuthLeasePublication::default();
+        guard
+            .publications
+            .insert(lease_key.clone(), (generation, publication.clone()));
+        Ok(publication)
+    }
+
+    fn is_current_publication(
+        &self,
+        lease_key: &LeaseKey,
+        publication: &AuthLeasePublication,
+    ) -> bool {
+        self.machines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_current_publication(lease_key, publication)
+    }
+
+    fn mark_reauth_required_for_publication(
+        &self,
+        lease_key: &LeaseKey,
+        publication: &AuthLeasePublication,
+    ) -> Result<(), DslTransitionError> {
+        let mut guard = self
+            .machines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !guard.is_current_publication(lease_key, publication)
+            || guard.authorities.get(lease_key).is_some_and(|entry| {
+                entry.state().lifecycle_phase == auth_dsl::AuthLifecyclePhase::ReauthRequired
+            })
+        {
+            return Ok(());
+        }
+        Self::apply_locked(
+            &mut guard,
+            lease_key,
+            auth_dsl::AuthMachineInput::MarkReauthRequired,
+            "AuthLeaseHandle::mark_reauth_required_for_publication",
+            false,
+        )
+        .map(|_| ())
+    }
+
     fn acquire_lease(
         &self,
         lease_key: &LeaseKey,
@@ -1593,6 +1723,7 @@ impl AuthLeaseHandle for RuntimeAuthLeaseHandle {
             ),
             "AuthLeaseHandle::restore_auth_lifecycle_snapshot",
         )?;
+        guard.publications.remove(lease_key);
         emit_audit(
             lease_key,
             "restore_auth_lifecycle_snapshot",
@@ -1649,6 +1780,7 @@ impl AuthLeaseHandle for RuntimeAuthLeaseHandle {
             ),
             context,
         )?;
+        guard.publications.remove(lease_key);
         emit_audit(
             lease_key,
             "restore_published_credential_lifecycle",
@@ -2262,6 +2394,48 @@ mod tests {
             after.credential_published_at_millis,
             before.credential_published_at_millis
         );
+    }
+
+    #[test]
+    fn publication_rejection_ignores_replaced_or_unregistered_observations() {
+        for replacement in ["matching", "acquire", "release"] {
+            let handle = RuntimeAuthLeaseHandle::new();
+            let key = lease("dev", "publication-fence");
+            let old = handle.publish_lease(&key, u64::MAX).unwrap();
+            let before = handle.snapshot(&key);
+            let current = if replacement == "matching" {
+                let current = handle.publish_lease(&key, u64::MAX).unwrap();
+                assert_eq!(handle.snapshot(&key), before);
+                current
+            } else {
+                if replacement == "release" {
+                    handle.release_lease(&key).unwrap();
+                }
+                handle.acquire_lease(&key, u64::MAX).unwrap();
+                let after = handle.snapshot(&key);
+                handle
+                    .mark_reauth_required_for_publication(&key, &old)
+                    .unwrap();
+                assert_eq!(handle.snapshot(&key), after);
+                handle.publish_lease(&key, u64::MAX).unwrap()
+            };
+            let replacement_snapshot = handle.snapshot(&key);
+            for stale in [old, AuthLeasePublication::default()] {
+                handle
+                    .mark_reauth_required_for_publication(&key, &stale)
+                    .unwrap();
+                assert_eq!(handle.snapshot(&key), replacement_snapshot);
+            }
+            for _ in 0..2 {
+                handle
+                    .mark_reauth_required_for_publication(&key, &current)
+                    .unwrap();
+                assert_eq!(
+                    handle.snapshot(&key).phase,
+                    Some(AuthLeasePhase::ReauthRequired)
+                );
+            }
+        }
     }
 
     #[test]
