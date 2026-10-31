@@ -178,10 +178,9 @@ a registration that served no live work keeps every input it recovered and
 the run its session left open as the Shutdown finds them, with no requeue
 mark, and one that served live work is stopped (see [Mobs](/guides/mobs)).
 The exception is a run left open whose stop was asked after the start
-registered it: the inputs bound to it end `Abandoned` with reason `Stopped`,
-and no later start resumes it. The boot's ordinary recovery may still
-normalize a staged input whose run cannot continue to queued, as every start
-does.
+registered it: the inputs bound to it end as `stopped`, and no later start
+resumes it. The boot's ordinary recovery may still normalize a staged input
+whose run cannot continue to queued, as every start does.
 
 - **The stop does not wait for the round.** It stops the turn at once. The
   run continues from its last committed round, and the work since that
@@ -223,7 +222,7 @@ that is killed leaves its runs as any crash does.
 | The run has no bound inputs (a direct or machine-service turn) | Closes the run as interrupted, with its content kept |
 | The saved transcript and the run cursor disagree | Holds the session for reconciliation; an operator can resolve the hold, unless the cursor cannot be read or its saved response has calls without a message id (see [Storage Operations](/guides/storage-operations#resolve-a-durable-tail-held-for-recovery)) |
 | A durable worker's resume gate refused the run | Settles the run like a stop (see [Resume Gate](#resume-gate)), then closes it as interrupted, with its content kept |
-| A graceful stop kept the run, and an input bound to it is older than the stop's max age at the next start | Ends the run's inputs as `requeue_expired`, then closes the run as interrupted, with its content kept |
+| A graceful stop kept the run, and an input bound to it is older than the stop's max age at the next start | Ends the run's inputs as `requeue_expired` (as `cancelled` when the run's stop was asked after that start registered it), then closes the run as interrupted, with its content kept |
 | On a `jsonl` or host-store realm, the process stopped after the run's closing save of a compacted transcript and before the run ended | Closes the run as interrupted: every message it wrote is kept and its inputs do not run again, but a run that had finished still shows the interrupted notice. Without the compaction, the same stop recovers a finished run as completed |
 
 Closing a run as interrupted keeps everything the run committed. Its rounds

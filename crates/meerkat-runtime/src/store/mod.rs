@@ -6790,7 +6790,9 @@ pub struct MachineUnregisterProgressSnapshot {
     requeue_max_age_ms: Option<u64>,
     /// Whether this unregister keeps every input its registration recovered
     /// exactly as the store holds it (the rollback of a materialization that
-    /// never served). Never set with a requeue max age.
+    /// never served), except the inputs bound to a run marked resumable
+    /// whose stop was asked, which end as stopped. Never set with a requeue
+    /// max age.
     keeps_recovered_inputs: bool,
 }
 
@@ -6831,7 +6833,8 @@ impl MachineUnregisterProgressSnapshot {
     }
 
     /// This progress keeping, or not, every input its registration
-    /// recovered: `true` when the unregister began with the keep
+    /// recovered, except the inputs bound to a run marked resumable whose
+    /// stop was asked: `true` when the unregister began with the keep
     /// disposition.
     #[must_use]
     pub(crate) fn with_keeps_recovered_inputs(mut self, keeps_recovered_inputs: bool) -> Self {
@@ -6840,9 +6843,10 @@ impl MachineUnregisterProgressSnapshot {
     }
 
     /// Whether the machine recorded keep for the unregister: every input its
-    /// registration recovered stays exactly as the store holds it. Like
-    /// [`Self::requeue_max_age_ms`], the disposition that applies, never a
-    /// joining call's.
+    /// registration recovered stays exactly as the store holds it, except the
+    /// inputs bound to a run marked resumable whose stop was asked, which end
+    /// as stopped. Like [`Self::requeue_max_age_ms`], the disposition that
+    /// applies, never a joining call's.
     pub fn keeps_recovered_inputs(&self) -> bool {
         self.keeps_recovered_inputs
     }

@@ -4374,7 +4374,9 @@ impl MeerkatMachine {
     /// authority, and a stale binding can never unregister a same-SessionId
     /// replacement. The rollback keeps every input the registration recovered
     /// from the store, unless the registration served live work, in which
-    /// case the machine stops every input
+    /// case the machine stops every input. Either way, the inputs bound to a
+    /// run the registration marked resumable whose stop was asked end as
+    /// stopped, so no later start resumes that run
     /// ([`PreparedSessionMaterialization::rollback_now`](super::PreparedSessionMaterialization::rollback_now)).
     pub async fn unregister_session_if_bindings_owned_registration(
         &self,
