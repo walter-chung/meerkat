@@ -641,6 +641,43 @@ async fn direct_ingest_unsupported_plain_controller_facts_preserves_readiness_ca
     direct_ingest_case(Case::UnsupportedFacts).await;
 }
 
+/// Publication only tries native controller custody and answers Busy instead
+/// of waiting. An attached session's runtime loop takes the session driver on
+/// every pass, and attach and bind steps return before that pass, so the
+/// fixture's publication must wait a held driver out, as a product login does.
+#[tokio::test]
+async fn install_credential_waits_for_a_held_driver_lock() {
+    let (configuration, template, _, _) = mutable_controller_configuration(true);
+    let machine = Arc::new(
+        MeerkatMachine::ephemeral()
+            .with_local_grant_authorization(configuration)
+            .expect("actual native/grant composition"),
+    );
+    let attached = AttachedSession::attach(&machine).await;
+    let driver = Arc::clone(
+        &machine
+            .sessions
+            .read()
+            .await
+            .get(&attached.session)
+            .expect("entry")
+            .driver,
+    );
+    // Stands in for the runtime loop's own driver lock on a pass.
+    let held = driver.lock_owned().await;
+    let holder = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(held);
+    });
+    let selection = selected(
+        &template,
+        "candidate-controller",
+        &format!("held-{}", attached.session),
+    );
+    install_credential(&machine, &EphemeralTokenStore::new(), &selection).await;
+    holder.await.expect("the holder releases the driver");
+}
+
 mod executor_readiness;
 
 mod admission_cancellation;
