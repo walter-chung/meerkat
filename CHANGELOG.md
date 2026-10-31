@@ -711,6 +711,21 @@ them.
   or reads an immutable snapshot, and keeps `Unavailable` for when it
   genuinely cannot answer.
 
+- `meerkat-core`: a logout or auth profile deletion no longer fails with
+  "controller credential custody is busy" when it meets native controller
+  custody held for a moment, as a governed session's runtime loop holds the
+  session's driver on every pass. The coordinated clear they go through
+  (`clear_tokens_and_publish_lifecycle_released_coordinated` and its
+  `_for_identity` and `_for_mode` forms) made its lease release attempt once,
+  and native controller custody answers the typed
+  `ControllerReadinessFailure::Busy` at once instead of waiting, while every
+  login and token commit already retried exactly that refusal. The clear now
+  retries it, with the same backoff, for up to two seconds, the budget a
+  login publication has; a refused attempt changes nothing. Every other veto,
+  such as a credential that unfinished work still references, returns at
+  once as before, and custody still busy at the deadline returns the same
+  refusal as before.
+
 ### Upgrade notes
 
 - A client of the generic schedule tool calls (`schedule/call`,
