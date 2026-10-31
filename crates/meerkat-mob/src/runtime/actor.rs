@@ -5953,6 +5953,45 @@ impl WiringEndpoint {
     }
 }
 
+/// Who removes a member's retained (historical) endpoints from the other
+/// end of a wired edge: it types a failed removal and decides whether a
+/// placed host's failed removal restores the edge's route installs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetainedEndpointSweep {
+    /// Placed-edge retirement, which unwires the edge: a failed removal
+    /// aborts that unwire, so the edge's route installs are restored.
+    Retirement,
+    /// An existing edge's repair: the edge stays wired and the repair is
+    /// retried, so a failed removal restores nothing.
+    Repair,
+}
+
+impl RetainedEndpointSweep {
+    fn incomplete(self, detail: String) -> MobError {
+        match self {
+            Self::Retirement => MobError::RetirementTopologyIncomplete(detail),
+            Self::Repair => MobError::WiringError(detail),
+        }
+    }
+
+    fn restores_route_installs_on_failure(self) -> bool {
+        matches!(self, Self::Retirement)
+    }
+}
+
+/// The counterparts one pass of an edge repair's retained-endpoint sweep
+/// reaches ([`MobActor::remove_retained_endpoints_across_edge`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetainedEndpointCounterparts {
+    /// Local counterparts, which remove the rows from their own trust
+    /// stores: swept before any lane reinstalls trust.
+    Local,
+    /// Placed counterparts, whose hosts remove the rows: swept after the
+    /// repair's local reinstall and before the edge's route installs are
+    /// re-driven.
+    Placed,
+}
+
 #[derive(Clone)]
 struct LocalBatchWiringEndpoint {
     comms: Arc<dyn CoreCommsRuntime>,
@@ -11723,17 +11762,19 @@ impl MobActor {
     }
 
     /// Remove one stale generation endpoint from every surviving placed
-    /// target, before retirement unwires the edge or before an edge repair
-    /// reinstalls current trust. The route-removal authority proves the exact
-    /// host lane; the consumed endpoint-migration authority proves
+    /// target, before retirement unwires the edge or when an edge repair
+    /// sweeps its placed counterparts. The route-removal authority proves the
+    /// exact host lane; the consumed endpoint-migration authority proves
     /// `retained_spec.peer_id` is historical trust for `retiring_identity`'s
-    /// runtime.
+    /// runtime. A failure restores the edge's route installs only when the
+    /// sweep is a retirement's, whose unwire it aborts.
     async fn realize_historical_route_removals_before_unwire(
         &mut self,
         edge: &mob_dsl::WiringEdge,
         retiring_identity: &AgentIdentity,
         retained_spec: &TrustedPeerDescriptor,
         _endpoint_migration_authority: CommsTrustMutationAuthority,
+        sweep: RetainedEndpointSweep,
     ) -> Result<bool, MobError> {
         let obligations =
             self.route_removal_obligations_before_unwire(edge, Some(retiring_identity));
@@ -11757,7 +11798,9 @@ impl MobActor {
         }
         for obligation in &obligations {
             if let Err(error) = self.authorize_route_removal_before_unwire(obligation) {
-                self.restore_route_installs_after_unwire_abort(edge).await;
+                if sweep.restores_route_installs_on_failure() {
+                    self.restore_route_installs_after_unwire_abort(edge).await;
+                }
                 return Err(error);
             }
             if let Err(error) = self
@@ -11768,7 +11811,9 @@ impl MobActor {
                 )
                 .await
             {
-                self.restore_route_installs_after_unwire_abort(edge).await;
+                if sweep.restores_route_installs_on_failure() {
+                    self.restore_route_installs_after_unwire_abort(edge).await;
+                }
                 return Err(error);
             }
         }
@@ -11782,15 +11827,15 @@ impl MobActor {
     /// authority. A local survivor (`survivor_comms`) removes the row from
     /// its own trust store; otherwise every surviving placed end's host is
     /// sent an authenticated `RemovePeerTrust` it must acknowledge. Removing
-    /// an absent row is a no-op, so a repeated sweep is idempotent.
-    /// `incomplete` types a removal that fails for the caller.
+    /// an absent row is a no-op, so a repeated sweep is idempotent. `sweep`
+    /// names the caller ([`RetainedEndpointSweep`]).
     async fn remove_retained_member_endpoints(
         &mut self,
         edge: &mob_dsl::WiringEdge,
         migrated: &RosterEntry,
         retained_peer_endpoints: BTreeSet<mob_dsl::MemberPeerEndpoint>,
         survivor_comms: Option<Arc<dyn CoreCommsRuntime>>,
-        incomplete: fn(String) -> MobError,
+        sweep: RetainedEndpointSweep,
     ) -> Result<(), MobError> {
         let migrated_identity = &migrated.agent_identity;
         for retained_peer_endpoint in retained_peer_endpoints {
@@ -11810,7 +11855,7 @@ impl MobActor {
                 self.apply_trusted_peer_remove(comms.as_ref(), retained_peer_id.clone(), authority)
                     .await
                     .map_err(|error| {
-                        incomplete(format!(
+                        sweep.incomplete(format!(
                             "failed to remove historical member trust '{retained_peer_id}' of '{migrated_identity}' from its local peer: {error}"
                         ))
                     })?;
@@ -11820,10 +11865,11 @@ impl MobActor {
                     migrated_identity,
                     &retained_spec,
                     authority,
+                    sweep,
                 )
                 .await?
             {
-                return Err(incomplete(format!(
+                return Err(sweep.incomplete(format!(
                     "historical member trust '{retained_peer_id}' of '{migrated_identity}' has no surviving local or placed cleanup lane"
                 )));
             }
@@ -45660,20 +45706,31 @@ impl MobActor {
         }
     }
 
-    /// Before an existing edge's trust is reinstalled, remove each end's
-    /// retained endpoints from the other end's trust. An endpoint migration
-    /// (a wake or a resume that moved a member to a session with another key)
-    /// keeps the old endpoint as the member's history, and a live or placed
-    /// peer may still trust it: reinstalling only the current endpoint would
-    /// leave that peer two rows under the member's name. A counterpart that
-    /// is not materialized holds no trust store (its wake installs current
-    /// endpoints only), and a legacy peer-only counterpart's trust lives in
-    /// its own runtime, so neither is swept. A removal that fails fails the
-    /// repair: the edge stays owed and its next repair sweeps again.
+    /// Whether either end of `edge` keeps retained (historical) endpoints.
+    fn edge_has_retained_endpoints(&self, edge: &mob_dsl::WiringEdge) -> bool {
+        let history = &self.dsl_authority.state().member_prior_peer_endpoints;
+        [&edge.a, &edge.b].into_iter().any(|end| {
+            history
+                .get(end)
+                .is_some_and(|retained| !retained.is_empty())
+        })
+    }
+
+    /// In an existing edge's repair, remove each end's retained endpoints
+    /// from the other end's trust, for the `counterparts` this pass reaches.
+    /// An endpoint migration (a wake or a resume that moved a member to a
+    /// session with another key) keeps the old endpoint as the member's
+    /// history, and a live or placed peer may still trust it: reinstalling
+    /// only the current endpoint would leave that peer two rows under the
+    /// member's name. A counterpart that is not materialized holds no trust
+    /// store (its wake installs current endpoints only), and a legacy
+    /// peer-only counterpart's trust lives in its own runtime, so neither is
+    /// swept. A removal that fails fails the repair.
     async fn remove_retained_endpoints_across_edge(
         &mut self,
         edge: &mob_dsl::WiringEdge,
         ends: [(&AgentIdentity, &WiringEndpoint); 2],
+        counterparts: RetainedEndpointCounterparts,
     ) -> Result<(), MobError> {
         for (migrated, counterpart) in ends {
             let retained_peer_endpoints = self
@@ -45686,10 +45743,12 @@ impl MobActor {
             if retained_peer_endpoints.is_empty() {
                 continue;
             }
-            let counterpart_comms = match counterpart {
-                WiringEndpoint::Local { comms, .. } => Some(Arc::clone(comms)),
-                WiringEndpoint::Placed { .. } => None,
-                WiringEndpoint::LocalDormant { .. } | WiringEndpoint::PeerOnly { .. } => continue,
+            let counterpart_comms = match (counterpart, counterparts) {
+                (WiringEndpoint::Local { comms, .. }, RetainedEndpointCounterparts::Local) => {
+                    Some(Arc::clone(comms))
+                }
+                (WiringEndpoint::Placed { .. }, RetainedEndpointCounterparts::Placed) => None,
+                _ => continue,
             };
             let migrated_entry = self
                 .roster
@@ -45703,7 +45762,7 @@ impl MobActor {
                 &migrated_entry,
                 retained_peer_endpoints,
                 counterpart_comms,
-                MobError::WiringError,
+                RetainedEndpointSweep::Repair,
             )
             .await?;
         }
@@ -45714,7 +45773,7 @@ impl MobActor {
     /// already owns. This excludes every new-edge branch so respawn topology
     /// restoration does not poll the generic wire future's large frame on the
     /// already-deep spawn/respawn actor stack. Each end's retained historical
-    /// endpoints are first removed from the other end
+    /// endpoints are also removed from the other end
     /// ([`Self::remove_retained_endpoints_across_edge`]).
     async fn repair_existing_member_wire(
         &mut self,
@@ -45731,18 +45790,29 @@ impl MobActor {
             ));
         }
         let handoff = authority.member_handoff()?;
-        // Built in its own frame (see `boxed_arm_future`): a repair also runs
-        // on the deep respawn stack.
-        boxed_arm_future(|| {
-            self.remove_retained_endpoints_across_edge(
-                edge,
-                [
-                    (local, peer_endpoint),
-                    (peer_member_identity, local_endpoint),
-                ],
-            )
-        })
-        .await?;
+        // A member whose endpoint migrated keeps its old endpoints as
+        // history, which the other end may still trust. A local counterpart
+        // drops them before any lane reinstalls trust. A placed counterpart's
+        // host drops them after this repair's local reinstall, so a slow or
+        // refusing host never leaves the local end without its trust, and
+        // before the edge's route installs are re-driven. Each sweep is built
+        // in its own frame (see `boxed_arm_future`): a repair also runs on the
+        // deep respawn stack.
+        let ends = [
+            (local, peer_endpoint),
+            (peer_member_identity, local_endpoint),
+        ];
+        let sweeps_history = self.edge_has_retained_endpoints(edge);
+        if sweeps_history {
+            boxed_arm_future(|| {
+                self.remove_retained_endpoints_across_edge(
+                    edge,
+                    ends,
+                    RetainedEndpointCounterparts::Local,
+                )
+            })
+            .await?;
+        }
         match (local_endpoint, peer_endpoint) {
             (
                 WiringEndpoint::Local {
@@ -46086,6 +46156,18 @@ impl MobActor {
                     "wire between a placed member and a legacy external (peer-only) member is unsupported ('{local}' <-> '{peer_member_identity}')"
                 )));
             }
+        }
+        // The local side's trust is in place: placed counterparts drop the
+        // retained endpoints now, before their installs are re-driven below.
+        if sweeps_history {
+            boxed_arm_future(|| {
+                self.remove_retained_endpoints_across_edge(
+                    edge,
+                    ends,
+                    RetainedEndpointCounterparts::Placed,
+                )
+            })
+            .await?;
         }
         // Repair is the operator retry lane (§9 "retry drains
         // obligations idempotently"): re-record + re-drive the
@@ -47118,7 +47200,7 @@ impl MobActor {
                 &retiring_entry,
                 retained_peer_endpoints,
                 surviving_local_comms,
-                MobError::RetirementTopologyIncomplete,
+                RetainedEndpointSweep::Retirement,
             )
             .await?;
         }
