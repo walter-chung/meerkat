@@ -25164,7 +25164,13 @@ macro_rules! meerkat_catalog_machine_dsl {
         // pre-run phase is restored, and the run is marked resumable, so the
         // stop classifier keeps its bound inputs bound and the stored cursor
         // resumes it at the next start. No turn terminal is recorded and no
-        // input changes. A run of a Retired runtime, a run whose turn
+        // input changes. A cancel the run accepted before the stop (its
+        // turn's `cancel_after_boundary`, or an ambient cancel whose boundary
+        // dispatch is still outstanding, `boundary_cancel_dispatch_pending`)
+        // stands as the run's stop intent (`run_stop_requested`), as a stop
+        // asked of it does: the stop classifier then keeps none of its bound
+        // inputs, so the next start never resumes the cancelled run. A run
+        // of a Retired runtime, a run whose turn
         // terminal is already published (completed, failed or cancelled), a
         // session without per-round commits, a stop that does not requeue,
         // or a run with a published live-boundary join is not suspended: the
@@ -25198,6 +25204,9 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.current_run_id = None;
                 self.pre_run_phase = None;
                 self.resumable_run_id = Some(run_id);
+                if self.cancel_after_boundary == true || self.boundary_cancel_dispatch_pending == true {
+                    self.run_stop_requested = Some(run_id);
+                }
             }
             to Idle
             emit RunSuspendedForStop { run_id: run_id }
@@ -25231,6 +25240,9 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.current_run_id = None;
                 self.pre_run_phase = None;
                 self.resumable_run_id = Some(run_id);
+                if self.cancel_after_boundary == true || self.boundary_cancel_dispatch_pending == true {
+                    self.run_stop_requested = Some(run_id);
+                }
             }
             to Attached
             emit RunSuspendedForStop { run_id: run_id }
