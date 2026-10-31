@@ -158,6 +158,13 @@ export interface BoundaryAppendsDiscarded {
   session_id: SessionId;
 }
 
+export interface BoundedToolResult {
+  kept_bytes: number;
+  tool_name: string;
+  tool_use_id: string;
+  total_bytes: number;
+}
+
 export type BudgetType = "tokens" | "time" | "tool_calls";
 
 export type CacheBreakpointBoundary = {
@@ -1067,6 +1074,8 @@ export type ToolProcessSpawner = {
   kind: "unknown";
 };
 
+export type ToolResultBoundAxis = "request_bytes" | "context_window";
+
 export interface TranscriptEditRewriteRange {
   end: number;
   start: number;
@@ -1540,6 +1549,13 @@ export interface RunResumedEvent {
   type: "run_resumed";
 }
 
+export interface ToolResultsBoundedForRequestEvent {
+  axis: ToolResultBoundAxis;
+  results: BoundedToolResult[];
+  run_id: RunId;
+  type: "tool_results_bounded_for_request";
+}
+
 export const KNOWN_AGENT_EVENT_TYPES = [
   "run_started",
   "run_completed",
@@ -1592,7 +1608,8 @@ export const KNOWN_AGENT_EVENT_TYPES = [
   "boundary_appends_discarded",
   "live_channel_closed",
   "request_reasoning_lowered",
-  "run_resumed"
+  "run_resumed",
+  "tool_results_bounded_for_request"
 ] as const;
 
 export type KnownAgentEventType = typeof KNOWN_AGENT_EVENT_TYPES[number];
@@ -1649,4 +1666,5 @@ export type AgentEvent =
   OperationObservationFailedEvent |
   HookLaunchRefusedEvent |
   RequestReasoningLoweredEvent |
-  RunResumedEvent;
+  RunResumedEvent |
+  ToolResultsBoundedForRequestEvent;

@@ -401,6 +401,16 @@ class BoundaryAppendsDiscarded(TypedDict, total=False):
     session_id: Required[SessionId]
 
 
+class BoundedToolResult(TypedDict, total=False):
+    """One tool result a model request carried shortened, as
+    [`AgentEvent::ToolResultsBoundedForRequest`] names it.
+    """
+    kept_bytes: Required[int]
+    tool_name: Required[str]
+    tool_use_id: Required[str]
+    total_bytes: Required[int]
+
+
 # Type of budget being tracked
 BudgetType = Literal['tokens', 'time', 'tool_calls']
 
@@ -1756,6 +1766,11 @@ class SystemNoticeMessage(TypedDict, total=False):
 ToolCallArguments = dict[str, Any]
 
 
+# The limit a model request was over with the run's own tool results
+# whole, as [`AgentEvent::ToolResultsBoundedForRequest`] reports it.
+ToolResultBoundAxis = Literal['request_bytes', 'context_window']
+
+
 # Durable correlation identity for one delegated objective.
 ObjectiveId = str
 
@@ -2590,10 +2605,31 @@ class AgentEventRunResumed(TypedDict, total=False):
     type: Required[Literal['run_resumed']]
 
 
+class AgentEventToolResultsBoundedForRequest(TypedDict, total=False):
+    """One model request of a run carried some of the run's own tool results
+    shortened, for that request only: with them whole the request was over
+    the provider's request-body cap, or its forecast was over the model's
+    context window, and no compaction made room (a compaction inside a run
+    keeps the run's request and newest round).
+
+    Each named result kept the head of its text, media as placeholders,
+    with a marker naming the call that the model reads. The stored
+    transcript keeps every result whole. With the default compactor the
+    next run's first check then compacts the whole transcript once; with
+    compaction off the request is still bounded and nothing is recorded.
+    Published before the request is sent, once for each request that
+    carries a bound.
+    """
+    axis: Required[ToolResultBoundAxis]
+    results: Required[list[BoundedToolResult]]
+    run_id: Required[RunId]
+    type: Required[Literal['tool_results_bounded_for_request']]
+
+
 # Events emitted during agent execution
 #
 # These events form the streaming API for consumers.
-AgentEvent = AgentEventRunStarted | AgentEventRunCompleted | AgentEventExtractionSucceeded | AgentEventExtractionFailed | AgentEventRunFailed | AgentEventHookStarted | AgentEventHookCompleted | AgentEventHookFailed | AgentEventHookDenied | AgentEventTurnStarted | AgentEventReasoningDelta | AgentEventReasoningComplete | AgentEventTextDelta | AgentEventTextComplete | AgentEventServerToolContent | AgentEventAssistantImageAppended | AgentEventToolCallRequested | AgentEventToolResultReceived | AgentEventTurnCompleted | AgentEventToolExecutionStarted | AgentEventToolExecutionCompleted | AgentEventToolExecutionTimedOut | AgentEventCompactionStarted | AgentEventCompactionCompleted | AgentEventCompactionFailed | AgentEventBudgetWarning | AgentEventRetrying | AgentEventSkillsResolved | AgentEventSkillResolutionFailed | AgentEventInteractionComplete | AgentEventInteractionCallbackPending | AgentEventInteractionFailed | AgentEventStreamTruncated | AgentEventToolConfigChanged | AgentEventBackgroundJobCompleted | AgentEventTranscriptRewriteCommitted | AgentEventTranscriptRewriteAuditReceiptCommitted | AgentEventProviderCacheBreakpointsDiscarded | AgentEventPeerContentIngested | AgentEventTurnUsageAccountingUnmeasured | AgentEventTurnUsageAccountingIdentityDisputed | AgentEventModelFallbackSkipped | AgentEventModelFallbackStaged | AgentEventModelFallbackCommitted | AgentEventModelFallbackTargetFailed | AgentEventBoundaryAppendApplied | AgentEventBoundaryAppendsDiscarded | AgentEventLiveChannelClosed | AgentEventOperationObservationFailed | AgentEventHookLaunchRefused | AgentEventRequestReasoningLowered | AgentEventRunResumed
+AgentEvent = AgentEventRunStarted | AgentEventRunCompleted | AgentEventExtractionSucceeded | AgentEventExtractionFailed | AgentEventRunFailed | AgentEventHookStarted | AgentEventHookCompleted | AgentEventHookFailed | AgentEventHookDenied | AgentEventTurnStarted | AgentEventReasoningDelta | AgentEventReasoningComplete | AgentEventTextDelta | AgentEventTextComplete | AgentEventServerToolContent | AgentEventAssistantImageAppended | AgentEventToolCallRequested | AgentEventToolResultReceived | AgentEventTurnCompleted | AgentEventToolExecutionStarted | AgentEventToolExecutionCompleted | AgentEventToolExecutionTimedOut | AgentEventCompactionStarted | AgentEventCompactionCompleted | AgentEventCompactionFailed | AgentEventBudgetWarning | AgentEventRetrying | AgentEventSkillsResolved | AgentEventSkillResolutionFailed | AgentEventInteractionComplete | AgentEventInteractionCallbackPending | AgentEventInteractionFailed | AgentEventStreamTruncated | AgentEventToolConfigChanged | AgentEventBackgroundJobCompleted | AgentEventTranscriptRewriteCommitted | AgentEventTranscriptRewriteAuditReceiptCommitted | AgentEventProviderCacheBreakpointsDiscarded | AgentEventPeerContentIngested | AgentEventTurnUsageAccountingUnmeasured | AgentEventTurnUsageAccountingIdentityDisputed | AgentEventModelFallbackSkipped | AgentEventModelFallbackStaged | AgentEventModelFallbackCommitted | AgentEventModelFallbackTargetFailed | AgentEventBoundaryAppendApplied | AgentEventBoundaryAppendsDiscarded | AgentEventLiveChannelClosed | AgentEventOperationObservationFailed | AgentEventHookLaunchRefused | AgentEventRequestReasoningLowered | AgentEventRunResumed | AgentEventToolResultsBoundedForRequest
 
 
 class StreamScopeFramePrimary(TypedDict, total=False):
