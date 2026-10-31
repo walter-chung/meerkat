@@ -2854,11 +2854,79 @@ mod tests {
             session_boundary_index: 7,
             last_compaction_boundary_index: Some(4),
             last_compaction_attempt_boundary_index: Some(6),
+            last_context_refusal_boundary_index: Some(5),
             last_rewrite_history_tokens: Some(61_234),
+            last_answered_request: Some(crate::compact::AnsweredRequestInput {
+                presented_tokens: 731_000,
+                transcript_rows: 412,
+                provider: "anthropic".to_string(),
+                model: "model-a".to_string(),
+            }),
         };
         persist_compaction_cadence(&mut session, &cadence).unwrap();
 
         assert_eq!(load_compaction_cadence(&mut session).unwrap(), cadence);
+    }
+
+    /// A cadence written before the input anchor and the context refusal
+    /// existed reads with neither, and a cadence without them writes neither
+    /// key, so a binary that predates them reads it unchanged.
+    #[test]
+    fn compaction_cadence_without_anchor_or_refusal_reads_and_writes_as_before() {
+        let legacy = serde_json::json!({
+            "session_boundary_index": 7,
+            "last_compaction_attempt_boundary_index": 6,
+            "last_rewrite_history_tokens": 61_234
+        });
+        let cadence: SessionCompactionCadence = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(cadence.last_answered_request, None);
+        assert_eq!(cadence.last_context_refusal_boundary_index, None);
+        assert_eq!(serde_json::to_value(&cadence).unwrap(), legacy);
+    }
+
+    /// The projection is the provider's count for the last answered request
+    /// plus the transcript estimate of only the rows appended since; without
+    /// an anchor there is none. The refusal fact is the agent's to fill from
+    /// its cadence.
+    #[test]
+    fn build_compaction_context_projects_presented_tokens_plus_appended_rows() {
+        let messages = vec![
+            Message::User(UserMessage::text("answered ".repeat(40))),
+            Message::User(UserMessage::text("x".repeat(4_000))),
+        ];
+        let ctx = build_compaction_context(
+            &messages,
+            0,
+            Some(AnsweredRequestAnchor {
+                presented_tokens: 90_000,
+                appended_rows: &messages[1..],
+            }),
+            None,
+            None,
+            None,
+            3,
+        );
+        assert_eq!(
+            ctx.projected_input_tokens,
+            Some(crate::compact::InputTokenProjection {
+                anchor_tokens: 90_000,
+                appended_tokens: 1_000,
+            })
+        );
+        assert_eq!(
+            ctx.projected_input_tokens
+                .map(crate::compact::InputTokenProjection::projected_tokens),
+            Some(91_000)
+        );
+        assert_eq!(ctx.last_context_refusal_boundary_index, None);
+        assert_eq!(
+            ctx.estimated_history_tokens,
+            estimate_tokens(&messages).unwrap(),
+            "the history estimate still measures the whole transcript"
+        );
+
+        let unanchored = build_compaction_context(&messages, 0, None, None, None, None, 3);
+        assert_eq!(unanchored.projected_input_tokens, None);
     }
 
     /// Cadence metadata written before 0.9.4 has no rewrite evidence: it reads
@@ -3019,7 +3087,7 @@ mod tests {
     #[test]
     fn build_compaction_context_populates_request_byte_estimate() {
         let messages = vec![Message::User(UserMessage::text("hello bytes"))];
-        let ctx = build_compaction_context(&messages, 42, None, None, None, 7);
+        let ctx = build_compaction_context(&messages, 42, None, None, None, None, 7);
         assert_eq!(
             ctx.estimated_request_bytes,
             estimate_request_bytes(&messages).unwrap(),

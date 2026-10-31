@@ -13695,6 +13695,14 @@ mod tests {
             cadence_before.last_compaction_boundary_index,
             "a rolled-back rewrite is an attempt, not a successful compaction"
         );
+        assert!(
+            cadence_before.last_answered_request.is_some(),
+            "the first answer anchored the projection"
+        );
+        assert_eq!(
+            agent.compaction_cadence.last_answered_request, cadence_before.last_answered_request,
+            "the rollback restores the anchor with the transcript it counted"
+        );
         let persisted_cadence: crate::compact::SessionCompactionCadence = serde_json::from_value(
             agent.session().metadata()[crate::compact::SESSION_COMPACTION_CADENCE_KEY].clone(),
         )
@@ -14535,6 +14543,19 @@ mod tests {
         let rollback_usage = rollback_session.total_usage();
         let rollback_last_input_tokens = agent.last_input_tokens;
         agent.compaction_cadence.last_rewrite_history_tokens = Some(111);
+        let rollback_anchor = crate::compact::AnsweredRequestInput {
+            presented_tokens: 731,
+            transcript_rows: u64::try_from(rollback_messages.len()).unwrap(),
+            provider: "other".to_string(),
+            model: "mock-model".to_string(),
+        };
+        agent.compaction_cadence.last_answered_request = Some(rollback_anchor.clone());
+        agent.compaction_cadence.last_context_refusal_boundary_index = Some(
+            agent
+                .compaction_cadence
+                .session_boundary_index
+                .saturating_sub(1),
+        );
         let rollback_compaction_cadence = agent.compaction_cadence.clone();
         let attempted_boundary = rollback_compaction_cadence.session_boundary_index + 1;
         let projection = append_abort_test_projection(agent.session_mut(), "atomic-apply-failure");
@@ -14556,6 +14577,10 @@ mod tests {
             .last_compaction_attempt_boundary_index = Some(attempted_boundary);
         agent.compaction_cadence.last_compaction_boundary_index = Some(attempted_boundary);
         agent.compaction_cadence.last_rewrite_history_tokens = Some(999);
+        // The attempt cleared the refusal; its committed rewrite dropped the
+        // anchor.
+        agent.compaction_cadence.last_context_refusal_boundary_index = None;
+        agent.compaction_cadence.last_answered_request = None;
         memory_store.staged.lock().unwrap().push(projection.clone());
         agent.compaction_transaction = Some(crate::agent::CompactionTransaction {
             carried_projections: Vec::new(),
@@ -14618,6 +14643,15 @@ mod tests {
             agent.compaction_cadence.last_rewrite_history_tokens,
             Some(111),
             "an aborted rewrite left nothing: the previous rewrite's evidence stays"
+        );
+        assert_eq!(
+            agent.compaction_cadence.last_answered_request,
+            Some(rollback_anchor),
+            "the rollback restores the anchor with the transcript it counted"
+        );
+        assert_eq!(
+            agent.compaction_cadence.last_context_refusal_boundary_index, None,
+            "the attempt ran, so the refusal it cleared stays cleared"
         );
         assert!(
             agent
@@ -16378,6 +16412,359 @@ mod tests {
             })
             .expect("the run's result is in the request");
         assert_eq!(result.len(), 95_000, "the result is sent whole");
+    }
+
+    /// Answers every ordinary request with `presented` input tokens and
+    /// every compaction summary request with a summary, and refuses each
+    /// ordinary request whose last user text is in `refuse` with a
+    /// context-length error, as a provider refuses a request over its window.
+    struct PresentingClient {
+        presented: u64,
+        refuse: &'static [&'static str],
+        summary_requests: Mutex<usize>,
+    }
+
+    impl PresentingClient {
+        fn new(presented: u64) -> Self {
+            Self::refusing(presented, &[])
+        }
+
+        fn refusing(presented: u64, refuse: &'static [&'static str]) -> Self {
+            Self {
+                presented,
+                refuse,
+                summary_requests: Mutex::new(0),
+            }
+        }
+
+        fn summary_requests(&self) -> usize {
+            *self.summary_requests.lock().unwrap()
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl AgentLlmClient for PresentingClient {
+        async fn stream_response(
+            &self,
+            messages: &[Message],
+            _tools: &[Arc<ToolDef>],
+            _max_tokens: u32,
+            _temperature: Option<f32>,
+            _provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
+        ) -> Result<super::LlmStreamResult, AgentError> {
+            let last_user = messages
+                .iter()
+                .rev()
+                .find_map(|message| match message {
+                    Message::User(user) => Some(user.text_content()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let text = if last_user == "COMPACT NOW" {
+                *self.summary_requests.lock().unwrap() += 1;
+                "summary"
+            } else if self.refuse.contains(&last_user.as_str()) {
+                return Err(AgentError::Llm {
+                    provider: "mock",
+                    reason: LlmFailureReason::ContextExceeded {
+                        max: 1_000,
+                        requested: 2_000,
+                    },
+                    message: "context length exceeded".to_string(),
+                });
+            } else {
+                "ok"
+            };
+            Ok(super::LlmStreamResult::new(
+                vec![AssistantBlock::Text {
+                    text: text.to_string(),
+                    meta: None,
+                }],
+                StopReason::EndTurn,
+                normalized_test_usage(
+                    self,
+                    Usage {
+                        input_tokens: self.presented,
+                        output_tokens: 1,
+                        ..Usage::default()
+                    },
+                ),
+            ))
+        }
+
+        fn provider(&self) -> crate::provider::Provider {
+            crate::provider::Provider::Other
+        }
+
+        fn model(&self) -> &'static str {
+            "mock-model"
+        }
+    }
+
+    /// [`DiscardingCompactor`]'s rebuild, compacting whenever `compacts`
+    /// says so and recording every context it is asked about.
+    struct RecordingDiscardingCompactor {
+        compacts: fn(&CompactionContext) -> bool,
+        seen: Mutex<Vec<CompactionContext>>,
+    }
+
+    impl RecordingDiscardingCompactor {
+        fn new(compacts: fn(&CompactionContext) -> bool) -> Self {
+            Self {
+                compacts,
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// The context of the check at `boundary`.
+        fn at(&self, boundary: u64) -> CompactionContext {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|ctx| ctx.session_boundary_index == boundary)
+                .cloned()
+                .unwrap_or_else(|| panic!("no compaction check at boundary {boundary}"))
+        }
+    }
+
+    impl Compactor for RecordingDiscardingCompactor {
+        fn should_compact(&self, ctx: &CompactionContext) -> bool {
+            self.seen.lock().unwrap().push(ctx.clone());
+            (self.compacts)(ctx)
+        }
+
+        fn compaction_prompt(&self) -> &'static str {
+            "COMPACT NOW"
+        }
+
+        fn max_summary_tokens(&self) -> u32 {
+            32
+        }
+
+        fn prepare_for_summarization(
+            &self,
+            messages: &[Message],
+            budget: Option<crate::compact::SummarizationSourceBudget>,
+        ) -> crate::compact::SummarizationSource {
+            DiscardingCompactor::new(u64::MAX).prepare_for_summarization(messages, budget)
+        }
+
+        fn rebuild_history(&self, messages: &[Message], summary: &str) -> CompactionResult {
+            DiscardingCompactor::new(u64::MAX).rebuild_history(messages, summary)
+        }
+    }
+
+    /// The compaction cadence `session`'s metadata carries.
+    fn persisted_cadence(session: &crate::Session) -> crate::compact::SessionCompactionCadence {
+        serde_json::from_value(
+            session.metadata()[crate::compact::SESSION_COMPACTION_CADENCE_KEY].clone(),
+        )
+        .unwrap()
+    }
+
+    /// The request the provider answers anchors the next projection: its
+    /// presented tokens, the rows it was composed from (its answer comes
+    /// after them) and the provider and model that counted them, persisted
+    /// with the cadence. The next request projects from it.
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn an_answered_request_anchors_the_input_projection_and_persists_it() {
+        let client = Arc::new(PresentingClient::new(5_000));
+        let compactor = Arc::new(RecordingDiscardingCompactor::new(|_| false));
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .compactor(compactor.clone())
+            .build_standalone(client, Arc::new(NoTools), Arc::new(NoopStore))
+            .await;
+
+        agent.run("first".into()).await.unwrap();
+        let rows = agent.session().messages().len();
+        let anchor = agent
+            .compaction_cadence
+            .last_answered_request
+            .clone()
+            .expect("the answered request anchors the projection");
+        assert_eq!(anchor.presented_tokens, 5_000);
+        assert_eq!(anchor.provider, "other");
+        assert_eq!(anchor.model, "mock-model");
+        assert_eq!(
+            anchor.transcript_rows,
+            u64::try_from(rows - 1).unwrap(),
+            "the request's rows: its answer came after them"
+        );
+        assert_eq!(
+            persisted_cadence(agent.session()),
+            agent.compaction_cadence,
+            "the anchor rides the session metadata"
+        );
+        assert_eq!(
+            compactor.at(0).projected_input_tokens,
+            None,
+            "nothing was answered before the first request"
+        );
+
+        agent.run("second".into()).await.unwrap();
+        let projection = compactor
+            .at(1)
+            .projected_input_tokens
+            .expect("the second run's first request projects from the first answer");
+        assert_eq!(projection.anchor_tokens, 5_000);
+        assert!(
+            projection.appended_tokens > 0,
+            "the answer and the new prompt were appended since: {projection:?}"
+        );
+    }
+
+    /// A committed rewrite drops the anchor: the count was of the transcript
+    /// the rewrite replaced. Here the rewritten request is refused, so
+    /// nothing anchors again before the next run, whose check projects
+    /// nothing; its answer anchors again on the rewritten transcript.
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn a_committed_rewrite_drops_the_anchor() {
+        let client = Arc::new(PresentingClient::refusing(5_000, &["second"]));
+        let compactor = Arc::new(RecordingDiscardingCompactor::new(|ctx| {
+            ctx.session_boundary_index == 1
+        }));
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .compactor(compactor.clone())
+            .build_standalone(client.clone(), Arc::new(NoTools), Arc::new(NoopStore))
+            .await;
+
+        agent.run("first".into()).await.unwrap();
+        assert!(agent.compaction_cadence.last_answered_request.is_some());
+        let refused = agent.run("second".into()).await;
+        assert!(refused.is_err(), "the rewritten request is refused");
+        assert_eq!(client.summary_requests(), 1, "one rewrite at boundary 1");
+        assert!(
+            compactor.at(1).projected_input_tokens.is_some(),
+            "the check that compacted projected from the first answer"
+        );
+        assert_eq!(
+            agent.compaction_cadence.last_answered_request, None,
+            "the committed rewrite dropped the anchor and nothing answered since"
+        );
+        assert_eq!(persisted_cadence(agent.session()), agent.compaction_cadence);
+
+        agent.run("third".into()).await.unwrap();
+        assert_eq!(
+            compactor.at(2).projected_input_tokens,
+            None,
+            "the next check has no anchor"
+        );
+        let anchor = agent
+            .compaction_cadence
+            .last_answered_request
+            .clone()
+            .expect("the answer anchors again");
+        assert_eq!(
+            anchor.transcript_rows,
+            u64::try_from(agent.session().messages().len() - 1).unwrap(),
+            "the anchor counts the rewritten transcript"
+        );
+    }
+
+    /// A request the provider refuses for context records the refused
+    /// boundary in the cadence, persisted, and the run stays failed. The next
+    /// check sees the fact, and the attempt it causes clears it whether it
+    /// commits or not, so it costs one compaction: a later run with no
+    /// refusal sees nothing.
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn a_context_refusal_is_recorded_and_cleared_by_the_next_attempt() {
+        let client = Arc::new(PresentingClient::refusing(5_000, &["second"]));
+        let compactor = Arc::new(RecordingDiscardingCompactor::new(|ctx| {
+            ctx.last_context_refusal_boundary_index.is_some()
+        }));
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .compactor(compactor.clone())
+            .build_standalone(client.clone(), Arc::new(NoTools), Arc::new(NoopStore))
+            .await;
+
+        agent.run("first".into()).await.unwrap();
+        let anchor = agent.compaction_cadence.last_answered_request.clone();
+        let refused = agent.run("second".into()).await;
+        assert!(
+            matches!(
+                refused,
+                Err(AgentError::TerminalFailure {
+                    cause_kind: crate::TurnTerminalCauseKind::LlmFailure,
+                    ..
+                })
+            ),
+            "the refused run stays a typed LLM failure: {refused:?}"
+        );
+        assert_eq!(
+            agent.compaction_cadence.last_context_refusal_boundary_index,
+            Some(1),
+            "the refused request's boundary"
+        );
+        assert_eq!(
+            agent.compaction_cadence.last_answered_request, anchor,
+            "a refused request anchors nothing"
+        );
+        assert_eq!(persisted_cadence(agent.session()), agent.compaction_cadence);
+
+        agent.run("third".into()).await.unwrap();
+        assert_eq!(
+            compactor.at(2).last_context_refusal_boundary_index,
+            Some(1),
+            "the next check sees the refusal"
+        );
+        assert_eq!(
+            client.summary_requests(),
+            1,
+            "one compaction for the refusal"
+        );
+        assert_eq!(
+            agent.compaction_cadence.last_context_refusal_boundary_index, None,
+            "the attempt cleared the refusal"
+        );
+        assert_eq!(
+            agent
+                .compaction_cadence
+                .last_compaction_attempt_boundary_index,
+            Some(2)
+        );
+
+        agent.run("fourth".into()).await.unwrap();
+        assert_eq!(client.summary_requests(), 1, "no refusal, no compaction");
+        assert_eq!(persisted_cadence(agent.session()), agent.compaction_cadence);
+    }
+
+    /// An anchor another provider or model counted (a model fallback or a
+    /// hot swap since) is not this model's count: the next check drops it
+    /// and projects nothing, and the next answer anchors again.
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn an_anchor_another_model_counted_is_dropped() {
+        let compactor = Arc::new(RecordingDiscardingCompactor::new(|_| false));
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .compactor(compactor.clone())
+            .build_standalone(
+                Arc::new(PresentingClient::new(5_000)),
+                Arc::new(NoTools),
+                Arc::new(NoopStore),
+            )
+            .await;
+
+        agent.run("first".into()).await.unwrap();
+        if let Some(anchor) = agent.compaction_cadence.last_answered_request.as_mut() {
+            anchor.model = "another-model".to_string();
+        }
+        agent.run("second".into()).await.unwrap();
+
+        assert_eq!(compactor.at(1).projected_input_tokens, None);
+        assert_eq!(
+            agent
+                .compaction_cadence
+                .last_answered_request
+                .as_ref()
+                .map(|anchor| anchor.model.as_str()),
+            Some("mock-model"),
+            "the second answer anchors again"
+        );
     }
 
     #[cfg(feature = "workspace-tests")]
