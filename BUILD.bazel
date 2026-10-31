@@ -711,6 +711,7 @@ test_suite(
         "//crates/meerkat-machine-kernels:kernel_typed_round_trip_test",
         "//crates/meerkat-machine-kernels:live_token_debug_redaction_test",
         "//crates/meerkat-machine-kernels:meerkat_machine_kernels_unit_test",
+        "//crates/meerkat-machine-kernels:native_helper_arity_test",
         "//crates/meerkat-machine-schema:auth_machine_oauth_flow_test",
         "//crates/meerkat-machine-schema:auth_machine_release_test",
         "//crates/meerkat-machine-schema:catalog_typed_round_trip_test",
