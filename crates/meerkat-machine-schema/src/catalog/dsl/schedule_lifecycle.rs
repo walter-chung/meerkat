@@ -528,4 +528,209 @@ mod tests {
         assert_eq!(auth.state().planning_cursor_utc_ms, planning_after_delete);
         assert_eq!(auth.state().next_occurrence_ordinal, ordinal_after_delete);
     }
+
+    fn revise(auth: &mut ScheduleLifecycleMachineAuthority, at_utc_ms: u64) {
+        ScheduleLifecycleMachineMutator::apply(
+            auth,
+            ScheduleLifecycleInput::Revise {
+                trigger_key: "trigger-0".into(),
+                target_binding_key: "target-0".into(),
+                misfire_policy: MisfirePolicy::Skip,
+                overlap_policy: OverlapPolicy::SkipIfRunning,
+                missing_target_policy: MissingTargetPolicy::MarkMisfired,
+                planning_horizon_days: 30,
+                planning_horizon_occurrences: 64,
+                at_utc_ms,
+            },
+        )
+        .expect("Revise from Active or Paused must succeed");
+    }
+
+    fn confirm(
+        auth: &mut ScheduleLifecycleMachineAuthority,
+        occurrence_id: &str,
+        superseding_revision: u64,
+    ) -> ScheduleLifecycleMachineTransition {
+        ScheduleLifecycleMachineMutator::apply(
+            auth,
+            ScheduleLifecycleInput::ConfirmOccurrencesSuperseded {
+                occurrence_id: occurrence_id.into(),
+                superseding_revision,
+            },
+        )
+        .expect("ConfirmOccurrencesSuperseded is accepted in every phase")
+    }
+
+    fn ack_ids(auth: &ScheduleLifecycleMachineAuthority) -> std::collections::BTreeSet<String> {
+        auth.state()
+            .superseded_ack_ids
+            .iter()
+            .map(|id| id.0.clone())
+            .collect()
+    }
+
+    fn ids(values: &[&str]) -> std::collections::BTreeSet<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    /// Each revise supersedes at its new revision, and its acknowledgements
+    /// replace the earlier supersessions': after any number of revises, from
+    /// Active or Paused, the set holds only the latest supersession's ids.
+    #[test]
+    fn revise_keeps_only_the_latest_supersessions_acks() {
+        let mut auth = ScheduleLifecycleMachineAuthority::new();
+        for round in 1..=6_u64 {
+            if round == 4 {
+                ScheduleLifecycleMachineMutator::apply(
+                    &mut auth,
+                    ScheduleLifecycleInput::Pause { at_utc_ms: 0 },
+                )
+                .expect("Pause from Active must succeed");
+            }
+            revise(&mut auth, round);
+            assert!(
+                auth.state().superseded_ack_ids.is_empty(),
+                "revise {round} must drop every acknowledgement of an earlier revision, found {:?}",
+                ack_ids(&auth)
+            );
+            let revision = auth.state().revision;
+            let occurrence = format!("occurrence-{round}");
+            confirm(&mut auth, &occurrence, revision);
+            assert_eq!(
+                ack_ids(&auth),
+                ids(&[occurrence.as_str()]),
+                "after revise {round} the set holds the latest supersession's acknowledgement only"
+            );
+        }
+        assert_eq!(auth.state().lifecycle_phase, ScheduleLifecycleState::Paused);
+    }
+
+    /// An acknowledgement that does not answer the latest supersession (a late
+    /// one of an earlier revision, whose id a later revise dropped, or one for
+    /// a revision the schedule never reached) is accepted and changes nothing;
+    /// a repeated acknowledgement of the latest supersession keeps its id.
+    #[test]
+    fn acks_that_do_not_answer_the_latest_supersession_are_idempotent_noops() {
+        let mut auth = ScheduleLifecycleMachineAuthority::new();
+        revise(&mut auth, 1);
+        confirm(&mut auth, "occurrence-a", 2);
+        revise(&mut auth, 2);
+        confirm(&mut auth, "occurrence-b", 3);
+        revise(&mut auth, 3);
+        confirm(&mut auth, "occurrence-c", 4);
+        assert_eq!(auth.state().revision, 4);
+        assert_eq!(ack_ids(&auth), ids(&["occurrence-c"]));
+        let latest = auth.state().clone();
+
+        for (occurrence, superseding_revision) in [
+            // Two revisions back, its id dropped by the later revises.
+            ("occurrence-a", 2),
+            // One revision back.
+            ("occurrence-b", 3),
+            // Never recorded, from an earlier revision.
+            ("occurrence-z", 1),
+            // A revision the schedule never reached.
+            ("occurrence-y", 5),
+            // The latest supersession's own acknowledgement again.
+            ("occurrence-c", 4),
+        ] {
+            let late = confirm(&mut auth, occurrence, superseding_revision);
+            assert_eq!(late.from_phase, ScheduleLifecycleState::Active);
+            assert_eq!(late.to_phase, ScheduleLifecycleState::Active);
+            assert!(
+                late.effects().is_empty(),
+                "an acknowledgement emits nothing, got {:?}",
+                late.effects()
+            );
+            assert_eq!(
+                auth.state(),
+                &latest,
+                "acknowledgement of {occurrence} at revision {superseding_revision} must leave \
+                 the latest supersession's set as it was"
+            );
+        }
+    }
+
+    /// Delete supersedes like a revise: it drops the earlier supersessions'
+    /// ids and records its own acknowledgements, which a repeated delete keeps.
+    #[test]
+    fn delete_keeps_only_its_own_supersessions_acks() {
+        for pause_first in [false, true] {
+            let mut auth = ScheduleLifecycleMachineAuthority::new();
+            revise(&mut auth, 1);
+            confirm(&mut auth, "occurrence-a", 2);
+            if pause_first {
+                ScheduleLifecycleMachineMutator::apply(
+                    &mut auth,
+                    ScheduleLifecycleInput::Pause { at_utc_ms: 2 },
+                )
+                .expect("Pause from Active must succeed");
+            }
+            ScheduleLifecycleMachineMutator::apply(
+                &mut auth,
+                ScheduleLifecycleInput::Delete { at_utc_ms: 3 },
+            )
+            .expect("Delete from Active or Paused must succeed");
+            assert_eq!(
+                auth.state().lifecycle_phase,
+                ScheduleLifecycleState::Deleted
+            );
+            assert!(
+                auth.state().superseded_ack_ids.is_empty(),
+                "delete (paused first: {pause_first}) must drop the revise's acknowledgements, found {:?}",
+                ack_ids(&auth)
+            );
+            confirm(&mut auth, "occurrence-b", 3);
+            confirm(&mut auth, "occurrence-a", 2);
+            assert_eq!(ack_ids(&auth), ids(&["occurrence-b"]));
+
+            let repeated = ScheduleLifecycleMachineMutator::apply(
+                &mut auth,
+                ScheduleLifecycleInput::Delete { at_utc_ms: 4 },
+            )
+            .expect("Delete from Deleted is the idempotent no-op");
+            assert!(repeated.effects().is_empty());
+            assert_eq!(
+                ack_ids(&auth),
+                ids(&["occurrence-b"]),
+                "a repeated delete keeps the delete's own acknowledgements"
+            );
+        }
+    }
+
+    /// A stored state from before the bound (any number of acknowledgements of
+    /// earlier revisions) recovers unchanged, and its next revise drops them.
+    #[test]
+    fn a_stored_large_ack_set_recovers_and_the_next_revise_drops_it() {
+        let mut stored = ScheduleLifecycleMachineAuthority::new().state().clone();
+        stored.revision = 41;
+        stored.superseded_ack_ids = (0..512)
+            .map(|n| OccurrenceId(format!("occurrence-{n}")))
+            .collect();
+
+        let mut auth = ScheduleLifecycleMachineAuthority::recover_from_state(stored.clone())
+            .expect("a stored set of any size recovers: no invariant reads its size");
+        assert_eq!(auth.state(), &stored);
+
+        revise(&mut auth, 1);
+        assert_eq!(auth.state().revision, 42);
+        assert!(
+            auth.state().superseded_ack_ids.is_empty(),
+            "the next revise must drop the stored acknowledgements, found {}",
+            auth.state().superseded_ack_ids.len()
+        );
+
+        let mut auth = ScheduleLifecycleMachineAuthority::recover_from_state(stored)
+            .expect("a stored set of any size recovers");
+        ScheduleLifecycleMachineMutator::apply(
+            &mut auth,
+            ScheduleLifecycleInput::Delete { at_utc_ms: 1 },
+        )
+        .expect("Delete from Active must succeed");
+        assert!(
+            auth.state().superseded_ack_ids.is_empty(),
+            "the next delete must drop the stored acknowledgements, found {}",
+            auth.state().superseded_ack_ids.len()
+        );
+    }
 }
