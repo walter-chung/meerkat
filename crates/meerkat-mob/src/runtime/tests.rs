@@ -100514,6 +100514,243 @@ async fn turn_driven_placed_spawn_with_initial_message_retains_no_activation_cle
     member.shutdown();
     scripted.shutdown();
 }
+
+/// A member whose endpoint migrated (a wake onto a successor session) is
+/// wired to a placed peer while it is dormant, so the wire wakes it and the
+/// wake's topology repairs the new edge. The repair reinstalls the member's
+/// own trust toward the placed peer first, then asks the peer's host, once per
+/// repair, to drop the member's old endpoint (`RemovePeerTrust` carrying the
+/// historical peer id). A host that refuses that removal (`Unavailable`)
+/// leaves the woken member trusting its placed peer; the edge's next repair
+/// (an idempotent `wire`) removes the old endpoint. No removal names the
+/// member's current endpoint.
+#[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_placed_peer_drops_a_migrated_members_old_endpoint_after_the_member_trusts_it() {
+    use crate::machines::mob_machine as dsl;
+    const STEP: Duration = Duration::from_secs(30);
+
+    async fn wait_for_machine_state(
+        handle: &MobHandle,
+        what: &str,
+        reached: impl Fn(&crate::machines::mob_machine::MobMachineState) -> bool,
+    ) {
+        let mut state = handle.machine_state_watch_rx.clone();
+        let outcome = tokio::time::timeout(Duration::from_secs(30), state.wait_for(reached))
+            .await
+            .map(|seen| seen.is_ok());
+        assert!(matches!(outcome, Ok(true)), "{what}");
+    }
+
+    /// Release `identity` once its registration's binding landed, and wait
+    /// until it is Dormant.
+    async fn release_landed(handle: &MobHandle, identity: &AgentIdentity) {
+        let key = crate::machines::mob_machine::AgentIdentity::from_domain(identity);
+        wait_for_machine_state(handle, "the member's registration lands", |state| {
+            state
+                .member_materialization_epoch
+                .get(&key)
+                .is_some_and(Option::is_some)
+        })
+        .await;
+        tokio::time::timeout(Duration::from_secs(30), handle.release_member(identity))
+            .await
+            .expect("the release answers")
+            .expect("release the member");
+        wait_for_machine_state(handle, "the released member is dormant", |state| {
+            state.member_materialization.get(&key).copied()
+                == Some(crate::machines::mob_machine::MemberMaterializationPhase::Dormant)
+        })
+        .await;
+    }
+
+    let _guard = placement_support::REAL_COMMS_TEST_LOCK.lock().await;
+    let host = placement_support::spawn_scripted_host_peer("placed-history-host").await;
+    let receiver = Arc::new(
+        placement_support::spawn_peer_comms_endpoint("placed-history-remote", true, None).await,
+    );
+    host.script_member_identity("remote", placement_support::member_identity_of(&receiver));
+    host.bind_member_endpoint("remote", Arc::clone(&receiver));
+    // A failed edge repair is owed again after this backoff: no owed retry
+    // runs during the row, so it reads what the wake's own repair left.
+    let controlling =
+        placement_support::create_controlling_mob_with_builder("placed-history", |builder| {
+            builder
+                .with_member_wake_retry_backoff(Duration::from_secs(600), Duration::from_secs(600))
+        })
+        .await;
+    let report = controlling.bind_scripted(&host).await;
+    controlling
+        .spawn_placed("worker", "remote", &report.host_id)
+        .await
+        .expect("spawn the placed peer");
+    let local = AgentIdentity::from("local");
+    let remote = AgentIdentity::from("remote");
+    let local_key = dsl::AgentIdentity::from_domain(&local);
+    let remote_key = dsl::AgentIdentity::from_domain(&remote);
+
+    // The local member's history: it is released, its binding then names a
+    // session no store holds, its original session is unlisted, and an
+    // unbound session named for it is listed, so its wake restores it on
+    // that successor, whose key is another endpoint.
+    tokio::time::timeout(
+        STEP,
+        controlling
+            .handle
+            .spawn_spec(SpawnMemberSpec::new("worker", "local")),
+    )
+    .await
+    .expect("the local spawn answers")
+    .expect("spawn the local member");
+    let original = controlling.member_session_id(&local).await;
+    release_landed(&controlling.handle, &local).await;
+    let old_peer_id = controlling
+        .handle
+        .query_machine_state()
+        .await
+        .expect("machine state")
+        .member_peer_endpoints
+        .get(&local_key)
+        .map(|endpoint| endpoint.peer_id.0.clone())
+        .expect("the member's durable endpoint");
+    controlling
+        .handle
+        .rebind_member_session_for_test(&local, SessionId::new())
+        .await
+        .expect("move the member's binding to a session no store holds");
+    // Unlisted, the original session is no successor candidate: the
+    // session created below is the only one, whatever the clock says (the
+    // original would tie with it on match rank and lose only on its earlier
+    // `updated_at`).
+    meerkat_runtime::RuntimeStore::delete_runtime_session_catalog_entry(
+        &*controlling.runtime_store,
+        &meerkat_runtime::LogicalRuntimeId::for_session(&original),
+    )
+    .await
+    .expect("unlist the member's original session");
+    let successor = controlling
+        .service
+        .create_session(CreateSessionRequest {
+            injected_context: Vec::new(),
+            model: "claude-haiku-4-5-20251001".to_string(),
+            prompt: "a session named for the member".to_string().into(),
+            system_prompt: meerkat_core::SystemPromptOverride::Inherit,
+            max_tokens: None,
+            event_tx: None,
+            build: Some(meerkat_core::service::SessionBuildOptions {
+                comms_name: Some(
+                    super::actor::render_member_comms_name(
+                        controlling.mob_id.as_str(),
+                        "worker",
+                        local.as_str(),
+                    )
+                    .expect("the member's comms name"),
+                ),
+                mob_member_binding: None,
+                ..Default::default()
+            }),
+            initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+            deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
+            labels: None,
+        })
+        .await
+        .expect("persist an unbound session named for the member")
+        .session_id;
+    MobSessionService::discard_live_session(&*controlling.service, &successor)
+        .await
+        .expect("discard the successor's creating actor");
+    tokio::time::timeout(STEP, controlling.handle.ensure_member_live(&local))
+        .await
+        .expect("the member's wake answers")
+        .expect("the member wakes on its successor");
+    assert_eq!(
+        controlling.member_session_id(&local).await,
+        successor,
+        "the wake moved the member to its successor"
+    );
+    let state = controlling
+        .handle
+        .query_machine_state()
+        .await
+        .expect("machine state");
+    let new_peer_id = state
+        .member_peer_endpoints
+        .get(&local_key)
+        .map(|endpoint| endpoint.peer_id.0.clone())
+        .expect("the member's current endpoint");
+    assert_ne!(
+        new_peer_id, old_peer_id,
+        "the successor's key is another endpoint"
+    );
+    assert!(
+        state
+            .member_prior_peer_endpoints
+            .get(&local_key)
+            .is_some_and(|prior| prior
+                .iter()
+                .any(|endpoint| endpoint.peer_id.0 == old_peer_id)),
+        "MobMachine keeps the old endpoint as the member's history"
+    );
+    release_landed(&controlling.handle, &local).await;
+
+    // The wire to the placed peer wakes the dormant member, and the wake's
+    // topology repairs the edge while the host refuses the old endpoint's
+    // removal.
+    host.reject_remove_peer_trust_for(
+        "remote",
+        crate::runtime::bridge_protocol::BridgeRejectionCause::Unavailable,
+        "the placed member is not served here",
+    );
+    tokio::time::timeout(STEP, controlling.handle.wire(local.clone(), remote.clone()))
+        .await
+        .expect("the wire answers")
+        .expect("wire the dormant member to its placed peer");
+    tokio::time::timeout(STEP, controlling.handle.ensure_member_live(&local))
+        .await
+        .expect("the wire's wake answers")
+        .expect("the wire wakes the member");
+    let remote_peer_id = controlling
+        .handle
+        .query_machine_state()
+        .await
+        .expect("machine state")
+        .member_peer_endpoints
+        .get(&remote_key)
+        .map(|endpoint| endpoint.peer_id.0.clone())
+        .expect("the placed peer's endpoint");
+    let removals = || {
+        host.received_remove_peer_trust_payloads()
+            .into_iter()
+            .filter(|payload| payload.agent_identity == "remote")
+            .map(|payload| payload.peer.peer_id)
+            .collect::<Vec<_>>()
+    };
+    // One retained endpoint and one host lane: the wake's repair sends one
+    // removal, and a rejected one is not resent (only a timeout is).
+    assert_eq!(
+        removals(),
+        vec![old_peer_id.clone()],
+        "the wake's repair asked the host once to remove the old endpoint, and only it"
+    );
+    assert!(
+        controlling
+            .local_member_trusts_peer(&successor, &remote_peer_id)
+            .await,
+        "the woken member trusts its placed peer although the host refused the old endpoint's removal"
+    );
+
+    // The edge's next repair asks again, once, and the host accepts.
+    tokio::time::timeout(STEP, controlling.handle.wire(local.clone(), remote.clone()))
+        .await
+        .expect("the repair answers")
+        .expect("the repair removes the old endpoint once the host accepts");
+    assert_eq!(
+        removals(),
+        vec![old_peer_id.clone(), old_peer_id.clone()],
+        "the repair asked once more, and no removal names the member's current endpoint"
+    );
+    host.shutdown();
+}
 /// D67: public ownership and the Closing admission state.
 mod admission_close;
 /// #1497 member continuations resolve through the mob roster.
