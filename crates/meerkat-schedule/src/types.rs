@@ -2268,7 +2268,8 @@ pub struct Schedule {
     /// drops the ids of earlier supersessions, and an acknowledgement that
     /// does not answer `revision` is accepted without being recorded. A set
     /// stored before this bound loads unchanged and is dropped at the next
-    /// revise or delete.
+    /// revise or delete of a live schedule; a schedule deleted before the
+    /// bound keeps the set it was deleted with.
     pub superseded_ack_ids: BTreeSet<OccurrenceId>,
     pub config: ScheduleConfig,
 }

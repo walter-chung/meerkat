@@ -34,7 +34,10 @@ machine! {
             // record an acknowledgement only when its `superseding_revision`
             // is `revision`. A set stored before this bound (any size, ids of
             // any earlier revision) recovers unchanged, since no invariant
-            // reads it, and its next Revise* or Delete* drops it.
+            // reads it, and the next Revise*, DeleteActive or DeletePaused of
+            // a live schedule drops it. A schedule deleted before the bound
+            // keeps the set it was deleted with: no Revise* arm runs from
+            // Deleted, and DeleteDeleted changes nothing.
             superseded_ack_ids: Set<OccurrenceId>,
         }
 
