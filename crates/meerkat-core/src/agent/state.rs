@@ -16119,7 +16119,9 @@ mod tests {
     /// writes the compaction summary when asked, and records every other
     /// request it serves. With `cap`, it measures each request as its JSON
     /// size against that provider cap. With `window`, it refuses every other
-    /// request over that context window, as a provider does.
+    /// request over that context window, as a provider does. With cache
+    /// claims, it places provider cache breakpoints on each request it
+    /// records.
     struct RoundsClient {
         rounds: usize,
         first_answer_bytes: usize,
@@ -16131,6 +16133,7 @@ mod tests {
         refused: Mutex<usize>,
         summary_requests: Mutex<Vec<Vec<Message>>>,
         tool_calls: Mutex<usize>,
+        claims_cache_breakpoints: bool,
     }
 
     impl RoundsClient {
@@ -16146,6 +16149,7 @@ mod tests {
                 refused: Mutex::new(0),
                 summary_requests: Mutex::new(Vec::new()),
                 tool_calls: Mutex::new(0),
+                claims_cache_breakpoints: false,
             }
         }
 
@@ -16182,6 +16186,47 @@ mod tests {
 
         fn summary_requests(&self) -> usize {
             self.summary_requests.lock().unwrap().len()
+        }
+
+        /// Place a provider cache breakpoint at the end of every request it
+        /// answers other than a compaction summary, and one before the
+        /// request's first tool results, as the OpenAI model
+        /// [`Self::with_window`] answers as.
+        fn with_cache_claims(mut self) -> Self {
+            self.claims_cache_breakpoints = true;
+            self
+        }
+
+        /// The cache breakpoints its lowering of `messages` places.
+        fn cache_breakpoint_claims(
+            &self,
+            messages: &[Message],
+        ) -> Vec<crate::ProviderCacheBreakpointClaim> {
+            if !self.claims_cache_breakpoints {
+                return Vec::new();
+            }
+            std::iter::once(messages.len())
+                .chain(messages.iter().position(is_tool_results))
+                .filter(|message_count| *message_count > 0)
+                .map(|message_count| {
+                    crate::provider_cache_breakpoint_claim(
+                        crate::ProviderCacheBreakpointClaimRequest {
+                            provider: self.provider,
+                            model: self.model,
+                            messages,
+                            boundary: crate::CacheBreakpointBoundary::TranscriptAfter {
+                                message_count: u64::try_from(message_count).unwrap(),
+                            },
+                            ttl: crate::ProviderCacheTtl::ProviderDefault,
+                            rendered_prefix: br#"{"renderer_mode":"rounds-test"}"#,
+                            lowered_request_encoding:
+                                crate::LoweredRequestEncoding::OpenAiResponsesJson,
+                            lowered_request_body: br#"{"model":"primary"}"#,
+                        },
+                    )
+                    .expect("rounds test claim shape")
+                })
+                .collect()
         }
     }
 
@@ -16251,12 +16296,15 @@ mod tests {
                 }
             }
             self.requests.lock().unwrap().push(messages.to_vec());
+            let claims = self.cache_breakpoint_claims(messages);
             if last_user == "first" {
-                return Ok(text("a".repeat(self.first_answer_bytes)));
+                return Ok(
+                    text("a".repeat(self.first_answer_bytes)).with_cache_breakpoint_claims(claims)
+                );
             }
             let mut calls = self.tool_calls.lock().unwrap();
             if *calls >= self.rounds {
-                return Ok(text("done".to_string()));
+                return Ok(text("done".to_string()).with_cache_breakpoint_claims(claims));
             }
             *calls += 1;
             Ok(super::LlmStreamResult::new(
@@ -16269,7 +16317,8 @@ mod tests {
                 }],
                 StopReason::ToolUse,
                 normalized_test_usage(self, Usage::default()),
-            ))
+            )
+            .with_cache_breakpoint_claims(claims))
         }
 
         fn provider(&self) -> crate::provider::Provider {
@@ -17444,6 +17493,96 @@ mod tests {
         );
 
         assert_fallback_bound_recorded_and_anchored_nothing(&agent);
+    }
+
+    /// The provider places a cache breakpoint at the end of each request it
+    /// answers and one before the request's first tool results. On either
+    /// axis, the breakpoint at the end of a request that carried the open
+    /// run's own result shortened anchors a prefix the transcript never held
+    /// (the transcript keeps the result whole), so it is dropped unreported;
+    /// the one before the shortened result binds and is kept. Before, every
+    /// bounded request published `provider_cache_breakpoints_discarded` for
+    /// a moved prefix: a degradation that did not happen.
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn a_cache_breakpoint_past_a_shortened_result_is_dropped_unreported() {
+        // The declared window, the provider's request cap, the result size
+        // and the axis that bounds the result.
+        for (window, cap, result_bytes, axis) in [
+            (50_000, None, 400_000, "context_window"),
+            (1_000_000, Some(100_000), 300_000, "request_bytes"),
+        ] {
+            let mut client = RoundsClient::new(1)
+                .with_window(1_000_000)
+                .with_cache_claims();
+            if let Some(cap) = cap {
+                client = client.with_cap(cap);
+            }
+            let client = Arc::new(client);
+            let mut agent = with_test_turn_state_handle_for_session(
+                AgentBuilder::new()
+                    .model("primary")
+                    .max_tokens_per_turn(1_024)
+                    .compactor(Arc::new(RecordingDiscardingCompactor::new(|_| false)))
+                    .with_effective_model_registry(summary_window_test_registry(&[(
+                        "primary", window,
+                    )])),
+                explicit_hot_swap_session("primary"),
+            )
+            .with_tool_visibility_owner(explicit_test_visibility_owner())
+            .build_standalone(
+                client.clone(),
+                Arc::new(LargeListingDispatcher::new(result_bytes)),
+                Arc::new(NoopStore),
+            )
+            .await;
+
+            agent.run("first".into()).await.unwrap();
+            let (tx, mut rx) = mpsc::channel::<crate::event::AgentEvent>(256);
+            agent
+                .run_with_events("second".into(), tx)
+                .await
+                .expect("the run completes with its result bounded");
+            let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+
+            let notices = bounded_request_notices(&events);
+            assert_eq!(
+                notices.len(),
+                1,
+                "{axis}: test setup: the run's request was bounded"
+            );
+            assert_eq!(notices[0]["axis"], axis);
+            let discards = events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        crate::event::AgentEvent::ProviderCacheBreakpointsDiscarded { .. }
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                discards.is_empty(),
+                "{axis}: the bound discards no cache breakpoint: {discards:?}"
+            );
+
+            let bounded = client.requests().last().cloned().expect("the last request");
+            let shortened_at = bounded
+                .iter()
+                .position(is_tool_results)
+                .expect("the bounded request carries the result");
+            let kept = agent
+                .session()
+                .authored_cache_breakpoints()
+                .expect("the session's cache evidence reads");
+            assert!(
+                kept.iter().any(|breakpoint| breakpoint.boundary()
+                    == crate::CacheBreakpointBoundary::TranscriptAfter {
+                        message_count: u64::try_from(shortened_at).unwrap(),
+                    }),
+                "{axis}: the breakpoint before the shortened result binds and is kept"
+            );
+        }
     }
 
     /// Answers every ordinary request with `presented` input tokens and

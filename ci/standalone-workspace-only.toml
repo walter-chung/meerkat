@@ -126,6 +126,7 @@ tests = [
     "agent::runner::skill_activation_effect_tests::work_authorization_clears_after_pending_boundary_refusal",
     "agent::runner::skill_activation_effect_tests::work_authorization_scope_replaces_some_and_none_and_clears_on_drop",
     "agent::state::tests::a_bound_after_a_model_fallback_cuts_again_from_the_whole_result",
+    "agent::state::tests::a_cache_breakpoint_past_a_shortened_result_is_dropped_unreported",
     "agent::state::tests::a_cancel_dispatched_while_the_run_was_staged_ends_it_at_its_first_boundary",
     "agent::state::tests::a_cancel_during_waiting_for_ops_boundary_hooks_ends_the_run_at_that_boundary",
     "agent::state::tests::a_cancel_for_another_run_never_cancels_this_one",
