@@ -1062,6 +1062,69 @@ fn marked_run_resumes_exclusively_through_prepare_then_resume_run() {
     assert_eq!(authority.state().current_run_id, Some(marked));
 }
 
+/// A direct turn's run (one the runtime did not prepare) never starts while
+/// a run is marked resumable, from any phase a direct run starts from, under
+/// a run id of its own or the marked run's: the marked run waits for its
+/// resume or its settlement (a store fence gap suspended it, or a restart
+/// left it open), and a run started beside it would commit its boundary over
+/// the marked run's provisional tail, or resume that run outside
+/// `ResumeRun`, a stopped one included. Once the mark ends, the same start
+/// is accepted. Unrun: written while Cargo is not run.
+#[test]
+fn no_direct_run_starts_while_a_run_is_marked_resumable() {
+    let marked = mm_dsl::RunId("run-marked".to_string());
+    let direct = mm_dsl::RunId("run-direct".to_string());
+    let start = |run_id: &mm_dsl::RunId| mm_dsl::MeerkatMachineInput::StartConversationRun {
+        run_id: run_id.clone(),
+        primitive_kind: mm_dsl::TurnPrimitiveKind::ConversationTurn,
+        admitted_content_shape: mm_dsl::ContentShape::Conversation,
+        vision_enabled: false,
+        image_tool_results_enabled: false,
+        max_extraction_retries: 0,
+    };
+    for phase in [
+        mm_dsl::MeerkatPhase::Idle,
+        mm_dsl::MeerkatPhase::Initializing,
+        mm_dsl::MeerkatPhase::Attached,
+    ] {
+        let state = |resumable_run_id: Option<mm_dsl::RunId>| mm_dsl::MeerkatMachineState {
+            lifecycle_phase: phase,
+            session_id: Some(mm_dsl::SessionId("session-recovery".to_string())),
+            // An Idle registration starts a direct run only with a runtime
+            // bound.
+            active_runtime_id: Some(mm_dsl::AgentRuntimeId("runtime-recovery".to_string())),
+            active_runtime_generation: Some(mm_dsl::Generation(1)),
+            turn_phase: mm_dsl::TurnPhase::Ready,
+            resumable_run_id,
+            ..Default::default()
+        };
+        for run_id in [&direct, &marked] {
+            let mut authority =
+                mm_dsl::MeerkatMachineAuthority::recover_from_state(state(Some(marked.clone())))
+                    .unwrap_or_else(|err| {
+                        panic!("{phase:?} seed state must be recoverable: {err:?}")
+                    });
+            assert!(
+                mm_dsl::MeerkatMachineMutator::apply(&mut authority, start(run_id)).is_err(),
+                "{phase:?}: no run {run_id:?} starts directly while a run is marked resumable"
+            );
+            assert_eq!(authority.state().resumable_run_id, Some(marked.clone()));
+            assert_eq!(authority.state().current_run_id, None);
+            assert_eq!(authority.state().lifecycle_phase, phase);
+        }
+        let mut authority = mm_dsl::MeerkatMachineAuthority::recover_from_state(state(None))
+            .unwrap_or_else(|err| panic!("{phase:?} seed state must be recoverable: {err:?}"));
+        mm_dsl::MeerkatMachineMutator::apply(&mut authority, start(&direct)).unwrap_or_else(
+            |err| panic!("{phase:?}: with no run marked a direct run starts: {err:?}"),
+        );
+        assert_eq!(authority.state().current_run_id, Some(direct.clone()));
+        assert_eq!(
+            authority.state().lifecycle_phase,
+            mm_dsl::MeerkatPhase::Running
+        );
+    }
+}
+
 /// A graceful requeue stop suspends a durable session's in-flight run: the
 /// run stops being current, the pre-run phase returns, and the run is marked
 /// resumable, with no turn terminal. A run whose turn terminal is already

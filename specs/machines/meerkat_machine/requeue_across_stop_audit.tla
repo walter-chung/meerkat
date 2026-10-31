@@ -95,18 +95,22 @@
 \*
 \* A store fence gap suspends A's run in process 1 instead, outside any stop
 \* (SuspendRunForStop with the FenceGap cause): the run's turn has started
-\* (and may have applied its primitive) when the gap comes, no unregister
-\* has begun, or one begins first; before the gap the run may also have
-\* accepted a cancel at its next boundary, an ambient cancel (its boundary
-\* dispatch outstanding, the turn's own flag unset) or a stop, or ended its
-\* turn cancelled. A stop, or an ambient cancel with the executor attached,
-\* may also be asked of the suspended run, and a run whose
-\* stop was asked is then settled (SettleResumableRun), the shell asking for
-\* either reason. The same process otherwise starts the marked run again
-\* (Prepare), resumes it (ResumeRun) and starts its turn again. The path runs twice: with an
-\* executor attached (the ToAttached arm) and, from a separate setup that
-\* starts the run with none attached and explores nothing else, without
-\* (the ToIdle arm). Properties of that path (all invariants):
+\* (and may have applied its primitive) when the gap comes, no unregister has
+\* begun, or one begins first; before the gap the run may also have accepted a
+\* cancel at its next boundary, an ambient cancel (its boundary dispatch
+\* outstanding, the turn's own flag unset) or a stop, or ended its turn
+\* cancelled. A stop, or an ambient cancel with the executor attached, may
+\* also be asked of the suspended run, and a run whose stop was asked is then
+\* settled (SettleResumableRun), the shell asking for either reason. The same
+\* process otherwise starts the marked run again (Prepare), resumes it
+\* (ResumeRun) and starts its turn again. While the run is suspended, and once
+\* it is settled, a direct turn (one the runtime did not prepare: no batch,
+\* never a resumed run) may start a run of its own (StartConversationRun under
+\* another run id, AuditDirectRun, from the phase the suspension left). The
+\* path runs twice: with an executor attached (the ToAttached arm) and, from a
+\* separate setup that starts the run with none attached and explores nothing
+\* else, without (the ToIdle arm, where no runtime is bound, so no direct run
+\* starts). Properties of that path (all invariants):
 \*
 \*   AuditFenceGapTurnResettable: while the run a fence gap suspended is
 \*     marked resumable, its turn is Ready, so the in-process resume can
@@ -125,6 +129,10 @@
 \*     gap or while suspended, is never resumed.
 \*   AuditStoppedGapRunSettledCancelled: a run whose stop was asked is
 \*     settled only as cancelled, never as a refused resume.
+\*   AuditOnlyTheMarkedRunStarts: while a run is marked resumable no other
+\*     run is current: the marked run starts again only under its own id
+\*     (Prepare, then ResumeRun), and no direct run starts beside it, which
+\*     would commit its boundary over the marked run's provisional tail.
 \*   AuditSuspendedRunNotTerminal (above) also covers the gap: a run whose
 \*     turn ended cancelled before the gap is not suspended.
 \*
@@ -135,12 +143,14 @@
 \* expected violations, so the invariants are not vacuous. Among them,
 \* AmbientCancelledGapRunSettled: a run suspended with no intent standing and
 \* never stopped while suspended is still settled as cancelled after an
-\* ambient cancel of it, so that cancel stands as its stop intent. The runner's
-\* --mutants mode seeds seventeen defects, at least one per invariant, into a
-\* copy of the generated model (or, for the serve-before-settle control, the
-\* audit's settlement order) and requires TLC to refuse each with the
-\* invariant it breaks, and ten stop-intent and fence-gap defects, each
-\* checked against its target invariant alone.
+\* ambient cancel of it, so that cancel stands as its stop intent; and
+\* DirectRunStartsAfterSettlement: once the stopped run is settled, a direct
+\* run starts. The runner's --mutants mode seeds seventeen defects, at least
+\* one per invariant, into a copy of the generated model (or, for the
+\* serve-before-settle control, the audit's settlement order) and requires TLC
+\* to refuse each with the invariant it breaks, and eleven stop-intent,
+\* fence-gap and direct-start defects, each checked against its target
+\* invariant alone.
 \*
 \* The TLC config is DERIVED from the generated ci.cfg on every run by
 \* requeue_across_stop_audit.sh. No audit step repeats without bound (the run
@@ -220,6 +230,8 @@ AuditA == "input_1"
 AuditB == "input_2"
 AuditInputs == {AuditA, AuditB}
 AuditRun == "runid_1"
+\* The run a direct turn starts: the runtime did not prepare it.
+AuditDirectRun == "runid_2"
 AuditMaxAgeMs == 900000
 AuditKinds == {"Prompt", "ExternalEvent"}
 TerminalPhases == {"Consumed", "Superseded", "Coalesced", "Abandoned"}
@@ -646,6 +658,19 @@ AuditGapSettleStopped ==
                    audit_gap_restarted, audit_gap_while_draining, audit_gap_idle,
                    audit_gap_intent_at_suspend, audit_gap_stopped, audit_gap_resumed_stopped>>
 
+\* A direct turn (one the runtime did not prepare: no batch, never a resumed
+\* run) starts a run of its own while the suspended run waits for the fence,
+\* or once it is settled: the machine starts it only once the mark has ended.
+\* With no runtime bound (the idle path) no direct run starts at all.
+AuditGapDirectStart ==
+    /\ audit_stage = "Gap"
+    /\ audit_gap_suspended
+    /\ ~audit_gap_resumed
+    /\ \/ StartConversationRunIdleWithBinding(AuditDirectRun, "ConversationTurn", "conversation", FALSE, FALSE, 0)
+       \/ StartConversationRunInitializing(AuditDirectRun, "ConversationTurn", "conversation", FALSE, FALSE, 0)
+       \/ StartConversationRunAttached(AuditDirectRun, "ConversationTurn", "conversation", FALSE, FALSE, 0)
+    /\ KeepAudit
+
 \* Once the fence is back, the same process starts the marked run again,
 \* resumes it and starts its turn again.
 AuditGapResume ==
@@ -888,6 +913,7 @@ AuditNext ==
     \/ AuditGapStopSuspended
     \/ AuditGapAmbientCancelSuspended
     \/ AuditGapSettleStopped
+    \/ AuditGapDirectStart
     \/ AuditGapResume
 
 AuditInit ==
@@ -1019,6 +1045,11 @@ AuditStoppedGapRunNeverResumes == ~audit_gap_resumed_stopped
 
 AuditStoppedGapRunSettledCancelled == audit_gap_settled \in {"None", "Cancelled"}
 
+\* While a run is marked resumable no other run is current: the marked run
+\* starts again only under its own id, and no direct run starts beside it.
+AuditOnlyTheMarkedRunStarts ==
+    resumable_run_id # None => current_run_id \in {None, resumable_run_id}
+
 \* ---- reachability goals, each checked as an expected violation ----
 
 \* The graceful end: Requeue keeps B through the stop and a replay, the
@@ -1107,10 +1138,17 @@ AuditWitnessAmbientCancelledGapRunSettled ==
     /\ ~audit_gap_intent_at_suspend
     /\ ~audit_gap_stopped
 
+\* Once the stopped run is settled (its mark ends), a direct turn starts a
+\* run of its own.
+AuditWitnessDirectRunStartsAfterSettlement ==
+    /\ audit_gap_settled = "Cancelled"
+    /\ current_run_id = Some(AuditDirectRun)
+
 NotAuditWitnessSuspendedRunResumes == ~AuditWitnessSuspendedRunResumes
 NotAuditWitnessFenceGapRunResumes == ~AuditWitnessFenceGapRunResumes
 NotAuditWitnessIdleFenceGapRunResumes == ~AuditWitnessIdleFenceGapRunResumes
 NotAuditWitnessStoppedSuspendedRunEnds == ~AuditWitnessStoppedSuspendedRunEnds
 NotAuditWitnessStoppedGapRunSettled == ~AuditWitnessStoppedGapRunSettled
 NotAuditWitnessAmbientCancelledGapRunSettled == ~AuditWitnessAmbientCancelledGapRunSettled
+NotAuditWitnessDirectRunStartsAfterSettlement == ~AuditWitnessDirectRunStartsAfterSettlement
 ====

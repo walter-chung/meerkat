@@ -26,17 +26,18 @@
 # overlaps Retain, a requeued wait-failure arm that writes state, is
 # guarded on the session or answers any failure, a suspend of a run whose
 # turn terminal is published, and a staged-row normalization that requeues
-# the suspended run's input. It then seeds ten stop-intent and fence-gap
-# defects (a fence-gap suspension that leaves the run's turn mid-flight, one
-# that spends a stage attempt, one that ignores the draining registration,
-# one that drops a cancel the run accepted before the gap, one that drops
-# only an ambient cancel accepted before the gap, one that suspends
-# a run whose turn already ended, one that unbinds the run's input, a resume
-# of a run whose stop was asked, a requeue stop that keeps the input of a
-# resumable run whose stop was asked, and a settlement of a stopped run as a
-# refused resume) and checks each against its target invariant alone, with
-# the generated invariants and the audit's others left out of that run. An
-# anchor this script expects but cannot find fails the run.
+# the suspended run's input. It then seeds eleven stop-intent, fence-gap and
+# direct-start defects (a fence-gap suspension that leaves the run's turn
+# mid-flight, one that spends a stage attempt, one that ignores the draining
+# registration, one that drops a cancel the run accepted before the gap, one
+# that drops only an ambient cancel accepted before the gap, one that
+# suspends a run whose turn already ended, one that unbinds the run's input,
+# a resume of a run whose stop was asked, a requeue stop that keeps the input
+# of a resumable run whose stop was asked, a settlement of a stopped run as a
+# refused resume, and a direct run start beside a run marked resumable) and
+# checks each against its target invariant alone, with the generated
+# invariants and the audit's others left out of that run. An anchor this
+# script expects but cannot find fails the run.
 set -euo pipefail
 
 usage="usage: requeue_across_stop_audit.sh <max-steps> [--mutants] [extra tlc args...]"
@@ -121,7 +122,8 @@ write_cfg() {
   cp "${ci_cfg}" "${cfg}"
   replace_exact_line "SPECIFICATION Spec" "SPECIFICATION AuditSpec" "${cfg}"
   replace_exact_line "  InputIdValues = {}" '  InputIdValues = {"input_1", "input_2"}' "${cfg}"
-  replace_exact_line "  RunIdValues = {}" '  RunIdValues = {"runid_1"}' "${cfg}"
+  # A second run id: the run a direct turn starts (AuditDirectRun).
+  replace_exact_line "  RunIdValues = {}" '  RunIdValues = {"runid_1", "runid_2"}' "${cfg}"
   replace_exact_line "  SessionIdValues = {}" '  SessionIdValues = {"sessionid_1"}' "${cfg}"
   replace_exact_line "  StringValues = {}" '  StringValues = {"input_1", "input_2"}' "${cfg}"
   replace_exact_line "CONSTANTS" "CONSTANTS
@@ -148,6 +150,7 @@ INVARIANTS
   AuditFenceGapKeepsStopIntent
   AuditStoppedGapRunNeverResumes
   AuditStoppedRunInputNotRetained
+  AuditOnlyTheMarkedRunStarts
   AuditStoppedGapRunSettledCancelled${extra}" "${cfg}"
   replace_exact_line "  CiStateConstraint" "  AuditStateConstraint" "${cfg}"
   printf 'CHECK_DEADLOCK FALSE\n' >> "${cfg}"
@@ -220,7 +223,8 @@ fi
 for witness in RetainedRunsAfterGracefulStop RetainedRunsAfterCrash ExpiredSettled \
   StagedNotRetained StopAbandonsEligible PlainStopAbandons RequeuedWaitAnswered \
   SuspendedRunResumes FenceGapRunResumes IdleFenceGapRunResumes \
-  StoppedSuspendedRunEnds StoppedGapRunSettled AmbientCancelledGapRunSettled; do
+  StoppedSuspendedRunEnds StoppedGapRunSettled AmbientCancelledGapRunSettled \
+  DirectRunStartsAfterSettlement; do
   cfg="${work_dir}/witness-${witness}.cfg"
   write_cfg "${cfg}" TRUE "
   NotAuditWitness${witness}"
@@ -783,6 +787,28 @@ for arm in ("SettleResumableRunIdle", "SettleResumableRunAttached"):
         text,
         arm,
         lambda line: line.startswith("    /\\ ") and '"ResumeRefused"' in line,
+        lambda line, _: "    /\\ TRUE",
+    )
+open(path, "w").write(text)
+PY
+
+  # A direct run starts beside a run marked resumable, as it could before
+  # the starts from Idle, Initializing and Attached carried Prepare's guard:
+  # a direct turn retried during a fence gap starts a run of its own.
+  mutate_target direct_start_beside_marked_run AuditOnlyTheMarkedRunStarts <<'PY'
+import os
+from gap_mutation import edit_arm
+path = os.environ["MODEL"]
+text = open(path).read()
+for arm in (
+    "StartConversationRunIdleWithBinding",
+    "StartConversationRunInitializing",
+    "StartConversationRunAttached",
+):
+    text = edit_arm(
+        text,
+        arm,
+        lambda line: line == "    /\\ (resumable_run_id = None)",
         lambda line, _: "    /\\ TRUE",
     )
 open(path, "w").write(text)
