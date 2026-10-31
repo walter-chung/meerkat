@@ -155,10 +155,10 @@ The decision flow:
     - the provider refused the last request for not fitting the model's
       context. That run still fails, and the refused request reported no
       usage; the agent records the refusal in the session's compaction
-      cadence (persisted by the failed run's closing save when the run had
-      committed a round), and the next check compacts the whole transcript
-      once, bypassing the cadence. The attempt clears the refusal whether it
-      commits or not.
+      cadence (committed with the failed run's boundary, so an agent rebuilt
+      from the store sees it too), and the next check compacts the whole
+      transcript once, bypassing the cadence. The attempt clears the refusal
+      whether it commits or not.
   </Step>
 </Steps>
 

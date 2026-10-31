@@ -108,12 +108,10 @@ refusal in the session's compaction cadence, and its next check compacts the
 whole transcript once, whatever the measures and the cadence say: a turn too
 large for the window is summarized instead of being sent again. That attempt
 clears the refusal whether it commits or not, so a refusal costs one
-compaction and cannot loop; an answered request clears it too. When the
-refused run had committed a round (a tool result too large for the window,
-for one), its closing save persists the refusal, so an agent rebuilt from the
-store compacts first too. A refusal of a run's first request is held by the
-live agent only, because nothing of that run is saved: an agent rebuilt from
-the store sends that request once more, and its next run compacts first.
+compaction and cannot loop; an answered request clears it too. The refused
+run's failed boundary commits the refusal with the session, also when the
+refused request was the run's first, so an agent rebuilt from the store
+(after a restart, or for a session not kept alive) compacts first too.
 
 ## Summary authority
 

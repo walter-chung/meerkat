@@ -368,12 +368,13 @@ them.
   too large for the window is summarized instead of being sent again. The
   attempt clears the fact whether it commits or not, so a refusal costs one
   compaction and cannot loop; an answered request clears it too. The refused
-  run still fails as before. When that run had committed a round (the
-  reported case: a tool result too large for the window), its closing save
-  persists the fact, so an agent rebuilt from the store after a restart
-  compacts first too (see Known limitations for a run's first request). A
-  custom `Compactor` receives the fact as
-  `CompactionContext::last_context_refusal_boundary_index`.
+  run still fails as before, and its hard-failure boundary commits the
+  fact with the session (the run's closing save, or, for a refusal of the
+  run's first request, the failed run's applied boundary), so a new agent
+  built from the store (after a restart, for a session not kept alive, for
+  a command-line resume) compacts first too, as does a session wedged by an
+  earlier release after its next refused run. A custom `Compactor` receives
+  the fact as `CompactionContext::last_context_refusal_boundary_index`.
 
 - `meerkat-core`: a pending or approved human consent (R3) is now kept
   across unrelated authorization changes and past the end of its decision's
@@ -652,15 +653,6 @@ them.
   with a context refusal: a compaction inside a run keeps the run's request
   and newest round verbatim. The next run compacts first and continues (see
   Fixed).
-
-- `meerkat-core`: when the provider refuses a run's first request for not
-  fitting the context, nothing of that run is saved, so the refusal fact is
-  held by the live agent only: that agent's next run compacts first, but an
-  agent rebuilt from the store sends the request once more before it
-  compacts, and a host that rebuilds the agent for every run (a session not
-  kept alive) keeps meeting the refusal. This is how a session wedged by an
-  earlier release presents (it has no persisted anchor); a host that keeps
-  its agents alive heals it on the run after the first refusal.
 
 - `meerkat-schedule`: a schedule's superseded acks still grow with every
   revision. `meerkat_schedule_list` summaries leave them out;
