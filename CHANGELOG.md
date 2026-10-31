@@ -341,6 +341,21 @@ them.
   cadence the agent's session carries; a host that swaps in a durable
   snapshot of the session calls it after the swap.
 
+- `meerkat-core`: `AgentEvent::ToolResultsBoundedForRequest { run_id,
+  results, axis }`, wire type `tool_results_bounded_for_request`, with the
+  new `BoundedToolResult` (`tool_use_id`, `tool_name`, `kept_bytes`,
+  `total_bytes`) and the non-exhaustive enum `ToolResultBoundAxis`
+  (`request_bytes`, `context_window`). It is published before a model
+  request that carries some of its run's own tool results shortened for that
+  request only (see Fixed): each call, the bytes of its text the request
+  kept and the bytes of the whole result, and the limit the request did not
+  fit with them whole. Before, only the marker the model reads said so.
+  `AgentEvent` is non-exhaustive, so a Rust match already has a wildcard
+  arm; the published event catalog (`meerkat_contracts::KNOWN_AGENT_EVENT_TYPES`)
+  and the generated SDK inventories list the new type. The Python and
+  TypeScript SDKs surface it as their unknown-event form with the whole
+  payload, and the Web SDK as its generated event type.
+
 ### Fixed
 
 - `meerkat-core` and `meerkat-session`: one tool result no longer carries a
@@ -359,24 +374,28 @@ them.
   (while the last rewrite left the history under the threshold, as for a
   history crossing), and a projection whose answered request alone was over
   the threshold waits for the cadence as the provider's count does. The
-  anchor is set by every answered request, dropped by a committed rewrite
-  (and restored when the rewrite rolls back), by a host transcript edit (a
-  rewrite, a revision restore or a system prompt update) and by a fork at a
-  point, and not used when the active provider or model is not the one that
-  counted it. It is persisted in the session's compaction cadence, so an
-  agent rebuilt from its store projects its first request too, and a live
-  session synced from the store adopts the stored cadence.
+  anchor is set by every answered request that carried the run's tool
+  results whole (not by one that carried them shortened, see below),
+  dropped by a committed rewrite (and restored when the rewrite rolls back),
+  by a host transcript edit (a rewrite, a revision restore or a system
+  prompt update) and by a fork at a point, and not used when the active
+  provider or model is not the one that counted it. It is persisted in the
+  session's compaction cadence, so an agent rebuilt from its store projects
+  its first request too, and a live session synced from the store adopts
+  the stored cadence.
 
 - `meerkat-core` and `meerkat-session`: a session whose request the provider
   refused for not fitting the model's context no longer stays wedged. The
   refused request reported no usage, so the next run's first check saw the
   same counts and sent the same request again, and so did every run after
   it. The refusal is now recorded in the session's compaction cadence
-  (`last_context_refusal_boundary_index`), and the next check compacts the
-  whole transcript once, whatever the thresholds and the cadence say: a turn
-  too large for the window is summarized instead of being sent again. The
-  attempt clears the fact whether it commits or not, so a refusal costs one
-  compaction and cannot loop; an answered request clears it too. The refused
+  (`last_context_refusal_boundary_index`), and the next check whose
+  compaction covers the whole transcript (the next run's first) compacts it
+  once, whatever the thresholds and the cadence say: a turn too large for
+  the window is summarized instead of being sent again. The attempt clears
+  the fact whether it commits or not, so a refusal costs one compaction and
+  cannot loop. A check inside a run neither sees nor clears it, since a
+  compaction there keeps the run's request and newest round. The refused
   run still fails as before, and its hard-failure boundary commits the
   fact with the session (the run's closing save, or, for a refusal of the
   run's first request, the failed run's applied boundary), so a new agent
@@ -386,6 +405,28 @@ them.
   fork at a point drop the fact with the anchor. A custom `Compactor`
   receives the fact as
   `CompactionContext::last_context_refusal_boundary_index`.
+
+- `meerkat-core`: a run whose own tool result is larger than what the
+  model's context window leaves no longer fails with a context refusal when
+  its request projects over the window. A compaction inside a run keeps the
+  run's request and newest round, so the round carrying the result was sent
+  whole and refused. The request-only bound that already shortened the
+  run's own results past the provider's request-body cap now also acts on
+  the token axis: when the composed request, after the compaction check,
+  still projects over the model's input budget (the context window less the
+  output reserve, or the input ceiling), each of the run's results over its
+  share keeps the head of its text and a marker naming the call, for that
+  request only, the share sized from the token overage at two bytes a
+  token. The stored transcript keeps every result whole. On either axis the
+  bound is now announced (`tool_results_bounded_for_request`, see Added),
+  the answer to a bounded request no longer anchors the input projection
+  (its count understates the transcript, so the anchor stays on the request
+  before it), and the bound records the fact a context refusal records, so
+  the next run's first check compacts the whole transcript once instead of
+  sending the whole result again. The compaction check measures the request
+  as composed, before the bound, in tokens as in bytes. After a model
+  fallback the bound cuts from the whole results again, so the marker and
+  the event state each result's whole size.
 
 - `meerkat-core`: a pending or approved human consent (R3) is now kept
   across unrelated authorization changes and past the end of its decision's
@@ -657,13 +698,22 @@ them.
   still widens the headroom the derived four-fifths of the context window
   leaves for what one boundary appends.
 
+- Upgrade the SDKs with the server: a Python, TypeScript or Web SDK of
+  0.9.8 or earlier refuses the new `tool_results_bounded_for_request` event
+  type, as it does any event type newer than its contract. A host that reads
+  the stored cadence's `last_context_refusal_boundary_index` sees it set by
+  a bounded request too, and kept until a compaction of the whole transcript
+  (an answered request no longer clears it).
+
 ### Known limitations
 
 - `meerkat-core`: a run whose own newest round is larger than what the
   context window leaves once the rows before the run are folded still fails
-  with a context refusal: a compaction inside a run keeps the run's request
-  and newest round verbatim. The next run compacts first and continues (see
-  Fixed).
+  with a context refusal when its request's projection reads under the
+  window: a compaction inside a run keeps the run's request and newest round
+  verbatim, and the request-only bound acts on the projection, whose
+  transcript estimate counts four bytes a token and so under-reads dense
+  content. The next run compacts first and continues (see Fixed).
 
 - `meerkat-core`: a context refusal whose run's closing save or boundary
   build fails is not persisted; the next refusal records it again.
