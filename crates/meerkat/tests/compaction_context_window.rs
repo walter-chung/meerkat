@@ -1058,7 +1058,7 @@ mod tests {
         assert!(has_compaction_summary(&session), "the compaction committed");
         let texts = user_texts(&session);
         assert!(
-            texts.iter().any(|text| *text == prompt),
+            texts.contains(&prompt),
             "the restored run's prompt stays verbatim"
         );
         assert!(
