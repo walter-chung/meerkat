@@ -40042,6 +40042,9 @@ macro_rules! meerkat_catalog_machine_dsl {
                     && self.unregister_queued_inputs == UnregisterQueuedInputsDisposition::Keep
                     && self.input_phases.contains_key(input_id)
                     && self.recovered_admitted_inputs.contains(input_id))
+                || (self.resumable_run_id != None
+                    && self.run_stop_requested == self.resumable_run_id
+                    && self.input_run_associations.get_cloned(input_id) == self.resumable_run_id)
             }
             update {}
             to Idle
@@ -40089,6 +40092,9 @@ macro_rules! meerkat_catalog_machine_dsl {
         // nothing (registration_live_input_seen): its unregister records a
         // requested Keep as Stop, since a recycle's recovery or a
         // deduplicated wait mixes live inputs into the recovered witness.
+        // The inputs of a run marked resumable whose stop was asked are not
+        // kept either: the Abandon arm ends them, so the next registration
+        // never resumes the stopped run.
         transition ClassifyStopInputDispositionKeep {
             per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
             on input ClassifyStopInputDisposition { input_id, durability, directed, objective_bound }
@@ -40097,6 +40103,11 @@ macro_rules! meerkat_catalog_machine_dsl {
                 && self.unregister_queued_inputs == UnregisterQueuedInputsDisposition::Keep
                 && self.input_phases.contains_key(input_id)
                 && self.recovered_admitted_inputs.contains(input_id)
+            }
+            guard "not_a_stopped_resumable_run_input" {
+                !(self.resumable_run_id != None
+                    && self.run_stop_requested == self.resumable_run_id
+                    && self.input_run_associations.get_cloned(input_id) == self.resumable_run_id)
             }
             update {}
             to Idle

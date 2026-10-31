@@ -254,6 +254,12 @@ if [[ "${run_mutants}" == "true" ]]; then
     MODEL="${dir}/model.tla" ARMS="${stop_arms}" PYTHONPATH="${work_dir}" python3 -
     local cfg="${work_dir}/mutant-${name}.cfg"
     write_cfg "${cfg}" "${settle_first}" ""
+    # The stop-intent invariants are left to their own targeted mutants
+    # (below): a general mutant that keeps the in-flight input also keeps it
+    # after a stop of its run, which they would report first.
+    awk '$0 != "  AuditStoppedRunInputNotRetained" && $0 != "  AuditStoppedGapRunSettledCancelled"' \
+      "${cfg}" > "${cfg}.next"
+    mv "${cfg}.next" "${cfg}"
     run_tlc "mutant-${name}" "${cfg}" "${dir}"
     local log="${work_dir}/mutant-${name}.log"
     if ! grep -qE "Error: (Invariant|Action property) ${property} is violated" "${log}"; then

@@ -24,7 +24,8 @@
 \* resumable, so the stop keeps A Staged and bound to it), then stops the
 \* runtime. A stop of A's run (StopCurrentRunForRun) may come first, at any
 \* point before the stop transaction: then the stop keeps nothing of the
-\* run, suspended or not. The stop classifies each non-terminal input twice, as the shell
+\* run, suspended or not. That branch ends in process 1: it never restarts
+\* and never takes the gap path, since what it checks is process 1's. The stop classifies each non-terminal input twice, as the shell
 \* does: once for the carriers before the exit and once for the cleanup after
 \* it (the shell refuses a stop whose two answers differ). After the stop it
 \* explores a replayed stop transaction (terminalize_async_stop_once runs
@@ -138,6 +139,10 @@
 \* finds no new state), and 32 steps reach the deepest witness. Check that by
 \* hand with:
 \*   specs/machines/meerkat_machine/requeue_across_stop_audit.sh 60
+\* The process-1 stop branch adds process-1 states only (it never restarts
+\* or takes the gap path): at most the process-1 share of the space again,
+\* never a doubling of the restart's. The safety run's distinct-state count
+\* is recorded here once measured.
 \*
 \* Scope limits: the requeue mark, the waiter answers, the runless carriers
 \* and the expiry clock are shell, so the carrier set here is the shell's
@@ -503,6 +508,7 @@ ConversationTurnStart == StartConversationRunRunning(AuditRun, "ConversationTurn
 
 AuditGapStartTurn ==
     /\ audit_stage = "P1"
+    /\ ~audit_p1_stop
     /\ audit_disposition = "None"
     /\ audit_attempts = 0
     /\ ~audit_suspended
@@ -645,6 +651,7 @@ RowOf(i) ==
 \* crash at any later point: the new process sees the durable rows.
 AuditRestart ==
     /\ audit_stage = "P1Stopped"
+    /\ ~audit_p1_stop
     /\ AuditFreshMachine
     /\ audit_rows' = [i \in NonTerminalInputs |-> RowOf(i)]
     /\ audit_recovery' = [i \in NonTerminalInputs |-> "Durability"]
