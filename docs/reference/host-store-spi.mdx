@@ -299,14 +299,19 @@ The store relies on Core keeping these rules:
   again. It never resumes on a later renew. The rule is Core's: a store
   answers a renew of the current token even when the holder's lease lapsed,
   and refuses only a token that was superseded or that it never issued.
+  A stop is a pause, not a failure: a run that reaches a model call or a
+  tool call while the holder is stopped waits for that fresh acquire, for
+  at most one self-fence window, and goes on once it resumed the holder.
+  The run fails only when the acquire fails, finds another process, or
+  takes longer than the window.
 - **Self-fencing.** The holder fences itself on its own clock: it makes no
   model call, dispatches nothing and commits nothing unless its last
   successful acquire or renew started less than the self-fence window ago.
   It checks the clock before each commit, before each model call, and right
   before each tool call starts, after the round's pre-tool hooks; a call
-  refused there never starts, and the round commits none of its results. A
-  check takes no store request; the per-round path sends no fence request to
-  the store.
+  refused there never starts, and the round commits none of its results.
+  While the window is open, a check takes no store request; the per-round
+  path sends no fence request to the store.
 - **Takeover wait.** After an acquire that supersedes a live holder, the new
   holder waits out `FenceGrant::superseded_lease` before it makes a model
   call or dispatches anything. By then the old holder has fenced itself: the

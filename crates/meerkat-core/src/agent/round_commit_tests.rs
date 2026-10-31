@@ -1063,6 +1063,93 @@ async fn a_call_after_the_fence_closes_never_starts() {
     );
 }
 
+/// A checkpointer whose writer's fence reads closed at once and is restored
+/// by the wait, as a host store writer that a timed-out renew stopped and
+/// whose re-acquire then succeeds: its check without a wait refuses, and its
+/// waiting check yields once and allows. It counts the waits.
+struct RestoredFenceCheckpointer {
+    inner: Arc<RecordingCheckpointer>,
+    waits: AtomicUsize,
+}
+
+#[async_trait]
+impl SessionCheckpointer for RestoredFenceCheckpointer {
+    async fn checkpoint_run(
+        &self,
+        session: &mut Session,
+        run_id: &RunId,
+        previous: Option<&RunCheckpointReceipt>,
+    ) -> Result<Option<RunCheckpointReceipt>, AgentError> {
+        self.inner.checkpoint_run(session, run_id, previous).await
+    }
+
+    fn dispatch_fence_check(&self) -> Result<(), AgentError> {
+        Err(AgentError::session_durable_projection_authority_unknown(
+            "the writer stopped; only its re-acquire restores the fence",
+        ))
+    }
+
+    async fn dispatch_fence_ready(&self) -> Result<(), AgentError> {
+        self.waits.fetch_add(1, Ordering::SeqCst);
+        tokio::task::yield_now().await;
+        Ok(())
+    }
+}
+
+/// Every dispatch of a run awaits the checkpointer's waiting fence, never
+/// its check without a wait: a fence that reads closed at once but is
+/// restored by the wait lets the run make both model calls and start both
+/// calls of its round, one at a time, and the run completes. The run asks
+/// the fence before each model call (2), once after the round's first
+/// commit (1), and before each call starts (2).
+#[tokio::test]
+async fn every_dispatch_awaits_the_waiting_fence() {
+    let client = ScriptedClient::new(vec![
+        Step::Tools(vec![("call-1", "probe", "{}"), ("call-2", "probe2", "{}")]),
+        Step::Answer("done"),
+    ]);
+    let tools = RecordingTools::new(RecordingTools::probes(), None);
+    let checkpointer = Arc::new(RestoredFenceCheckpointer {
+        inner: RecordingCheckpointer::new(),
+        waits: AtomicUsize::new(0),
+    });
+    let mut agent = AgentBuilder::new()
+        .resume_session(fresh_session())
+        .with_turn_state_handle(Arc::new(
+            crate::agent::test_turn_state_handle::TestTurnStateHandle::new(),
+        ))
+        .with_runtime_execution_kind_for_test(
+            meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn,
+        )
+        .with_checkpointer(Arc::clone(&checkpointer) as Arc<dyn SessionCheckpointer>)
+        .with_tools_config(meerkat_core::ToolsConfig {
+            max_concurrent: 1,
+            ..meerkat_core::ToolsConfig::default()
+        })
+        .build_standalone(Arc::clone(&client), Arc::clone(&tools), Arc::new(NoopStore))
+        .await;
+
+    agent
+        .run("start".into())
+        .await
+        .expect("the restored fence admits every dispatch");
+    assert_eq!(client.calls(), 2, "both model calls were made");
+    assert_eq!(
+        tools
+            .dispatched()
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["call-1", "call-2"],
+        "both calls of the round started"
+    );
+    assert_eq!(
+        checkpointer.waits.load(Ordering::SeqCst),
+        5,
+        "the fence was awaited before each model call, after the round's first commit and before each call"
+    );
+}
+
 /// No round outlives its run. A run whose round fails (here its first
 /// commit returns no receipt) leaves no round bound, and a call the host
 /// dispatches next carries no dedupe key, even under the failed round's call

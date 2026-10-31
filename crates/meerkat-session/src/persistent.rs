@@ -3139,6 +3139,37 @@ impl meerkat_core::SessionCheckpointer for StoreCheckpointer {
         if window.is_open() {
             return Ok(());
         }
+        Err(self.dispatch_fence_refusal(window))
+    }
+
+    /// [`Self::dispatch_fence_check`] for a dispatch that may wait: an open
+    /// window allows at once, with no I/O. A writer that stopped (its renew
+    /// failed or timed out) waits, bounded by its self-fence window, for the
+    /// re-acquire its next write would make, and goes on when that resumed
+    /// it; a failed re-acquire, another writer, or no answer within the
+    /// window refuses as the check does.
+    async fn dispatch_fence_ready(&self) -> Result<(), AgentError> {
+        let Some(fence) = self.runtime_store.self_fence() else {
+            return Ok(());
+        };
+        if fence.window().is_open() {
+            return Ok(());
+        }
+        let window = fence.dispatch_window().await;
+        if window.is_open() {
+            return Ok(());
+        }
+        Err(self.dispatch_fence_refusal(window))
+    }
+}
+
+impl StoreCheckpointer {
+    /// The teardown-class refusal of a dispatch whose self-fence window
+    /// reads `window`, closed.
+    fn dispatch_fence_refusal(
+        &self,
+        window: meerkat_core::host_store::SelfFenceWindow,
+    ) -> AgentError {
         // Names the session when its base is at hand without waiting.
         let session = self
             .whole_blob_base_authority
@@ -3149,13 +3180,11 @@ impl meerkat_core::SessionCheckpointer for StoreCheckpointer {
                     .map(|authority| format!("session {}", authority.session_id()))
             })
             .unwrap_or_else(|| "this session".to_string());
-        Err(AgentError::session_durable_projection_authority_unknown(
-            format!(
-                "{session}: this writer's self-fence window closed ({:?} since its last acquire \
-                 or renew started, window {:?}, renew failed: {}); another process may own the \
-                 session, so nothing more is dispatched; live actor reload required",
-                window.elapsed, window.window, window.renew_failed
-            ),
+        AgentError::session_durable_projection_authority_unknown(format!(
+            "{session}: this writer's self-fence window closed ({:?} since its last acquire \
+             or renew started, window {:?}, renew failed: {}); another process may own the \
+             session, so nothing more is dispatched; live actor reload required",
+            window.elapsed, window.window, window.renew_failed
         ))
     }
 }
@@ -14945,6 +14974,26 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         }
     }
 
+    /// Log a runtime turn's failure that no earlier branch of its outcome
+    /// handled. A failure that requires the session's teardown does not keep
+    /// the live session: the runtime tears it down, so the line says that
+    /// instead of promising the live session to the next queued input.
+    fn warn_runtime_turn_failed(id: &SessionId, error: &SessionError) {
+        if Self::failure_requires_teardown(error) {
+            tracing::warn!(
+                session_id = %id,
+                error = %error,
+                "runtime turn failed with a failure that requires a live session reload; the runtime tears the live session down instead of preserving it for the next queued input"
+            );
+        } else {
+            tracing::warn!(
+                session_id = %id,
+                error = %error,
+                "runtime turn failed; preserving the live session for the next queued input"
+            );
+        }
+    }
+
     /// Whether a run that ended in a machine-owned hard-failure terminal must
     /// stop the executor instead of committing its failed boundary, by the
     /// rule a re-based run's failure follows (`Self::rebased_run_failure`).
@@ -15425,11 +15474,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                     // through the live actor before cleanup can remove it.
                     Err((error, None))
                 } else {
-                    tracing::warn!(
-                        session_id = %id,
-                        error = %error,
-                        "runtime turn failed; preserving the live session for the next queued input"
-                    );
+                    Self::warn_runtime_turn_failed(id, &error);
                     Err((error, None))
                 }
             }
@@ -15630,11 +15675,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                     // exact cancellation terminal under its existing boundary.
                     Err(error)
                 } else {
-                    tracing::warn!(
-                        session_id = %id,
-                        error = %error,
-                        "runtime turn failed; preserving the live session for the next queued input"
-                    );
+                    Self::warn_runtime_turn_failed(id, &error);
                     Err(error)
                 }
             }
@@ -29887,8 +29928,12 @@ mod tests {
     /// The store checkpointer reads the host store's self-fence: over a host
     /// store realm whose writer's window has closed (its renew failed),
     /// `dispatch_fence_check` refuses with the teardown class, so the run
-    /// makes no model call and dispatches no tool. An open window, and a
-    /// store without a lease, allow. Unrun until the candidate's validation.
+    /// makes no model call and dispatches no tool. `dispatch_fence_ready`,
+    /// which the run awaits, first waits for the writer's re-acquire, and
+    /// refuses the same way when that does not resume it (this host's renews
+    /// always fail, the renew of a re-acquire included). An open window, and
+    /// a store without a lease, allow. Unrun until the candidate's
+    /// validation.
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(start_paused = true)]
     async fn a_closed_host_store_fence_window_refuses_dispatch() {
@@ -29922,6 +29967,9 @@ mod tests {
         // Right after the acquire, the window is open.
         meerkat_core::SessionCheckpointer::dispatch_fence_check(&fenced)
             .expect("an open window allows");
+        meerkat_core::SessionCheckpointer::dispatch_fence_ready(&fenced)
+            .await
+            .expect("an open window allows a waiting dispatch at once");
         // The first renew, at 1 s, fails: the writer stops and its window
         // closes until a fresh acquire and renew succeed, which this host
         // never allows.
@@ -29929,10 +29977,17 @@ mod tests {
         let refused = meerkat_core::SessionCheckpointer::dispatch_fence_check(&fenced)
             .expect_err("a closed window refuses");
         assert_teardown_required_projection_authority(refused, "self-fence window closed");
+        let refused = meerkat_core::SessionCheckpointer::dispatch_fence_ready(&fenced)
+            .await
+            .expect_err("a re-acquire that does not resume the writer refuses");
+        assert_teardown_required_projection_authority(refused, "self-fence window closed");
         // A store without a lease always allows.
         let unfenced = checkpointer(Arc::new(InMemoryRuntimeStore::new()));
         meerkat_core::SessionCheckpointer::dispatch_fence_check(&unfenced)
             .expect("a store without a lease allows");
+        meerkat_core::SessionCheckpointer::dispatch_fence_ready(&unfenced)
+            .await
+            .expect("a store without a lease allows a waiting dispatch");
     }
 
     struct WholeBlobAuthorityReadProbe {

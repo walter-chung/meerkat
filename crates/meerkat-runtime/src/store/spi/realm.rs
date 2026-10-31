@@ -44,7 +44,9 @@
 //!   ([`FenceTiming::self_fence_window`]). The realm is the process's
 //!   [`SelfFence`]: the run loop reads the same window right before each
 //!   model call and each tool dispatch. Otherwise the call re-acquires
-//!   first, and refuses when that fails. In the steady
+//!   first, and refuses when that fails; a dispatch waits for that
+//!   re-acquire for at most one self-fence window
+//!   ([`SelfFence::dispatch_window`]). In the steady
 //!   state this is a local clock read: no store I/O is added to a round.
 //!   Every per-round commit of a run (commits A and B) is such a mutation,
 //!   so a writer past its window dispatches no tool and makes no model call
@@ -609,6 +611,7 @@ impl std::fmt::Debug for SpiRealm {
     }
 }
 
+#[async_trait::async_trait]
 impl SelfFence for SpiRealm {
     fn window(&self) -> SelfFenceWindow {
         SelfFenceWindow {
@@ -616,6 +619,42 @@ impl SelfFence for SpiRealm {
             window: self.self_fence_window,
             renew_failed: self.stopped.load(Ordering::Acquire),
         }
+    }
+
+    /// While the window is open, the reading as it is: a clock read, no
+    /// store I/O. Otherwise the dispatch waits for the re-acquire a write
+    /// would wait for ([`SpiRealm::ensure_lease`]: the one in flight, or a
+    /// fresh one on a task of its own, so giving up on it leaves it
+    /// running), for at most one self-fence window, and reads the window
+    /// again: open only when that re-acquire resumed the writer.
+    ///
+    /// The bound is the self-fence window, the span one successful acquire
+    /// or renew lets a writer dispatch for: a run waits no longer for its
+    /// writer to prove the fence again than one proof lasts. The window is
+    /// at least two renew intervals, and the re-acquire's renew is held to
+    /// one; its listing has no timeout of its own, and the bound keeps a run
+    /// from waiting on a store that does not answer.
+    async fn dispatch_window(&self) -> SelfFenceWindow {
+        let window = SelfFence::window(self);
+        if window.is_open() {
+            return window;
+        }
+        match tokio::time::timeout(self.self_fence_window, self.ensure_lease()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    %error,
+                    "host store writer stopped and its re-acquire did not resume it; the dispatch is refused"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    bound = ?self.self_fence_window,
+                    "host store writer stopped and its re-acquire did not finish within the self-fence window; the dispatch is refused"
+                );
+            }
+        }
+        SelfFence::window(self)
     }
 }
 

@@ -1750,13 +1750,14 @@ where
     }
 
     /// Whether this writer may still dispatch: the session checkpointer's
-    /// fence check (see [`crate::SessionCheckpointer::dispatch_fence_check`]),
-    /// asked of every agent with a checkpointer, a live bridge run's included:
-    /// such a run commits nothing, but it still calls the model and runs
-    /// tools.
-    fn check_dispatch_fence(&self) -> Result<(), AgentError> {
+    /// fence (see [`crate::SessionCheckpointer::dispatch_fence_ready`]),
+    /// asked of every agent with a checkpointer, a live bridge run's
+    /// included: such a run commits nothing, but it still calls the model
+    /// and runs tools. A writer whose fence was stopped waits here, bounded,
+    /// for its re-acquire, and is refused when that does not restore it.
+    async fn check_dispatch_fence(&self) -> Result<(), AgentError> {
         match self.checkpointer.as_ref() {
-            Some(checkpointer) => checkpointer.dispatch_fence_check(),
+            Some(checkpointer) => checkpointer.dispatch_fence_ready().await,
             None => Ok(()),
         }
     }
@@ -3356,8 +3357,9 @@ where
             if let Some(exceeded) = self.budget.observe().exceeded() {
                 return Err(exceeded.to_agent_error());
             }
-            // 1b. A writer past its self-fence window calls no model.
-            self.check_dispatch_fence()?;
+            // 1b. A writer past its self-fence window calls no model; a
+            // stopped one waits here, bounded, for its re-acquire first.
+            self.check_dispatch_fence().await?;
 
             // 2. Compute effective timeout for this call
             let controller = if *controller_feedback {
@@ -4510,7 +4512,7 @@ where
                     if compactor.should_compact(&ctx) {
                         // A writer past its self-fence window sends no
                         // summarization request either.
-                        self.check_dispatch_fence()?;
+                        self.check_dispatch_fence().await?;
                         // A run in flight keeps its request and its newest
                         // round verbatim: the rows before it are folded
                         // first, then its own completed rounds. When neither
@@ -7298,7 +7300,7 @@ where
         let tool_name = decided.tool_name.clone().unwrap_or_default();
         // A writer past its self-fence window starts no tool, a decided
         // consent's retained attempt included: the refusal ends the run.
-        self.check_dispatch_fence()?;
+        self.check_dispatch_fence().await?;
         let dispatched = match dispatch_retained_consent_boxed(
             Arc::clone(&self.tools),
             self.observed_tool_dispatch_context(Some(Arc::clone(review))),
@@ -9175,7 +9177,7 @@ where
         // A writer past its self-fence window admits no tool: a pause since
         // the commit (or since a resumed round's adopted tail) wrote nothing
         // the store's own fence check would refuse.
-        if let Err(error) = self.check_dispatch_fence() {
+        if let Err(error) = self.check_dispatch_fence().await {
             self.terminalize_round_failure(ctx.run_id, ctx.turn_count, ctx.event_tx, &error)
                 .await?;
             return Err(error);
@@ -9210,7 +9212,8 @@ where
         //
         // A writer past its self-fence window starts no further call: each
         // call asks the fence right before it starts, after its concurrency
-        // permit, and once one is refused, no later call starts.
+        // permit (a stopped writer's call waits there, bounded, for the
+        // re-acquire), and once one is refused, no later call starts.
         let fence = self.checkpointer.clone().map(DispatchFence::new);
         let mut dispatch_results = dispatch_tool_calls_fenced_boxed(
             Arc::clone(&self.tools),
@@ -10856,7 +10859,7 @@ type ToolDispatchFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = Vec<ToolDispatchResult>> + 'static>>;
 
 /// The writer's fence a tool batch asks right before each call starts (see
-/// [`crate::SessionCheckpointer::dispatch_fence_check`]). The first refusal
+/// [`crate::SessionCheckpointer::dispatch_fence_ready`]). The first refusal
 /// is kept for the round, and no later call of the batch starts.
 #[derive(Clone)]
 struct DispatchFence {
@@ -10872,9 +10875,15 @@ impl DispatchFence {
         }
     }
 
-    /// Whether one call may start now: no earlier call of the batch was
-    /// refused, and the fence allows.
-    fn admits_call(&self) -> bool {
+    /// Whether one call may start now: no call of the batch was refused,
+    /// and the fence allows, once a stopped writer's re-acquire it waits for
+    /// (bounded) restored it. A refusal of another call that came in while
+    /// this one waited stops this one too.
+    async fn admits_call(&self) -> bool {
+        if self.refused() {
+            return false;
+        }
+        let ready = self.checkpointer.dispatch_fence_ready().await;
         let mut refusal = self
             .refusal
             .lock()
@@ -10882,13 +10891,21 @@ impl DispatchFence {
         if refusal.is_some() {
             return false;
         }
-        match self.checkpointer.dispatch_fence_check() {
+        match ready {
             Ok(()) => true,
             Err(error) => {
                 *refusal = Some(error);
                 false
             }
         }
+    }
+
+    /// Whether a call of the batch was refused.
+    fn refused(&self) -> bool {
+        self.refusal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
     }
 
     /// The batch's fence refusal, if a call was refused.
@@ -11043,7 +11060,9 @@ fn dispatch_tool_calls_fenced_boxed<T: AgentToolDispatcher + ?Sized + 'static>(
                                         advertised_timeout_ms,
                                     ));
                                 }
-                                if fence.as_ref().is_some_and(|fence| !fence.admits_call()) {
+                                if let Some(fence) = fence.as_ref()
+                                    && !fence.admits_call().await
+                                {
                                     return Err(ToolError::execution_failed(
                                         "this writer's self-fence window closed before the call \
                                          started; it did not run",

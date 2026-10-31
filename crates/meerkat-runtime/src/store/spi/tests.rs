@@ -1103,6 +1103,156 @@ async fn a_batch_of_unknown_outcome_does_not_poison_the_realm_at_a_reacquire() {
         .expect("another runtime writes");
 }
 
+// Unrun until the candidate's validation. A dispatch reads an open window at
+// once, with no host call. On a writer that one timed-out renew stopped, it
+// waits for the re-acquire (here the background one, whose listing answers
+// 1.4 s into the wait) and reads the window open again, under a fresh token.
+#[tokio::test(start_paused = true)]
+async fn a_dispatch_on_a_stopped_writer_waits_for_the_reacquire() {
+    use meerkat_core::host_store::SelfFence;
+    let timing = FenceTiming::try_new(Duration::from_secs(1), Duration::from_secs(3)).unwrap();
+    let host = Arc::new(TestHost::with_timing(timing));
+    let (realm, _store) = open(&host).await;
+    let first = realm.fence();
+    host.take_calls();
+    assert!(
+        realm.dispatch_window().await.is_open(),
+        "an open window answers at once"
+    );
+    assert!(host.take_calls().is_empty(), "with no host call");
+    {
+        let mut faults = host.faults.lock().unwrap();
+        faults.renew_hang = 1;
+        faults.list_delay = Some(Duration::from_millis(1500));
+    }
+    // 1 s: the renew never answers. 2 s: the realm gives up on it and stops,
+    // and the tick at 2 s starts the re-acquire, whose listing answers at
+    // 3.5 s.
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    assert!(
+        !realm.lease_is_live(),
+        "the timed-out renew stopped the writer"
+    );
+    assert!(realm.window().renew_failed);
+    let started = tokio::time::Instant::now();
+    let window = realm.dispatch_window().await;
+    let waited = started.elapsed();
+    assert!(
+        window.is_open(),
+        "the re-acquire resumed the writer: {window:?}"
+    );
+    assert!(realm.fence() > first, "under a fresh token");
+    assert!(
+        waited >= Duration::from_millis(1300) && waited <= Duration::from_millis(1500),
+        "the dispatch waited for the re-acquire's listing, within the 2 s window: {waited:?}"
+    );
+}
+
+// Unrun until the candidate's validation. A re-acquire whose acquire answers
+// a store error restores nothing: the dispatch reads the window closed at
+// once, without waiting out its bound, and the realm is not poisoned.
+#[tokio::test(start_paused = true)]
+async fn a_dispatch_on_a_stopped_writer_refuses_when_the_reacquire_fails() {
+    use meerkat_core::host_store::SelfFence;
+    let timing = FenceTiming::try_new(Duration::from_secs(1), Duration::from_secs(3)).unwrap();
+    let host = Arc::new(TestHost::with_timing(timing));
+    let (realm, _store) = open(&host).await;
+    {
+        let mut faults = host.faults.lock().unwrap();
+        faults.renew_unavailable = 1;
+        faults.acquire_unavailable = 1000;
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !realm.lease_is_live(),
+        "the failed renew stopped the writer"
+    );
+    let started = tokio::time::Instant::now();
+    let window = realm.dispatch_window().await;
+    assert!(!window.is_open(), "the re-acquire failed: {window:?}");
+    assert!(window.renew_failed);
+    assert!(
+        started.elapsed() < Duration::from_millis(100),
+        "a failed re-acquire refuses at once: {:?}",
+        started.elapsed()
+    );
+    assert!(realm.realm_poisoned().is_none());
+}
+
+// Unrun until the candidate's validation. Another process wrote while this
+// writer was stopped: the re-acquire the dispatch waits for finds the
+// foreign batch, the realm is poisoned, and the window stays closed.
+#[tokio::test(start_paused = true)]
+async fn a_dispatch_on_a_stopped_writer_refuses_when_another_writer_committed() {
+    use meerkat_core::host_store::SelfFence;
+    let timing = FenceTiming::try_new(Duration::from_secs(1), Duration::from_secs(3)).unwrap();
+    let host = Arc::new(TestHost::with_timing(timing));
+    let (old_realm, _old_store) = open(&host).await;
+    host.faults.lock().unwrap().renew_unavailable = 1;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(!old_realm.lease_is_live());
+    host.expire_lease();
+    {
+        let (other_realm, other_store) = open(&host).await;
+        other_store
+            .persist_input_state(
+                &LogicalRuntimeId::new("foreign"),
+                &persistable(StoredInputState::new_accepted(InputId::new())),
+            )
+            .await
+            .unwrap();
+        drop(other_store);
+        drop(other_realm);
+    }
+    host.expire_lease();
+    let window = old_realm.dispatch_window().await;
+    assert!(
+        !window.is_open(),
+        "the dispatch never runs on another writer's realm: {window:?}"
+    );
+    assert!(
+        old_realm.realm_poisoned().is_some(),
+        "the foreign batch poisons the realm"
+    );
+}
+
+// Unrun until the candidate's validation. The wait is bounded by the
+// self-fence window (2 s): a re-acquire whose listing takes 60 s is not
+// waited for, and the dispatch reads the window closed at the bound. The
+// re-acquire goes on without it and resumes the writer once its listing
+// answers.
+#[tokio::test(start_paused = true)]
+async fn a_dispatch_waits_no_longer_than_the_self_fence_window() {
+    use meerkat_core::host_store::SelfFence;
+    let timing = FenceTiming::try_new(Duration::from_secs(1), Duration::from_secs(3)).unwrap();
+    let host = Arc::new(TestHost::with_timing(timing));
+    let (realm, _store) = open(&host).await;
+    {
+        let mut faults = host.faults.lock().unwrap();
+        faults.renew_hang = 1;
+        faults.list_delay = Some(Duration::from_secs(60));
+    }
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    assert!(
+        !realm.lease_is_live(),
+        "the timed-out renew stopped the writer"
+    );
+    let started = tokio::time::Instant::now();
+    let window = realm.dispatch_window().await;
+    let waited = started.elapsed();
+    assert!(!window.is_open(), "the bound passed: {window:?}");
+    assert!(
+        waited >= Duration::from_secs(2) && waited < Duration::from_millis(2100),
+        "the dispatch waited one self-fence window: {waited:?}"
+    );
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert!(
+        realm.lease_is_live(),
+        "the re-acquire resumed the writer once its listing answered"
+    );
+    assert!(realm.realm_poisoned().is_none());
+}
+
 // Unrun until the candidate's validation. A call dropped while its
 // batch is in flight still lands it and adopts the new version, so the next
 // call on the scope commits on top of it instead of conflicting.

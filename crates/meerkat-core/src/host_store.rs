@@ -128,7 +128,11 @@
 //!   one renew interval unless the host declares another). This takes no
 //!   store I/O per round, and there is no fence check on the per round
 //!   path. Core exposes the window through [`SelfFence`], so the run loop
-//!   checks it right before each model call and each tool dispatch.
+//!   checks it right before each model call and each tool dispatch. A
+//!   stopped holder's run waits there, for at most one self-fence window,
+//!   for the fresh acquire it makes before its next write
+//!   ([`SelfFence::dispatch_window`]), and dispatches only once that acquire
+//!   resumed it.
 //! - **The host's obligation on the margin:** it is at least one renew
 //!   interval plus twice the store's visibility lag (the time from the
 //!   start of a write until every acquire and renew sees it). A takeover
@@ -331,9 +335,22 @@ impl Default for FenceTiming {
 /// documentation). Core's host store realm implements it; the run loop asks
 /// it right before each model call and each tool dispatch, not only before
 /// commits.
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait SelfFence: Send + Sync {
     /// The writer's self-fence window now. A local clock read; no store I/O.
     fn window(&self) -> SelfFenceWindow;
+
+    /// The writer's self-fence window for a dispatch about to start: the
+    /// reading as it is while the window is open, otherwise the reading
+    /// after waiting, bounded, for the fresh acquire the writer makes
+    /// before its next write (a stopped holder re-acquires; see the writer
+    /// rules in the module documentation). The window it answers is open
+    /// only when that acquire resumed the writer. The default waits for
+    /// nothing and answers [`Self::window`].
+    async fn dispatch_window(&self) -> SelfFenceWindow {
+        self.window()
+    }
 }
 
 /// One reading of a writer's self-fence window.

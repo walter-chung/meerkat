@@ -432,6 +432,11 @@ fence:
   the realm stops until it is opened again. A later renew never restores
   it. A renew answered `FencedOut` means another process holds the fence,
   and the realm stops until it is opened again.
+- **A stop is a pause.** A run that reaches a model call or a tool call
+  while the holder is stopped (a renew failed or timed out) waits for that
+  new acquire, for at most one self-fence window, and goes on once it
+  succeeds. The run fails as before only when the acquire fails, finds
+  another process, or takes longer than the window.
 - **Self-fencing.** The holder makes no model call, dispatches no tool and
   commits nothing unless its last successful acquire or renew started less
   than the self-fence window ago. The window is the lease minus the store's

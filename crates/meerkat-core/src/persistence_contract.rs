@@ -395,23 +395,42 @@ pub trait SessionCheckpointer: Send + Sync {
         )))
     }
 
-    /// Whether this writer may still act on the session now.
+    /// Whether this writer may still act on the session now, read without
+    /// waiting.
     ///
     /// A checkpointer over a host store answers from its fence handle's
     /// self-fence window: past it, another process may already own the
-    /// session, and nothing this process dispatches may run. The agent asks
-    /// right before each model request, right after a tool round's first
-    /// commit, before any tool of the round is admitted, and right before
-    /// each tool call starts, because a pause between a commit and a
-    /// dispatch writes nothing that would meet the write path's own fence
-    /// check. An error stops the run there, as a refused commit does: no
-    /// later call of the round starts and the round's results are not
-    /// committed. Return the teardown-required class
+    /// session, and nothing this process dispatches may run. A refusal
+    /// returns the teardown-required class
     /// ([`AgentError::session_durable_projection_authority_unknown`]) so the
     /// live actor reloads instead of continuing on stale authority. Called
-    /// synchronously, with no I/O. The default allows.
+    /// synchronously, with no I/O. The agent asks
+    /// [`Self::dispatch_fence_ready`], whose default asks this check. The
+    /// default allows.
     fn dispatch_fence_check(&self) -> Result<(), AgentError> {
         Ok(())
+    }
+
+    /// Whether this writer may dispatch now, after any wait its fence needs.
+    ///
+    /// The agent awaits it right before each model request, right after a
+    /// tool round's first commit, before any tool of the round is admitted,
+    /// and right before each tool call starts, because a pause between a
+    /// commit and a dispatch writes nothing that would meet the write path's
+    /// own fence check. An error stops the run there, as a refused commit
+    /// does: no later call of the round starts and the round's results are
+    /// not committed.
+    ///
+    /// A checkpointer over a host store whose writer stopped (a renew failed
+    /// or timed out, or its window closed) waits here, bounded, for the
+    /// fresh acquire the writer makes before its next write
+    /// ([`crate::host_store::SelfFence::dispatch_window`]), and allows once
+    /// that acquire resumed the writer. When the acquire fails, finds
+    /// another writer, or does not finish in time, it refuses as
+    /// [`Self::dispatch_fence_check`] does. The default asks
+    /// [`Self::dispatch_fence_check`] and never waits.
+    async fn dispatch_fence_ready(&self) -> Result<(), AgentError> {
+        self.dispatch_fence_check()
     }
 
     /// Record how far the live session retired its transcript history once

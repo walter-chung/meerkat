@@ -9902,8 +9902,9 @@ pub trait RuntimeStore: Send + Sync {
     /// The self-fence of a store whose writes hold a host store fence
     /// ([`meerkat_core::host_store::SelfFence`]), or `None`, the default. The
     /// run loop's checkpointer reads its window right before each model call
-    /// and each tool dispatch. Decorators must forward their inner store's
-    /// fence.
+    /// and each tool dispatch, and waits on a closed one for the writer's
+    /// re-acquire ([`meerkat_core::host_store::SelfFence::dispatch_window`]).
+    /// Decorators must forward their inner store's fence.
     fn self_fence(&self) -> Option<std::sync::Arc<dyn meerkat_core::host_store::SelfFence>> {
         None
     }

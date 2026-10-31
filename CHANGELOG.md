@@ -372,6 +372,28 @@ them.
   wording: an earlier summary is part of the next summary request, so what
   it says can carry into later summaries.
 
+- `meerkat-core`, `meerkat-runtime`, `meerkat-session`: on a host store
+  realm, a transient fence renew stop no longer fails turns. A renew that
+  fails or times out stops the realm's writer until a fresh acquire, and
+  store writes already waited for that re-acquire; the run's dispatch check
+  did not. A turn that reached a model call, a compaction summary call, a
+  tool round or a tool call during the gap failed at once with
+  `SessionDurableProjectionAuthorityUnknown` ("self-fence window closed ...
+  renew failed: true"), the runtime tore the live session down, and the
+  turn's input and every other unfinished input of the session ended as
+  stopped. The dispatch check now waits for the same re-acquire, for at
+  most one self-fence window (the lease minus the self-fence margin, 20 s at
+  the default fence timing), and the turn goes on once the re-acquire
+  resumed the writer. It still refuses as before when the re-acquire fails,
+  finds another writer (a live holder, or a batch this writer did not
+  write, which poisons the realm), or does not finish within the window;
+  the realm then logs a warning naming the cause. `SelfFence` gains
+  `dispatch_window` and `SessionCheckpointer` gains `dispatch_fence_ready`,
+  provided methods whose defaults keep the check without a wait; the run
+  loop awaits `dispatch_fence_ready` before every dispatch. The warning
+  logged for a failed runtime turn no longer says the live session is
+  preserved for the next queued input when the failure requires a reload.
+
 - `meerkat-runtime`: an admitted governed resume of retained work (for
   example a consent notice) that a graceful requeue stop kept, or that a
   restart found in the store, now runs on the session's next registration.

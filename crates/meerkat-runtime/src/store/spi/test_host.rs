@@ -70,6 +70,9 @@ pub(crate) struct Faults {
     pub(crate) conflict: u32,
     /// Renews that answer `Unavailable`.
     pub(crate) renew_unavailable: u32,
+    /// Renews that never answer: the realm's renew timeout gives up on
+    /// them.
+    pub(crate) renew_hang: u32,
     /// Acquires that answer `Unavailable`.
     pub(crate) acquire_unavailable: u32,
     /// Head loads that answer `Unavailable`.
@@ -294,14 +297,21 @@ impl HostStore for TestHost {
 
     async fn renew_fence(&self, token: FenceToken) -> Result<(), HostStoreError> {
         self.record(HostCall::RenewFence);
-        let delay = {
+        let (delay, hang) = {
             let mut faults = self.faults();
             if faults.renew_unavailable > 0 {
                 faults.renew_unavailable -= 1;
                 return Err(HostStoreError::Unavailable("injected".into()));
             }
-            faults.renew_delay
+            let hang = faults.renew_hang > 0;
+            if hang {
+                faults.renew_hang -= 1;
+            }
+            (faults.renew_delay, hang)
         };
+        if hang {
+            std::future::pending::<()>().await;
+        }
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
         }
