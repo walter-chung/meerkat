@@ -266,6 +266,31 @@ them.
   the same way on the dispatch and entered paths, and answers `Unavailable`
   only past the bounds; its prepared path does not wait.
 
+- `meerkat`: `GovernedHelperAdmissionFence::create_idempotent_after_owner_change`
+  (async), the host-level retry of a governed helper admission's
+  contention. The fence runs inside the WorkGraph store call and never
+  waits: while another writer holds the publication its check excludes
+  owner changes on (a reservation of the writer that has not published), or
+  an owner change is in progress there, it refuses as `Unavailable` with
+  nothing run or committed. The new form makes the keyed create through a
+  new fence for each attempt (a fence serves one attempt), always the same
+  idempotent `create_idempotent_with_fence`. Only after an attempt whose
+  fence named such a change or hold as it refused does it wait, with one
+  `OwnerChangeChurn` per call (`wait_after_stale_read`: 2 s and three free
+  rebuilds, clamped to the `budget_remaining` passed), outside every lock
+  and store transaction, and try again. It answers success, `Denied` and
+  every other `Unavailable` (a refusal to rebuild with no change in
+  progress, clock or custody unavailable, a poisoned publication) at once,
+  and returns the last `Unavailable` once a wait is not settled. `refusal()`
+  on the fence it was called on reads the answered attempt's reason, and
+  that fence serves this one admission. It covers prepared, dispatch and
+  entered fences; each wait is traced at site `helper_admission`, and
+  dropping the future commits nothing an attempt did not commit itself.
+  `meerkat-core`: `EnteredDispatchOperation::work_authorization`, the
+  entered operation's governed work context (the dispatch's own, as
+  `GovernedDispatchOperation::work_authorization` returns it), whose
+  `owner_change_in_progress` such a wait reads.
+
 ### Fixed
 
 - `meerkat-core`: a pending or approved human consent (R3) is now kept
@@ -504,6 +529,23 @@ them.
   take once it is unset. The host binaries' own workers and main future keep
   the 8 MiB budget. The added size is virtual address space; pages are
   committed only when touched.
+
+- `meerkat-core`, `meerkat`, `meerkat-authorization`: the documentation of
+  `OwnerChangeChurn::wait_after_stale_read` said that a genuine
+  `Unavailable` is final and never waits, without naming the `Unavailable`
+  that is not genuine. A governed helper admission fence's contention (its
+  refusal while another writer holds the publication, or an owner change is
+  in progress there) is retryable at the host level: a new fence and the
+  same idempotent create after that wait, taken outside every lock and
+  store transaction, as
+  `GovernedHelperAdmissionFence::create_idempotent_after_owner_change` does.
+  The wait's documentation and `HelperAdmissionRefusal::Unavailable` now say
+  so. `AdmittedWorkPolicyOwner` now says that an `Unavailable` answer is
+  final where it is asked (at a controller's model request it ends the run
+  with nothing sent), so an owner never answers its own transient lock
+  contention that way: it waits briefly for its own lock or reads an
+  immutable snapshot, and keeps `Unavailable` for when it genuinely cannot
+  answer.
 
 ### Known limitations
 
