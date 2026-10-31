@@ -14,9 +14,11 @@
 //! input stays queued. Another writer, met at the re-acquire, at a dispatch
 //! whose window still reads open, at a commit or while a suspended run waits,
 //! still refuses and tears the live session down, and the waiters are told
-//! the store keeps their inputs for the new owner; a direct turn, which has
-//! no runtime run to suspend, fails with a retryable store error. Unrun until
-//! the candidate's validation.
+//! the store keeps their inputs for the new owner. A direct turn's run is
+//! stopped and suspended at the gap: the turn fails with a retryable store
+//! error after its one wait, another direct turn is refused busy while the
+//! run stays marked, and the runtime settles the run once the fence is back.
+//! Unrun until the candidate's validation.
 
 use super::*;
 use futures::stream;
@@ -524,6 +526,9 @@ impl HostStore for FenceHost {
                         }
                     })
                     .await;
+                    // The commit lands once the window reads closed, and the
+                    // stop is recorded then, as a timed-out renew's is.
+                    self.control.wait_until_stopped().await;
                 }
                 Stop::TimedOutRenew(_) => self.control.stop_with_a_timed_out_renew().await,
                 Stop::TakenOver => self.control.take_over().await,
@@ -1029,6 +1034,58 @@ impl FenceRow {
         completion.expect("a completion waiter")
     }
 
+    /// Run one more direct turn of the session, as a surface runs a turn
+    /// the runtime loop does not dispatch, waiting at most
+    /// [`TURN_DEADLINE`] for its answer.
+    async fn run_direct_turn(
+        &self,
+        prompt: &str,
+    ) -> Result<RunResult, crate::surface::SurfaceRuntimeMaterializeError> {
+        let (_, turn) =
+            crate::surface::split_runtime_backed_eager_create_request(CreateSessionRequest {
+                model: "claude-sonnet-4-5".into(),
+                prompt: prompt.into(),
+                injected_context: Vec::new(),
+                system_prompt: meerkat_core::SystemPromptOverride::Inherit,
+                max_tokens: None,
+                event_tx: None,
+                initial_turn: InitialTurnPolicy::RunImmediately,
+                deferred_prompt_policy: DeferredPromptPolicy::Discard,
+                build: None,
+                labels: None,
+            });
+        let turn = turn.expect("a request that runs at once carries its turn");
+        tokio::time::timeout(
+            TURN_DEADLINE,
+            crate::surface::run_runtime_backed_initial_turn_with_machine(
+                &self.service,
+                &self.machine,
+                &self.session_id,
+                turn,
+            ),
+        )
+        .await
+        .expect("the direct turn ends")
+    }
+
+    /// Wait, at most `deadline`, until the session's runtime marks no run
+    /// resumable: it resumed or settled the run it marked. Whether it did.
+    async fn wait_until_no_run_is_marked(&self, deadline: Duration) -> bool {
+        let started = tokio::time::Instant::now();
+        while self
+            .machine
+            .resumable_run_id(&self.session_id)
+            .await
+            .is_some()
+        {
+            if started.elapsed() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        true
+    }
+
     /// Wait, at most `deadline`, until the session's runtime loop has
     /// ended: its attachment no longer has open command channels.
     async fn wait_for_the_runtime_loop_to_end(&self, deadline: Duration) -> bool {
@@ -1239,6 +1296,8 @@ enum TurnAnswer {
 struct FencedRun {
     /// The turn's answer.
     answer: TurnAnswer,
+    /// When the turn was answered.
+    answered_at: tokio::time::Instant,
     model_requests: usize,
     dispatched: usize,
     lease_live_after: bool,
@@ -1264,6 +1323,22 @@ impl FencedRun {
     fn answer_text(&self) -> String {
         format!("{:?}", self.answer)
     }
+
+    /// Check that the turn was answered within one dispatch wait bound (and
+    /// the agent's retry backoff) of the writer's stop: no second wait, such
+    /// as a closing save's, came after the first.
+    fn assert_answered_within_one_wait(&self, site: &str) {
+        let stopped_at = self
+            .row
+            .control
+            .stopped_at()
+            .expect("the writer stopped during the run");
+        let answered_after = self.answered_at.duration_since(stopped_at);
+        assert!(
+            answered_after <= DISPATCH_WAIT_BOUND + ANSWER_SLACK,
+            "{site}: the turn is answered within one dispatch wait of the stop: {answered_after:?}"
+        );
+    }
 }
 
 /// Run the initial turn of a fresh session over a host store realm whose
@@ -1279,9 +1354,11 @@ async fn run_with_window_closing_during(closes_during: ClosesDuring) -> FencedRu
 async fn run_with_stop(closes_during: ClosesDuring, stop: Stop, turn: Turn) -> FencedRun {
     let mut row = FenceRow::open(closes_during, stop, turn).await;
     let answer = row.run_turn(TURN_DEADLINE).await;
+    let answered_at = tokio::time::Instant::now();
     let input_phases = row.input_phases().await;
     FencedRun {
         answer,
+        answered_at,
         model_requests: row.model_requests(),
         dispatched: row.dispatched(),
         lease_live_after: row.realm.lease_is_live(),
@@ -1341,9 +1418,12 @@ fn assert_refused_after_the_round(run: &FencedRun, row: &str) {
 }
 
 /// A direct turn whose writer stayed stopped through its whole dispatch
-/// wait, with no other writer found, failed with a retryable store error:
-/// the turn has no runtime run to suspend, and nothing proves another owner,
-/// so it is not the teardown class.
+/// wait, with no other writer found, failed with a retryable store error
+/// after that one wait: its run is stopped and suspended there, with no
+/// terminal and no closing save, and nothing proves another owner, so it is
+/// not the teardown class. Before, the run ended failed at the wait, its
+/// closing save waited a second bound, and its terminal's write met the gap,
+/// which left the session repair-blocked.
 fn assert_direct_turn_failed_retryably(run: &FencedRun, row: &str) {
     assert!(
         !run.completed(),
@@ -1358,6 +1438,7 @@ fn assert_direct_turn_failed_retryably(run: &FencedRun, row: &str) {
         !answer.contains("DurableProjectionAuthorityUnknown"),
         "{row}: no other writer was found, so not the teardown class: {answer}"
     );
+    run.assert_answered_within_one_wait(row);
 }
 
 /// Run `row`'s queued turn over a writer whose fence gap outlasts three
@@ -1428,8 +1509,9 @@ async fn assert_suspended_through_the_gap(
 ///
 /// Every renew fails from then on, the renew of each re-acquire included,
 /// so the writer never gets its window back. No other writer is found, so
-/// the direct turn fails with a retryable store error once its dispatch
-/// wait passes, not with the teardown class.
+/// the direct turn fails with a retryable store error once its one dispatch
+/// wait passes (its run is stopped and suspended there), not with the
+/// teardown class.
 #[tokio::test]
 async fn a_writer_past_its_fence_window_makes_no_model_call_and_dispatches_no_tool() {
     let first = run_with_window_closing_during(ClosesDuring::FirstCommit).await;
@@ -1505,10 +1587,11 @@ async fn a_tool_call_after_a_timed_out_renew_waits_for_the_reacquire() {
 
 /// A re-acquire that keeps failing (every acquire answers a store error)
 /// restores nothing: the waiting model call of a direct turn waits its whole
-/// bound, retrying, and the turn then fails with a retryable store error. No
-/// other writer was found: the writer stays stopped, the realm is not
-/// poisoned, and the turn is not the teardown class. Before, the turn was
-/// refused at once with the teardown class.
+/// bound, retrying, and the turn then fails with a retryable store error,
+/// its run stopped and suspended there. No other writer was found: the
+/// writer stays stopped, the realm is not poisoned, and the turn is not the
+/// teardown class. Before, the turn was refused at once with the teardown
+/// class.
 #[tokio::test]
 async fn a_direct_turn_whose_reacquire_keeps_failing_fails_retryably() {
     let run = run_with_stop(
@@ -1542,8 +1625,14 @@ async fn a_foreign_batch_at_the_reacquire_refuses_the_dispatch() {
 
 /// The wait is bounded: a re-acquire whose listing takes 30 s outlasts the
 /// 13 s dispatch wait bound, so the direct turn fails with a retryable store
-/// error. The re-acquire itself goes on and resumes the writer once its
-/// listing answers; only the dispatch gave up.
+/// error after that one wait, its run stopped and suspended there. Another
+/// direct turn asked while the fence stays closed is refused busy
+/// (`SESSION_BUSY`): no run starts beside the suspended one while it is
+/// marked resumable. The re-acquire itself goes on and resumes the writer
+/// once its listing answers; the runtime then settles the stopped run,
+/// which never asks the model again, and the next direct turn completes.
+/// Before, the turn failed only after a second wait, its closing save's, and
+/// its terminal's write met the gap, which left the session repair-blocked.
 #[tokio::test]
 async fn a_direct_turn_fails_retryably_when_its_reacquire_outlasts_the_bound() {
     let run = run_with_stop(
@@ -1556,10 +1645,73 @@ async fn a_direct_turn_fails_retryably_when_its_reacquire_outlasts_the_bound() {
     assert_eq!(run.dispatched, 1, "the call ran once, before the stop");
     assert_eq!(run.model_requests, 1, "no model call after the stop");
     assert!(!run.poisoned_after, "a slow listing poisons nothing");
+    let during_the_gap = run.row.run_direct_turn("probe again").await;
+    assert!(
+        matches!(
+            during_the_gap,
+            Err(crate::surface::SurfaceRuntimeMaterializeError::Session(
+                SessionError::Busy { .. }
+            ))
+        ),
+        "a direct turn while the stopped run waits for the fence is refused busy: \
+         {during_the_gap:?}"
+    );
     tokio::time::sleep(LISTING_PAST_THE_WINDOW + Duration::from_secs(5)).await;
     assert!(
         run.row.realm.lease_is_live(),
         "the slow re-acquire resumes the writer once its listing answers"
+    );
+    assert!(
+        run.row.wait_until_no_run_is_marked(TURN_DEADLINE).await,
+        "the runtime settles the stopped run once the fence is back"
+    );
+    let next = run.row.run_direct_turn("probe again").await;
+    assert!(next.is_ok(), "the next direct turn completes: {next:?}");
+    assert_eq!(
+        run.row.model_requests(),
+        2,
+        "the stopped run never asked the model again: only the next turn did"
+    );
+    assert_eq!(run.row.dispatched(), 1, "nothing ran twice");
+}
+
+/// A direct turn whose round commit meets a store fence gap is stopped and
+/// suspended at the commit's wait, as at a dispatch: the run's first model
+/// call stops the writer, whose re-acquires keep failing, and answers with
+/// the round's call, so the round's first commit is the first write that
+/// meets the stopped writer. The turn fails with a retryable store error
+/// after that one wait, not with the teardown class, and the round's call
+/// never runs. Before, the refused commit failed the run, its closing save
+/// waited a second bound, and its terminal's write met the gap, which left
+/// the session repair-blocked.
+#[tokio::test]
+async fn a_direct_turns_round_commit_at_a_fence_gap_fails_retryably_after_one_wait() {
+    let run = run_with_stop(
+        ClosesDuring::RoundModelCall,
+        Stop::TimedOutRenew(Reacquire::Fails),
+        Turn::Direct,
+    )
+    .await;
+    let row = "a direct turn's round commit";
+    assert!(
+        !run.completed(),
+        "{row}: the turn does not complete while the fence stays closed"
+    );
+    let answer = run.answer_text();
+    assert!(
+        answer.contains("stayed closed through its round commit's wait"),
+        "{row}: the commit's fence wait ended the turn: {answer}"
+    );
+    assert!(
+        !answer.contains("DurableProjectionAuthorityUnknown"),
+        "{row}: no other writer was found, so not the teardown class: {answer}"
+    );
+    run.assert_answered_within_one_wait(row);
+    assert_eq!(run.dispatched, 0, "{row}: the round's call never runs");
+    assert_eq!(run.model_requests, 1, "{row}: no model call after the stop");
+    assert!(
+        !run.poisoned_after,
+        "{row}: a failed acquire poisons nothing"
     );
 }
 
