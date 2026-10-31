@@ -17188,6 +17188,264 @@ mod tests {
         );
     }
 
+    /// The fallback fixtures' agent ([`FallbackActivatingClient`]) whose
+    /// primary and backup declare the context windows `windows`, whose
+    /// backup's provider takes at most `backup_cap` request bytes, and whose
+    /// compactor never compacts, so only a bound shortens a request. Its run
+    /// calls `list_records` once on the primary for a 400 KB result; the
+    /// primary then fails the request that carries the result, and the retry
+    /// goes to the backup.
+    #[cfg(feature = "workspace-tests")]
+    async fn fallback_bound_agent(
+        windows: (u32, u32),
+        backup_cap: u64,
+    ) -> (
+        Arc<FallbackActivatingClient>,
+        crate::agent::Agent<FallbackActivatingClient, LargeListingDispatcher, NoopStore>,
+    ) {
+        use crate::retry::RetryPolicy;
+
+        let client = Arc::new(FallbackActivatingClient::with_tool_round(
+            summary_window_test_registry(&[("primary", windows.0), ("backup", windows.1)]),
+            backup_cap,
+        ));
+        let visibility_owner: Arc<dyn crate::ToolVisibilityOwner> =
+            Arc::new(RecordingFallbackVisibilityOwner::default());
+        let generated_visibility_owner =
+            crate::tool_scope::generated_test_tool_visibility_owner_from(Arc::clone(
+                &visibility_owner,
+            ));
+        let agent = with_test_turn_state_handle_for_session(
+            AgentBuilder::new(),
+            explicit_hot_swap_session("primary"),
+        )
+        .with_effective_model_registry(client.registry())
+        .max_tokens_per_turn(1_024)
+        .compactor(Arc::new(RecordingDiscardingCompactor::new(|_| false)))
+        .with_tool_visibility_owner(generated_visibility_owner)
+        .with_model_routing_handle(Arc::new(RecordingModelRoutingHandle::new(visibility_owner)))
+        .with_sticky_model_fallback_commit_coordinator(Arc::new(
+            RecordingStickyFallbackCoordinator::default(),
+        ))
+        .retry_policy(RetryPolicy {
+            max_retries: 1,
+            initial_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            multiplier: 1.0,
+            call_timeout: None,
+            stream_inactivity_timeout: None,
+        })
+        .build_standalone(
+            Arc::clone(&client),
+            Arc::new(LargeListingDispatcher::new(400_000)),
+            Arc::new(NoopStore),
+        )
+        .await;
+        (client, agent)
+    }
+
+    /// After a run whose request a fallback's limits bounded: the stored
+    /// transcript keeps the result whole, the bound recorded (and persisted)
+    /// that the transcript holds content a request could not carry, and the
+    /// answer to the bounded request anchored no input projection: the anchor
+    /// stays on the request that made the call.
+    #[cfg(feature = "workspace-tests")]
+    fn assert_fallback_bound_recorded_and_anchored_nothing(
+        agent: &crate::agent::Agent<FallbackActivatingClient, LargeListingDispatcher, NoopStore>,
+    ) {
+        let transcript = agent.session().messages().to_vec();
+        let stored = rows_where(&transcript, is_tool_results);
+        let [Message::ToolResults { results, .. }] = stored.as_slice() else {
+            panic!("the run's one result row is stored");
+        };
+        assert_eq!(
+            results[0].text_content().len(),
+            400_000,
+            "the stored transcript keeps the result whole"
+        );
+        assert!(
+            agent
+                .compaction_cadence
+                .last_context_refusal_boundary_index
+                .is_some(),
+            "the bound records that the transcript holds content a request could not carry"
+        );
+        assert_eq!(
+            persisted_cadence(agent.session()).last_context_refusal_boundary_index,
+            agent.compaction_cadence.last_context_refusal_boundary_index,
+            "the fact is persisted with the session"
+        );
+        let call_at = transcript
+            .iter()
+            .position(is_tool_call)
+            .expect("the stored call");
+        let anchor = agent
+            .compaction_cadence
+            .last_answered_request
+            .clone()
+            .expect("the request that made the call anchored the projection");
+        assert_eq!(
+            anchor.transcript_rows,
+            u64::try_from(call_at).unwrap(),
+            "the anchor stays on the request that made the call: the answer to the bounded \
+             request anchors none"
+        );
+    }
+
+    /// The primary's 60k-token window bounds the run's own 400 KB result for
+    /// the request that carries it; the primary fails that request, and the
+    /// retry goes to the backup, whose provider takes 50 KB of request, less
+    /// than the bounded request holds. The retry path bounds the request
+    /// again from the whole result the first bound cut, not from the head the
+    /// request carries: the backup's request carries a shorter head of the
+    /// whole result, and each sent request is announced once, the second
+    /// with the whole size on the request-byte axis. The bound is recorded,
+    /// the answer anchors no input projection, and the stored transcript
+    /// keeps the result whole. Cut from the carried head, the second notice
+    /// would state the head's size as the whole.
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn a_bound_after_a_model_fallback_cuts_again_from_the_whole_result() {
+        let (client, mut agent) = fallback_bound_agent((60_000, 60_000), 50_000).await;
+
+        let (tx, mut rx) = mpsc::channel::<crate::event::AgentEvent>(256);
+        let result = agent.run_with_events("go".into(), tx).await;
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            result.is_ok(),
+            "the run completes on the backup: {:?}",
+            result.err()
+        );
+        assert_eq!(client.fallback_commits(), 1, "the fallback activated");
+
+        let requests = client.seen_requests();
+        assert_eq!(
+            requests.len(),
+            3,
+            "the call, the primary's failed request and the backup's request"
+        );
+        let primary = carried_result_texts(&requests[1], "tc_1");
+        assert_eq!(
+            primary.len(),
+            2,
+            "test setup: the primary's request carries the result bounded"
+        );
+        let carried = carried_result_texts(&requests[2], "tc_1");
+        let [head, marker] = carried.as_slice() else {
+            panic!(
+                "the backup's request carries a head and a marker, not {} blocks",
+                carried.len()
+            );
+        };
+        assert!(
+            head.len() < primary[0].len(),
+            "the backup's request carries a shorter head: {} of the primary's {} bytes",
+            head.len(),
+            primary[0].len()
+        );
+        assert!(
+            head.bytes().all(|byte| byte == b'r'),
+            "the head is the start of the whole result"
+        );
+        assert!(
+            marker.contains("400000"),
+            "the marker states the whole size: {marker}"
+        );
+
+        let notices = bounded_request_notices(&events);
+        assert_eq!(notices.len(), 2, "each bounded request is announced once");
+        assert_eq!(notices[0]["axis"], "context_window");
+        assert_eq!(
+            notices[0]["results"][0]["kept_bytes"],
+            u64::try_from(primary[0].len()).unwrap()
+        );
+        assert_eq!(notices[0]["results"][0]["total_bytes"], 400_000);
+        assert_eq!(notices[1]["axis"], "request_bytes");
+        assert_eq!(notices[1]["results"][0]["tool_use_id"], "tc_1");
+        assert_eq!(
+            notices[1]["results"][0]["kept_bytes"],
+            u64::try_from(head.len()).unwrap()
+        );
+        assert_eq!(
+            notices[1]["results"][0]["total_bytes"], 400_000,
+            "the bound after the fallback is cut from the whole result"
+        );
+
+        assert_fallback_bound_recorded_and_anchored_nothing(&agent);
+    }
+
+    /// The primary's 128k-token window takes the run's own 400 KB result, so
+    /// the request that carries it goes whole; the primary fails it, and the
+    /// retry goes to the backup, whose provider takes 100 KB of request. Only
+    /// the retry path bounds the request, for the backup: the bound is
+    /// announced once, after the fallback is staged, and recorded, and the
+    /// answer to the bounded request anchors no input projection.
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn a_request_the_fallback_bounds_is_announced_recorded_and_anchors_nothing() {
+        let (client, mut agent) = fallback_bound_agent((128_000, 128_000), 100_000).await;
+
+        let (tx, mut rx) = mpsc::channel::<crate::event::AgentEvent>(256);
+        let result = agent.run_with_events("go".into(), tx).await;
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            result.is_ok(),
+            "the run completes on the backup: {:?}",
+            result.err()
+        );
+        assert_eq!(client.fallback_commits(), 1, "the fallback activated");
+
+        let requests = client.seen_requests();
+        assert_eq!(
+            requests.len(),
+            3,
+            "the call, the primary's failed request and the backup's request"
+        );
+        assert_eq!(
+            carried_result_texts(&requests[1], "tc_1")
+                .iter()
+                .map(String::len)
+                .collect::<Vec<_>>(),
+            vec![400_000],
+            "test setup: the primary's request carries the result whole"
+        );
+        let carried = carried_result_texts(&requests[2], "tc_1");
+        let [head, _marker] = carried.as_slice() else {
+            panic!(
+                "the backup's request carries a head and a marker, not {} blocks",
+                carried.len()
+            );
+        };
+
+        let notices = bounded_request_notices(&events);
+        assert_eq!(notices.len(), 1, "the backup's request is announced once");
+        assert_eq!(notices[0]["axis"], "request_bytes");
+        assert_eq!(notices[0]["results"][0]["tool_use_id"], "tc_1");
+        assert_eq!(
+            notices[0]["results"][0]["kept_bytes"],
+            u64::try_from(head.len()).unwrap()
+        );
+        assert_eq!(notices[0]["results"][0]["total_bytes"], 400_000);
+        let kinds = events
+            .iter()
+            .map(crate::event::agent_event_type)
+            .collect::<Vec<_>>();
+        let staged = kinds
+            .iter()
+            .position(|kind| *kind == "model_fallback_staged")
+            .expect("the fallback is staged");
+        let announced = kinds
+            .iter()
+            .position(|kind| *kind == "tool_results_bounded_for_request")
+            .expect("the bound is announced");
+        assert!(
+            staged < announced,
+            "the bound is announced for the backup's request: {kinds:?}"
+        );
+
+        assert_fallback_bound_recorded_and_anchored_nothing(&agent);
+    }
+
     /// Answers every ordinary request with `presented` input tokens and
     /// every compaction summary request with a summary, and refuses each
     /// ordinary request whose last user text is in `refuse` with a
@@ -30461,6 +30719,14 @@ mod tests {
             Mutex<Vec<Option<crate::lifecycle::run_primitive::ProviderParamsOverride>>>,
         forged_client_capability_filter: Mutex<ToolFilter>,
         forged_client_max_output_tokens: std::sync::atomic::AtomicU32,
+        /// Answer the next request, on any model, with one call of
+        /// `list_records` (`tc_1`): the primary then fails the request that
+        /// carries its result.
+        tool_round_pending: std::sync::atomic::AtomicBool,
+        /// The request bytes the backup's provider takes; `None` measures no
+        /// request. The primary's provider takes any size.
+        backup_request_cap: Option<u64>,
+        seen_requests: Mutex<Vec<Vec<Message>>>,
     }
 
     fn fallback_activation_test_registry() -> Arc<crate::ModelRegistry> {
@@ -30871,7 +31137,26 @@ mod tests {
                 seen_provider_params: Mutex::new(Vec::new()),
                 forged_client_capability_filter: Mutex::new(ToolFilter::All),
                 forged_client_max_output_tokens: std::sync::atomic::AtomicU32::new(u32::MAX),
+                tool_round_pending: std::sync::atomic::AtomicBool::new(false),
+                backup_request_cap: None,
+                seen_requests: Mutex::new(Vec::new()),
             }
+        }
+
+        /// The models of `registry`, a run that calls `list_records` once on
+        /// the primary before the primary fails, so the fallback's request
+        /// carries the run's result, and a backup whose provider takes at most
+        /// `backup_request_cap` request bytes.
+        fn with_tool_round(registry: Arc<crate::ModelRegistry>, backup_request_cap: u64) -> Self {
+            let mut client = Self::new();
+            client.registry = registry;
+            client.tool_round_pending = std::sync::atomic::AtomicBool::new(true);
+            client.backup_request_cap = Some(backup_request_cap);
+            client
+        }
+
+        fn seen_requests(&self) -> Vec<Vec<Message>> {
+            self.seen_requests.lock().unwrap().clone()
         }
 
         fn with_post_activation_identity_read_failure() -> Self {
@@ -31365,13 +31650,22 @@ mod tests {
     impl AgentLlmClient for FallbackActivatingClient {
         fn request_pressure(
             &self,
-            _messages: &[Message],
+            messages: &[Message],
             _tools: &[Arc<ToolDef>],
             _max_tokens: u32,
             _temperature: Option<f32>,
             _params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
         ) -> Result<Option<crate::ProviderRequestPressure>, AgentError> {
-            Ok(Some(crate::ProviderRequestPressure::new(0, None)))
+            let backup_cap = self
+                .backup_request_cap
+                .filter(|_| self.active.load(std::sync::atomic::Ordering::SeqCst) != 0);
+            let Some(cap) = backup_cap else {
+                return Ok(Some(crate::ProviderRequestPressure::new(0, None)));
+            };
+            let bytes = serde_json::to_vec(messages).map_or(u64::MAX, |encoded| {
+                u64::try_from(encoded.len()).unwrap_or(u64::MAX)
+            });
+            Ok(Some(crate::ProviderRequestPressure::new(bytes, Some(cap))))
         }
 
         async fn stream_response(
@@ -31382,6 +31676,7 @@ mod tests {
             _temperature: Option<f32>,
             provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
         ) -> Result<super::LlmStreamResult, AgentError> {
+            self.seen_requests.lock().unwrap().push(messages.to_vec());
             self.seen_max_tokens.lock().unwrap().push(max_tokens);
             self.seen_provider_params
                 .lock()
@@ -31403,6 +31698,22 @@ mod tests {
                     .collect::<Vec<_>>(),
             );
 
+            if self
+                .tool_round_pending
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Ok(super::LlmStreamResult::new(
+                    vec![AssistantBlock::ToolUse {
+                        id: "tc_1".to_string(),
+                        name: "list_records".into(),
+                        args: serde_json::value::RawValue::from_string("{}".to_string())
+                            .expect("static raw value should parse"),
+                        meta: None,
+                    }],
+                    StopReason::ToolUse,
+                    normalized_test_usage(self, Usage::default()),
+                ));
+            }
             if self.active.load(std::sync::atomic::Ordering::SeqCst) == 0 {
                 return Err(AgentError::llm(
                     "mock",
