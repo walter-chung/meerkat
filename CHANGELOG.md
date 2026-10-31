@@ -1043,10 +1043,6 @@ them.
 - `meerkat-core`: a context refusal whose run's closing save or boundary
   build fails is not persisted; the next refusal records it again.
 
-- `meerkat-schedule`: a schedule's superseded acks still grow with every
-  revision. `meerkat_schedule_list` summaries leave them out;
-  `meerkat_schedule_get` and the host APIs return them with the schedule.
-
 - `meerkat-runtime`, `meerkat-session`: the registration a stopped host
   runtime's session leaves degraded stays in its machine until that machine
   reloads it, at the session's next registration there, or the process exits.
