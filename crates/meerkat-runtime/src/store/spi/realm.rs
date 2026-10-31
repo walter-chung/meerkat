@@ -628,37 +628,67 @@ impl SelfFence for SpiRealm {
     /// re-acquire in flight and, when that one did not resume the writer,
     /// runs one of its own, on a task of its own, so giving up on it leaves
     /// it running), for at most [`SpiRealm::dispatch_wait_bound`], and reads
-    /// the window again: open only when a re-acquire resumed the writer.
+    /// the window again: open only when a re-acquire resumed the writer. A
+    /// re-acquire that fails without proving another writer (the store
+    /// refused an acquire, or the renew after it failed) is tried again
+    /// after one renew interval, as the realm's own renewal does, until the
+    /// bound; another writer (the realm is poisoned) ends the wait at once.
     async fn dispatch_window(&self) -> SelfFenceWindow {
         let window = SelfFence::window(self);
         if window.is_open() {
             return window;
         }
         let bound = self.dispatch_wait_bound();
-        let reacquired = tokio::time::timeout(bound, self.ensure_lease()).await;
-        // The window read after the wait decides, not the attempt's outcome:
+        let retry_after = self.timing.renew_interval();
+        let mut last_error = None;
+        let reacquired = tokio::time::timeout(bound, async {
+            loop {
+                match self.ensure_lease().await {
+                    Ok(()) => return,
+                    Err(error @ SpiError::RealmPoisoned(_)) => {
+                        last_error = Some(error);
+                        return;
+                    }
+                    Err(error) => last_error = Some(error),
+                }
+                tokio::time::sleep(retry_after).await;
+            }
+        })
+        .await;
+        // The window read after the wait decides, not the attempts' outcome:
         // another attempt may have resumed the writer meanwhile, or a new
         // stop may have closed the window again since.
         let window = SelfFence::window(self);
         if !window.is_open() {
-            match reacquired {
-                Ok(Ok(())) => tracing::warn!(
+            match (reacquired, last_error) {
+                (_, Some(error @ SpiError::RealmPoisoned(_))) => tracing::warn!(
+                    %error,
+                    "host store writer's fence window is closed and another writer holds the \
+                     realm; the dispatch does not proceed"
+                ),
+                (Ok(()), _) => tracing::warn!(
                     "host store writer's fence window closed again right after its re-acquire; \
                      the dispatch does not proceed"
                 ),
-                Ok(Err(error)) => tracing::warn!(
+                (Err(_), Some(error)) => tracing::warn!(
                     %error,
-                    "host store writer's fence window is closed and its re-acquire did not \
-                     restore it; the dispatch does not proceed"
-                ),
-                Err(_) => tracing::warn!(
                     ?bound,
-                    "host store writer's fence window is closed and its re-acquire did not \
+                    "host store writer's fence window stayed closed: no re-acquire restored it \
+                     within the dispatch wait bound; the dispatch does not proceed"
+                ),
+                (Err(_), None) => tracing::warn!(
+                    ?bound,
+                    "host store writer's fence window stayed closed: its re-acquire did not \
                      finish within the dispatch wait bound; the dispatch does not proceed"
                 ),
             }
         }
         window
+    }
+
+    /// Another writer holds the realm: it is poisoned, and never resumes.
+    fn lost(&self) -> bool {
+        self.realm_poisoned().is_some()
     }
 }
 

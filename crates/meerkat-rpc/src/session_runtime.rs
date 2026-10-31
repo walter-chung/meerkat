@@ -15754,11 +15754,12 @@ fn completion_outcome_to_rpc_result(
 /// The JSON-RPC answer of a waiter failure, from its generated resolution.
 ///
 /// An internal failure answers `-32603` with the generated reason and whether
-/// the input is resumable. A session that is not running answers `-32003`: a
-/// graceful stop kept the input durably queued for the session's next start,
-/// and `data` names the input, the stop's time and `kind` and `reason`
-/// `requeued_across_stop`. Do not resubmit such an input; the same
-/// idempotency key after the restart re-attaches to it.
+/// the input is resumable. A session that is not running the input answers
+/// `-32003`: a graceful stop kept the input durably queued for the session's
+/// next start, or a store fence gap kept it queued until the store's fence is
+/// re-acquired, and `data` names the input, the stop's (or the gap's) time
+/// and `kind` and `reason` `requeued_across_stop`. Do not resubmit such an
+/// input; the same idempotency key re-attaches to it.
 fn runtime_completion_wait_failure_rpc_error(
     error: &meerkat_runtime::completion::CompletionWaitError,
     authority: meerkat_runtime::meerkat_machine::RuntimeCompletionWaitFailureAuthority,

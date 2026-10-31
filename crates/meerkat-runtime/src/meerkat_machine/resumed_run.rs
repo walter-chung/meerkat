@@ -13,6 +13,47 @@ use crate::resumed_run_admission::ResumedRunAdmission;
 use crate::traits::RuntimeDriverError;
 
 impl MeerkatMachine {
+    /// The self-fence of this machine's store, when its writes hold a host
+    /// store fence ([`crate::store::RuntimeStore::self_fence`]): a run that
+    /// a store fence gap suspended resumes only once its window is open.
+    pub(crate) fn store_self_fence(&self) -> Option<Arc<dyn meerkat_core::host_store::SelfFence>> {
+        self.store.as_ref().and_then(|store| store.self_fence())
+    }
+
+    /// Whether `session_id`'s store holds a provisional tail of `run_id`:
+    /// the run made a round commit, so it resumes from the cursor the tail
+    /// carries. A run with none (a store fence gap suspended it before its
+    /// first round commit) starts again from its bound inputs instead. A
+    /// tail that cannot be read counts as held: the resume then reads it
+    /// again, through the session layer, and fails as a resume does.
+    pub(crate) async fn run_holds_provisional_tail(
+        &self,
+        session_id: &meerkat_core::types::SessionId,
+        run_id: &meerkat_core::lifecycle::RunId,
+    ) -> bool {
+        let Some(store) = self.store.as_ref() else {
+            return false;
+        };
+        let runtime_id = crate::identifiers::LogicalRuntimeId::for_session(session_id);
+        match store.session_persistence_profile() {
+            crate::store::RuntimeSessionPersistenceProfile::HeadCanonicalV1 => {
+                match store
+                    .load_head_canonical_provisional_tail(&runtime_id)
+                    .await
+                {
+                    Ok(tail) => tail.is_some_and(|authority| authority.run_id() == run_id),
+                    Err(_) => true,
+                }
+            }
+            crate::store::RuntimeSessionPersistenceProfile::WholeBlobV1 => {
+                match store.load_whole_blob_provisional_tail(&runtime_id).await {
+                    Ok(tail) => tail.is_some_and(|tail| tail.authority().run_id() == run_id),
+                    Err(_) => true,
+                }
+            }
+        }
+    }
+
     /// The run `session_id`'s durable tail left open, as its registration
     /// observes it before input recovery.
     ///

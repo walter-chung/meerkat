@@ -1089,7 +1089,10 @@ impl SessionCheckpointer for RestoredFenceCheckpointer {
         ))
     }
 
-    async fn dispatch_fence_ready(&self) -> Result<(), AgentError> {
+    async fn dispatch_fence_ready(
+        &self,
+        _suspendable_run: Option<&RunId>,
+    ) -> Result<(), AgentError> {
         self.waits.fetch_add(1, Ordering::SeqCst);
         tokio::task::yield_now().await;
         Ok(())
@@ -1171,7 +1174,10 @@ impl SessionCheckpointer for SplitFenceCheckpointer {
         self.inner.checkpoint_run(session, run_id, previous).await
     }
 
-    async fn dispatch_fence_ready(&self) -> Result<(), AgentError> {
+    async fn dispatch_fence_ready(
+        &self,
+        _suspendable_run: Option<&RunId>,
+    ) -> Result<(), AgentError> {
         match self.waits.fetch_add(1, Ordering::SeqCst) {
             // The model call and the round's post-commit check.
             0 | 1 => Ok(()),

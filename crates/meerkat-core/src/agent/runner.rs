@@ -3383,8 +3383,10 @@ where
 
     /// End a run whose execution future the host dropped to suspend it, for
     /// a stop that keeps the session's queued work (a host draining and
-    /// requeueing, for a deploy), and say where the suspended run stood;
-    /// `None` when no run had started.
+    /// requeueing, for a deploy) or for a store fence gap (the session
+    /// checkpointer's writer stayed stopped through the run's dispatch wait,
+    /// see [`crate::SessionCheckpointer::dispatch_fence_ready`]), and say
+    /// where the suspended run stood; `None` when no run had started.
     ///
     /// [`crate::DroppedRunSuspension::Resumable`]: the run's last round
     /// commit, cursor included, stays its resume point. Unlike

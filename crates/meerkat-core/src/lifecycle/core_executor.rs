@@ -307,11 +307,12 @@ pub enum CoreExecutorError {
     #[error("Run was cancelled")]
     Cancelled,
 
-    /// The applied run was suspended by a stop that keeps the session's
-    /// queued work ([`AgentError::RunSuspended`]): it is neither cancelled
-    /// nor failed. Its turn stopped at an await point and wrote nothing more,
-    /// so its last round commit stays its resume point. The runtime loop
-    /// realizes no terminal for it and leaves its inputs as they are; it is
+    /// The applied run was suspended ([`AgentError::RunSuspended`]), by a
+    /// stop that keeps the session's queued work or by a store fence gap: it
+    /// is neither cancelled nor failed. Its turn stopped at an await point
+    /// and wrote nothing more, so its last round commit stays its resume
+    /// point. The runtime loop realizes no terminal for it and leaves its
+    /// inputs as they are, bound to it with their stage attempts; it is
     /// never a cancellation, which realizes `RunCancelled` and abandons the
     /// inputs, and never an apply failure, which requeues them.
     #[error("Run {run_id} was suspended; it resumes from its last round commit")]

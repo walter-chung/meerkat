@@ -5469,6 +5469,35 @@ impl RuntimeLoopAuthorityBinding {
         }
     }
 
+    /// The self-fence of the session's store, when its writes hold a host
+    /// store fence.
+    fn store_self_fence(&self) -> Option<std::sync::Arc<dyn meerkat_core::host_store::SelfFence>> {
+        self.machine
+            .upgrade()
+            .and_then(|machine| machine.store_self_fence())
+    }
+
+    /// Whether another writer is proven to hold the session store's fence:
+    /// this process's writer never resumes, and the store refuses its writes.
+    fn store_fence_lost(&self) -> bool {
+        self.store_self_fence().is_some_and(|fence| fence.lost())
+    }
+
+    /// Whether the session's store holds a provisional tail of `run_id` (a
+    /// round commit of the run), as
+    /// [`crate::meerkat_machine::MeerkatMachine::run_holds_provisional_tail`]
+    /// reads it; held when the machine is gone.
+    async fn run_holds_provisional_tail(&self, run_id: &RunId) -> bool {
+        match self.machine.upgrade() {
+            Some(machine) => {
+                machine
+                    .run_holds_provisional_tail(&self.session_id, run_id)
+                    .await
+            }
+            None => true,
+        }
+    }
+
     /// A guard that signals run-settlement waiters when the scope it spans
     /// ends, however it ends.
     fn run_settlement_publication(&self) -> RunSettlementPublication {
@@ -5983,6 +6012,11 @@ struct FeedWakeHoldState {
     /// ladder as the interaction-terminal recovery drain).
     repoll_delay: std::time::Duration,
 }
+
+/// The least time between two waits of a resume lap for a store fence that
+/// stays closed: the realm's own wait already lasts its bound, and a fence
+/// whose wait answers at once is polled no faster than this.
+const FENCE_GAP_REPOLL: std::time::Duration = std::time::Duration::from_secs(1);
 
 const FEED_HOLD_REPOLL_BASE: std::time::Duration = std::time::Duration::from_millis(25);
 const FEED_HOLD_REPOLL_CAP: std::time::Duration = std::time::Duration::from_secs(1);
@@ -7440,7 +7474,7 @@ async fn admit_resumed_run(
     let request = {
         let d = driver.lock().await;
         let bound_input_ids = d.resumed_run_bound_input_ids(&run_id);
-        let turn_tool_overlay = resumed_run_primitive(&d, &run_id, &bound_input_ids)
+        let turn_tool_overlay = resumed_run_primitive(&d, &run_id, &bound_input_ids, true)
             .ok()
             .and_then(|primitive| {
                 primitive
@@ -7582,23 +7616,37 @@ async fn settle_refused_resumed_run(
 
 /// How the loop realized an `apply` that answered with a suspended run.
 enum SuspendedRunRealization {
-    /// The machine marked the run resumable; nothing else is realized.
-    Suspended,
+    /// The machine marked the run resumable, for `cause`; nothing else is
+    /// realized.
+    Suspended {
+        cause: crate::meerkat_machine::dsl::RunSuspensionCause,
+    },
     /// The machine refused the suspension: the run is cancelled as before.
     Refused,
     /// The loop lost its driver authority.
     Exit,
 }
 
-/// Realize an `apply` the executor answered with a suspended run: a graceful
-/// requeue stop dropped the turn with no terminal and no closing write. The
-/// machine marks the run resumable (`SuspendRunForStop`) under driver
-/// authority, before the stop's first input classification, so the stop keeps
-/// the run's inputs bound to it with its requeue mark and the next start
-/// resumes the run from its last committed round. Nothing else is realized:
-/// no terminal, no input change, and the provisional tail stays.
+/// Realize an `apply` the executor answered with a suspended run, with no
+/// terminal and no closing write, for one of two causes the machine tells
+/// apart (`SuspendRunForStop`):
 ///
-/// The machine refuses outside a requeue stop, for a session without durable
+/// - a graceful requeue stop (the registration drains for an unregister that
+///   requeues): the machine marks the run resumable, under driver authority
+///   and before the stop's first input classification, so the stop keeps the
+///   run's inputs bound to it with its requeue mark and the next start
+///   resumes the run from its last committed round;
+/// - a store fence gap (the session store's writer stayed stopped through the
+///   run's whole dispatch wait and no other writer was found, outside any
+///   unregister): the machine marks the run resumable and returns its turn to
+///   `Ready`, its inputs keep their run and their stage attempts, and this
+///   loop resumes the run once the store's fence is restored.
+///
+/// Nothing else is realized: no terminal, no input change, and the
+/// provisional tail stays.
+///
+/// The machine refuses outside a requeue stop or a fence gap (a draining
+/// registration suspends only for its stop), for a session without durable
 /// rounds, while a live-boundary join is still published, for a run whose
 /// turn already ended, or for a run that is not current; a suspension of
 /// another run than this loop's is refused here. A refused suspension is
@@ -7606,9 +7654,9 @@ enum SuspendedRunRealization {
 /// cancelled and its waiters and directed terminals resolve through that
 /// realization. The agent already ended the turn without a terminal event,
 /// so the session's event stream carries no run terminal for it; a refusal
-/// is rare, since the saga asks only under a requeue stop on a persistent
-/// session and the agent answers suspended only for a run with round
-/// commits.
+/// is rare, since a suspension is asked only under a requeue stop or for a
+/// fence gap on a persistent session, and the agent answers suspended only
+/// for a run that takes round commits.
 async fn realize_suspended_run(
     driver: &crate::meerkat_machine::SharedDriver,
     authority_binding: &RuntimeLoopAuthorityBinding,
@@ -7639,24 +7687,40 @@ async fn realize_suspended_run(
         &*d,
         crate::meerkat_machine::driver::DriverEntry::Persistent(_)
     );
+    // The loop asks the session for a suspension only for a requeue stop,
+    // which drains the registration; a suspension outside an unregister is
+    // the session store's fence gap.
+    let cause = if d.registration_draining() {
+        crate::meerkat_machine::dsl::RunSuspensionCause::RequeueStop
+    } else {
+        crate::meerkat_machine::dsl::RunSuspensionCause::FenceGap
+    };
     match crate::meerkat_machine::driver::machine_suspend_run_for_stop(
         &mut d,
         run_id,
         durable_session,
-        crate::meerkat_machine::dsl::RunSuspensionCause::RequeueStop,
+        cause,
     ) {
         Ok(true) => {
-            tracing::info!(
-                %run_id,
-                "the requeue stop suspended the run; the next start resumes it"
-            );
-            SuspendedRunRealization::Suspended
+            match cause {
+                crate::meerkat_machine::dsl::RunSuspensionCause::RequeueStop => tracing::info!(
+                    %run_id,
+                    "the requeue stop suspended the run; the next start resumes it"
+                ),
+                crate::meerkat_machine::dsl::RunSuspensionCause::FenceGap => tracing::warn!(
+                    %run_id,
+                    "a store fence gap suspended the run; it resumes once the store's fence is \
+                     restored"
+                ),
+            }
+            SuspendedRunRealization::Suspended { cause }
         }
         Ok(false) => {
             tracing::warn!(
                 %run_id,
                 durable_session,
-                "the machine refused to suspend the run for the stop; it is cancelled"
+                ?cause,
+                "the machine refused to suspend the run; it is cancelled"
             );
             SuspendedRunRealization::Refused
         }
@@ -7664,7 +7728,8 @@ async fn realize_suspended_run(
             tracing::error!(
                 %run_id,
                 %error,
-                "failed to suspend the run for the stop; it is cancelled"
+                ?cause,
+                "failed to suspend the run; it is cancelled"
             );
             SuspendedRunRealization::Refused
         }
@@ -7673,15 +7738,20 @@ async fn realize_suspended_run(
 
 /// The run primitive of a resumed run: its bound inputs, hydrated from the
 /// ledger and merged exactly as an ordinary run merges its batch, dispatched
-/// with the `ResumeRun` kind under the run's original id.
+/// under the run's original id.
 ///
-/// The kind is stamped only on this dispatched primitive, never on an input:
-/// the session layer then re-enters the run from its cursor and appends none
-/// of the inputs again.
+/// A run that resumes from its provisional tail (`from_tail`) is dispatched
+/// with the `ResumeRun` kind, stamped only on this dispatched primitive,
+/// never on an input: the session layer then re-enters the run from its
+/// cursor and appends none of the inputs again. A run without a tail (a
+/// store fence gap suspended it before its first round commit) keeps its
+/// batch's own kind: the session layer starts it again from its inputs, as
+/// at its first start.
 fn resumed_run_primitive(
     d: &crate::meerkat_machine::driver::DriverEntry,
     run_id: &RunId,
     input_ids: &[InputId],
+    from_tail: bool,
 ) -> Result<RunPrimitive, String> {
     let staged_inputs = d
         .hydrate_resumed_run_inputs(run_id, input_ids)
@@ -7729,7 +7799,9 @@ fn resumed_run_primitive(
     };
     let metadata = staged.turn_metadata.get_or_insert_with(Default::default);
     metadata.work_authorization = work_authorization;
-    metadata.execution_kind = Some(meerkat_core::lifecycle::RuntimeExecutionKind::ResumeRun);
+    if from_tail {
+        metadata.execution_kind = Some(meerkat_core::lifecycle::RuntimeExecutionKind::ResumeRun);
+    }
     Ok(primitive)
 }
 
@@ -8001,6 +8073,42 @@ async fn process_queue(
         if resumable_run_id.is_some() && draining {
             return false;
         }
+        // A marked run resumes only on a writer whose store fence is open: a
+        // run a store fence gap suspended waits here, one bounded wait at a
+        // time, until the fence is restored. No guard is held while it waits,
+        // and each wait ends with a new lap, so stops and effects are seen
+        // between waits. Another writer holding the fence ends the session's
+        // runs here: nothing of the run starts again in this process, the
+        // store keeps its inputs for the new owner, and every local waiter is
+        // told its input stays queued, as a teardown for that cause tells it.
+        if resumable_run_id.is_some()
+            && let Some(fence) = authority_binding.store_self_fence()
+            && !fence.window().is_open()
+        {
+            drop(turn_finalization_guard);
+            let window = fence.dispatch_window().await;
+            if !window.is_open() {
+                if fence.lost() {
+                    tracing::warn!(
+                        session_id = %authority_binding.session_id,
+                        "another writer holds the session store's fence; the suspended run does \
+                         not resume in this process, and the session's waiters are told their \
+                         inputs stay queued for the new owner"
+                    );
+                    if let Some(completions) = completions {
+                        completions.lock().await.fail_all_waiters(
+                            crate::completion::CompletionWaitError::RequeuedAcrossStop {
+                                stopped_at: chrono::Utc::now(),
+                            },
+                        );
+                    }
+                    return false;
+                }
+                // A fence whose wait answers at once must not spin the loop.
+                tokio::time::sleep(FENCE_GAP_REPOLL).await;
+            }
+            continue 'lap;
+        }
         let resumed_run_id = match resumable_run_id {
             Some(run_id) => {
                 match admit_resumed_run(driver, completions, executor, authority_binding, run_id)
@@ -8012,6 +8120,14 @@ async fn process_queue(
                 }
             }
             None => None,
+        };
+        // A resumed run continues from its last round commit, the cursor of
+        // its provisional tail; a run a store fence gap suspended before its
+        // first round commit has no tail, and starts again from its bound
+        // inputs under its own run, which spends no stage attempt.
+        let resumed_from_tail = match resumed_run_id.as_ref() {
+            Some(run_id) => authority_binding.run_holds_provisional_tail(run_id).await,
+            None => true,
         };
 
         // Record interrupted-run notices owed to the model while the
@@ -8184,7 +8300,12 @@ async fn process_queue(
                         // A resumed run that cannot be described is stopped
                         // through the mismatch path, never replayed while its
                         // provisional tail stands.
-                        break 'dequeue match resumed_run_primitive(&d, &run_id, &input_ids) {
+                        break 'dequeue match resumed_run_primitive(
+                            &d,
+                            &run_id,
+                            &input_ids,
+                            resumed_from_tail,
+                        ) {
                             Ok(primitive) => RuntimeLoopDequeueOutcome::Ready {
                                 input_ids,
                                 run_id,
@@ -9510,13 +9631,14 @@ async fn process_queue(
                         }
                     }
                     Err(e) => {
-                        // A run a graceful requeue stop suspended is realized
-                        // as nothing: the machine marks it resumable before
-                        // the stop classifies any input, and the stop keeps
-                        // its inputs bound to it. It never reaches the
-                        // failed-run disposition below, whose replay would
-                        // requeue the inputs over the run's provisional tail.
-                        // A suspension the machine refuses is cancelled.
+                        // A run a graceful requeue stop or a store fence gap
+                        // suspended is realized as nothing: the machine marks
+                        // it resumable (for a stop, before the stop classifies
+                        // any input), and its inputs stay bound to it. It
+                        // never reaches the failed-run disposition below,
+                        // whose replay would requeue the inputs over the run's
+                        // provisional tail. A suspension the machine refuses
+                        // is cancelled.
                         let (e, d) = match &e {
                             CoreExecutorError::Suspended {
                                 run_id: suspended_run_id,
@@ -9531,7 +9653,27 @@ async fn process_queue(
                                 )
                                 .await
                                 {
-                                    SuspendedRunRealization::Suspended => continue 'lap,
+                                    SuspendedRunRealization::Suspended {
+                                        cause:
+                                            crate::meerkat_machine::dsl::RunSuspensionCause::FenceGap,
+                                    } => {
+                                        // The run's inputs stay bound to it and
+                                        // run when it resumes, once the fence is
+                                        // back or at the next start. Their
+                                        // waiters are told so now, within the
+                                        // run's one dispatch wait, instead of
+                                        // waiting out the gap.
+                                        if let Some(completions) = completions {
+                                            completions.lock().await.fail_inputs(
+                                                input_ids.iter().cloned(),
+                                                crate::completion::CompletionWaitError::RequeuedAcrossStop {
+                                                    stopped_at: chrono::Utc::now(),
+                                                },
+                                            );
+                                        }
+                                        continue 'lap;
+                                    }
+                                    SuspendedRunRealization::Suspended { .. } => continue 'lap,
                                     SuspendedRunRealization::Exit => return true,
                                     SuspendedRunRealization::Refused => {
                                         (CoreExecutorError::cancelled(), driver.lock().await)
@@ -9586,6 +9728,30 @@ async fn process_queue(
                         if teardown_required {
                             handoff.disposition =
                                 RuntimeLoopTeardownDisposition::UnregisterRequired;
+                        }
+                        // Another writer holds the session store's fence: the
+                        // store refuses every write of this process from here
+                        // on, so nothing this teardown realizes for the
+                        // session's inputs lands, and the store keeps them as
+                        // last committed, pending, for the new owner to run.
+                        // Every local waiter is told its input stays queued,
+                        // not that it ended, so no caller resubmits work the
+                        // new owner runs.
+                        if teardown_required
+                            && authority_binding.store_fence_lost()
+                            && let Some(completions) = completions
+                        {
+                            tracing::warn!(
+                                session_id = %authority_binding.session_id,
+                                %run_id,
+                                "another writer holds the session store's fence; the session's \
+                                 waiters are told their inputs stay queued for the new owner"
+                            );
+                            completions.lock().await.fail_all_waiters(
+                                crate::completion::CompletionWaitError::RequeuedAcrossStop {
+                                    stopped_at: chrono::Utc::now(),
+                                },
+                            );
                         }
                         let terminal_authority_guard = match authority_binding
                             .lock_current_driver_authority(driver, "runtime loop terminal failure")
@@ -13899,8 +14065,9 @@ mod tests {
             vec![input_id.clone()],
             "the staged input is the run's bound batch"
         );
-        let primitive = resumed_run_primitive(&guard, &run_id, std::slice::from_ref(&input_id))
-            .expect("a run's own staged input describes its resumed batch");
+        let primitive =
+            resumed_run_primitive(&guard, &run_id, std::slice::from_ref(&input_id), true)
+                .expect("a run's own staged input describes its resumed batch");
         assert_eq!(
             primitive.contributing_input_ids(),
             std::slice::from_ref(&input_id)
@@ -13911,6 +14078,23 @@ mod tests {
                 .and_then(|metadata| metadata.execution_kind),
             Some(meerkat_core::lifecycle::RuntimeExecutionKind::ResumeRun),
             "the dispatched primitive carries the resume kind"
+        );
+        // A run without a provisional tail (a store fence gap suspended it
+        // before its first round commit) starts again from the same inputs,
+        // under its batch's own kind.
+        let restarted =
+            resumed_run_primitive(&guard, &run_id, std::slice::from_ref(&input_id), false)
+                .expect("the same batch describes the run's start again");
+        assert_eq!(
+            restarted.contributing_input_ids(),
+            std::slice::from_ref(&input_id)
+        );
+        assert_ne!(
+            restarted
+                .turn_metadata()
+                .and_then(|metadata| metadata.execution_kind),
+            Some(meerkat_core::lifecycle::RuntimeExecutionKind::ResumeRun),
+            "a run that starts again from its inputs is no resume"
         );
         match &*guard {
             crate::meerkat_machine::DriverEntry::Ephemeral(d) => assert_eq!(
@@ -13933,7 +14117,8 @@ mod tests {
         let guard = driver.lock().await;
         assert!(guard.resumed_run_bound_input_ids(&other_run).is_empty());
         assert!(
-            resumed_run_primitive(&guard, &other_run, std::slice::from_ref(&input_id)).is_err(),
+            resumed_run_primitive(&guard, &other_run, std::slice::from_ref(&input_id), true)
+                .is_err(),
             "an input bound to another run is not this run's resumed batch"
         );
     }

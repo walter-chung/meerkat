@@ -78,17 +78,27 @@ pub enum CompletionWaitError {
         "the durable outcome of run {run_id} is unknown: its store did not answer within its commit deadline; read the input after its session reloads"
     )]
     DurableOutcomeUnknown { run_id: RunId },
-    /// The input was still queued when its runtime stopped, and the stop's
-    /// unregister kept it durably queued for the next start
-    /// ([`UnregisterQueuedInputs::Requeue`](crate::UnregisterQueuedInputs::Requeue)).
-    /// It is neither failed nor consumed: the next start runs it, or ends it
-    /// as abandoned with reason `requeue_expired` when it is older than the
-    /// stop's max age by then. Do not resubmit it; read it after the restart.
+    /// The input stays durably queued across a runtime stop or a store fence
+    /// gap, and runs later. It is neither failed nor consumed.
+    ///
+    /// - A runtime stop: the input was still queued when its runtime stopped,
+    ///   and the stop's unregister kept it durably queued for the next start
+    ///   ([`UnregisterQueuedInputs::Requeue`](crate::UnregisterQueuedInputs::Requeue)).
+    ///   The next start runs it, or ends it as abandoned with reason
+    ///   `requeue_expired` when it is older than the stop's max age by then.
+    /// - A store fence gap: the session store's writer stayed stopped through
+    ///   the dispatch wait of the run the input is bound to, and the run was
+    ///   suspended with the input still bound to it; or another writer took
+    ///   the session over, and the store keeps the input for that owner. The
+    ///   input runs when the fence is re-acquired (the run resumes) or at the
+    ///   next start.
+    ///
+    /// Do not resubmit it; read it later.
     #[error(
-        "the input stays queued across the runtime stop at {stopped_at} and runs on the next start; do not resubmit it"
+        "the input stays queued across the runtime stop or store fence gap at {stopped_at} and runs when the fence is re-acquired or at the next start; do not resubmit it"
     )]
     RequeuedAcrossStop {
-        /// When the stop kept the input queued.
+        /// When the stop or the fence gap kept the input queued.
         stopped_at: chrono::DateTime<chrono::Utc>,
     },
     /// The input joined run `run_id` at a model boundary, and a round commit

@@ -425,11 +425,24 @@ pub trait SessionCheckpointer: Send + Sync {
     /// or timed out, or its window closed) waits here, bounded, for the
     /// fresh acquire the writer makes before its next write
     /// ([`crate::host_store::SelfFence::dispatch_window`]), and allows once
-    /// that acquire resumed the writer. When the acquire fails, finds
-    /// another writer, or does not finish in time, it refuses as
-    /// [`Self::dispatch_fence_check`] does. The default asks
-    /// [`Self::dispatch_fence_check`] and never waits.
-    async fn dispatch_fence_ready(&self) -> Result<(), AgentError> {
+    /// that acquire resumed the writer. When another writer is proven
+    /// ([`crate::host_store::SelfFence::lost`]), it refuses as
+    /// [`Self::dispatch_fence_check`] does, with the teardown class. When no
+    /// acquire resumed the writer within the wait and no other writer is
+    /// proven (a store fence gap), nothing is lost yet: `suspendable_run` is
+    /// the run asking, when the agent could suspend it (a run that takes
+    /// round commits and has not written its closing save), and a
+    /// checkpointer whose host dispatched that run may have it suspended
+    /// there instead of answering, so it resumes from its last round commit
+    /// (or starts again from its inputs, before its first) once the fence is
+    /// back. Otherwise it refuses with a retryable error, which requires no
+    /// teardown. The default asks [`Self::dispatch_fence_check`] and never
+    /// waits.
+    async fn dispatch_fence_ready(
+        &self,
+        suspendable_run: Option<&RunId>,
+    ) -> Result<(), AgentError> {
+        let _ = suspendable_run;
         self.dispatch_fence_check()
     }
 

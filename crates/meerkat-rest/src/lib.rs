@@ -5207,12 +5207,13 @@ async fn completion_wait_error_to_api_error(
 /// The REST answer of a waiter failure, from its generated resolution.
 ///
 /// An internal failure answers `500` with the generated reason's code and
-/// whether the input is resumable. A session that is not running answers
-/// `409` `SESSION_NOT_RUNNING`: a graceful stop kept the input durably queued
-/// for the session's next start, and `details` names the input, the stop's
-/// time and `kind` and `reason` `requeued_across_stop`. It is no retryable
-/// unavailability: do not resubmit such an input; the same idempotency key
-/// after the restart re-attaches to it.
+/// whether the input is resumable. A session that is not running the input
+/// answers `409` `SESSION_NOT_RUNNING`: a graceful stop kept the input
+/// durably queued for the session's next start, or a store fence gap kept it
+/// queued until the store's fence is re-acquired, and `details` names the
+/// input, the stop's (or the gap's) time and `kind` and `reason`
+/// `requeued_across_stop`. It is no retryable unavailability: do not
+/// resubmit such an input; the same idempotency key re-attaches to it.
 fn runtime_completion_wait_failure_api_error(
     error: &meerkat_runtime::completion::CompletionWaitError,
     authority: meerkat_runtime::meerkat_machine::RuntimeCompletionWaitFailureAuthority,

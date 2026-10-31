@@ -187,7 +187,9 @@ cannot continue to queued, as every start does.
   the calls [answered as interrupted](#calls-answered-as-interrupted).
 - **The inputs stay bound to the run.** Callers waiting on them get the
   answer the stop gives the queued prompts it keeps,
-  `requeued_across_stop` (`RequeuedAcrossStop`).
+  `requeued_across_stop` (`RequeuedAcrossStop`), the same answer a run that
+  a store fence gap suspends gives (see
+  [One writer, fenced](#one-writer-fenced)).
 - **The run continues at the next start**, when its session is opened again
   or its mob rebuilds the member, before the kept queued prompts run.
   Meerkat does not look for such runs at start-up.
@@ -435,9 +437,26 @@ fence:
 - **A stop is a pause.** A run that reaches a model call or a tool call
   while the holder is stopped (a renew failed or timed out, or its window
   closed) waits for that new acquire, for at most one self-fence window
-  plus the acquire's own timeouts (35 s at the default timing), and goes on
-  once it succeeds. The run fails as before only when the acquire fails,
-  finds another process, or takes longer than that.
+  plus the acquire's own timeouts (35 s at the default timing), trying again
+  once per renew interval while the acquire fails, and goes on once it
+  succeeds. A tool call waits within its own deadline: a call whose
+  deadline passes during the wait ends as a tool timeout although it never
+  started.
+- **A longer gap suspends the run.** When no acquire succeeds within that
+  wait and no other process shows up (a store fence gap), the run is
+  suspended as a graceful stop suspends it: it stops at the wait, its
+  inputs stay bound to it without spending a stage attempt, and callers
+  waiting on them are answered `requeued_across_stop` within that one wait.
+  The runtime resumes the run once the fence is back: from its last
+  committed round, or from its inputs when it had not committed a round
+  yet. The gap may last any number of waits. A turn that no runtime run
+  backs (a direct turn) fails with a retryable storage error instead.
+- **Another process ends this one's runs.** When the acquire finds that
+  another process holds the fence or committed meanwhile, the run is
+  refused and the live session torn down. The store refuses every later
+  write of this process, so the session's inputs stay as last committed,
+  for the new owner to run, and callers waiting on them here are answered
+  `requeued_across_stop`.
 - **Self-fencing.** The holder makes no model call, dispatches no tool and
   commits nothing unless its last successful acquire or renew started less
   than the self-fence window ago. The window is the lease minus the store's
@@ -564,6 +583,13 @@ Before you run a host store in production, run the host store chapter of the
   with `extraction_required` a second time under the same run id.
 - The tools of a resumed run see no content of the current turn, as with a
   pending continuation.
+- A run that a store fence gap suspended resumes in the same process as
+  after a restart: what it did after its last round commit is done again.
+  A run suspended before its first round commit starts again from its
+  inputs, so its run-start hooks run again and `RunStarted` is published
+  again under the same run id. A mob delegation whose member turn a fence
+  gap suspends ends as it does for a stop; the member's input still runs
+  once the fence is back.
 - Budget counters that span the agent's lifetime, rather than the run's,
   start again with the agent after a restart, as for any session a host
   rebuilds; the run's own time budget continues.

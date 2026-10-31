@@ -3391,8 +3391,9 @@ pub(crate) enum ExactTurnTerminal {
     Runtime(meerkat_runtime::completion::CompletionOutcome),
     DirectSessionError(meerkat_core::service::SessionError),
     PlacedBounded(meerkat_contracts::wire::supervisor_bridge::BridgeBoundedTurnResult),
-    /// A graceful stop kept the admitted input durably queued for the next
-    /// start ([`meerkat_runtime::completion::CompletionWaitError::RequeuedAcrossStop`]).
+    /// A graceful stop, or a store fence gap, kept the admitted input durably
+    /// queued, for the next start or for the fence's re-acquire
+    /// ([`meerkat_runtime::completion::CompletionWaitError::RequeuedAcrossStop`]).
     RequeuedAcrossStop {
         input_id: meerkat_core::lifecycle::InputId,
     },
@@ -4488,9 +4489,10 @@ pub enum BoundedTurnFailure {
         admitted_session_id: SessionId,
         error: MobError,
     },
-    /// A graceful Shutdown kept this queued input durably queued: it runs on
-    /// the mob's next start. Do not resubmit it; a same-key replay after the
-    /// restart re-attaches to it.
+    /// A graceful Shutdown, or a store fence gap, kept this input durably
+    /// queued: it runs on the mob's next start, or once the member session
+    /// store's fence is re-acquired. Do not resubmit it; a same-key replay
+    /// re-attaches to it.
     RequeuedAcrossStop {
         session_id: SessionId,
         input_id: meerkat_core::lifecycle::InputId,
@@ -4615,7 +4617,7 @@ impl std::fmt::Display for BoundedTurnFailure {
                 input_id,
             } => write!(
                 f,
-                "input '{input_id}' for session '{session_id}' stays queued across the stop and runs on the next start; re-attach with the same delivery key, do not resubmit"
+                "input '{input_id}' for session '{session_id}' stays queued across the stop or store fence gap and runs when the fence is re-acquired or on the next start; re-attach with the same delivery key, do not resubmit"
             ),
             Self::RequeueExpired {
                 session_id,

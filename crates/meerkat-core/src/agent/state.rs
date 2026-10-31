@@ -1754,12 +1754,29 @@ where
     /// asked of every agent with a checkpointer, a live bridge run's
     /// included: such a run commits nothing, but it still calls the model
     /// and runs tools. A writer whose fence was stopped waits here, bounded,
-    /// for its re-acquire, and is refused when that does not restore it.
+    /// for its re-acquire. When that does not restore it, the checkpointer
+    /// may have the run suspended here (it never answers then, and the host
+    /// drops the run at this wait, as [`Self::suspend_dropped_run`] expects),
+    /// or it refuses.
     async fn check_dispatch_fence(&self) -> Result<(), AgentError> {
         match self.checkpointer.as_ref() {
-            Some(checkpointer) => checkpointer.dispatch_fence_ready().await,
+            Some(checkpointer) => {
+                let suspendable = self.suspendable_run_id();
+                checkpointer
+                    .dispatch_fence_ready(suspendable.as_ref())
+                    .await
+            }
             None => Ok(()),
         }
+    }
+
+    /// The current run when the host could suspend it by dropping its
+    /// future ([`Self::suspend_dropped_run`] would answer it resumable): a
+    /// run that takes round commits and has not written its closing save.
+    fn suspendable_run_id(&self) -> Option<RunId> {
+        let run_id = self.runtime_started_run_id.as_ref()?;
+        (self.round_commits.commits_enabled() && !self.round_commits.final_save_written())
+            .then(|| run_id.clone())
     }
 
     /// Start the round state of a fresh run.
@@ -9218,7 +9235,11 @@ where
         // deadline: a call whose deadline passes while it waits ends as a
         // tool timeout although it never started, and a call that starts
         // after a wait runs with what is left of its deadline.
-        let fence = self.checkpointer.clone().map(DispatchFence::new);
+        let suspendable_run = self.suspendable_run_id();
+        let fence = self
+            .checkpointer
+            .clone()
+            .map(|checkpointer| DispatchFence::new(checkpointer, suspendable_run));
         let mut dispatch_results = dispatch_tool_calls_fenced_boxed(
             Arc::clone(&self.tools),
             self.observed_tool_dispatch_context(self.operation_review.clone()),
@@ -10863,18 +10884,25 @@ type ToolDispatchFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = Vec<ToolDispatchResult>> + 'static>>;
 
 /// The writer's fence a tool batch asks right before each call starts (see
-/// [`crate::SessionCheckpointer::dispatch_fence_ready`]). The first refusal
-/// is kept for the round, and no later call of the batch starts.
+/// [`crate::SessionCheckpointer::dispatch_fence_ready`]), on behalf of the
+/// round's run (`suspendable_run`, when the host could suspend it). The
+/// first refusal is kept for the round, and no later call of the batch
+/// starts.
 #[derive(Clone)]
 struct DispatchFence {
     checkpointer: Arc<dyn crate::SessionCheckpointer>,
+    suspendable_run: Option<RunId>,
     refusal: Arc<std::sync::Mutex<Option<AgentError>>>,
 }
 
 impl DispatchFence {
-    fn new(checkpointer: Arc<dyn crate::SessionCheckpointer>) -> Self {
+    fn new(
+        checkpointer: Arc<dyn crate::SessionCheckpointer>,
+        suspendable_run: Option<RunId>,
+    ) -> Self {
         Self {
             checkpointer,
+            suspendable_run,
             refusal: Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -10887,7 +10915,10 @@ impl DispatchFence {
         if self.refused() {
             return false;
         }
-        let ready = self.checkpointer.dispatch_fence_ready().await;
+        let ready = self
+            .checkpointer
+            .dispatch_fence_ready(self.suspendable_run.as_ref())
+            .await;
         let mut refusal = self
             .refusal
             .lock()

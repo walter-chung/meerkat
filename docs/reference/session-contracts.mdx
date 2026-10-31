@@ -941,6 +941,16 @@ graceful shutdown that does not choose a disposition, a mob Shutdown
 included, uses this stop with a 15 minute max age for sessions that commit
 every round.
 
+A store fence gap answers the same. When a host store realm's writer stays
+stopped through a run's whole dispatch wait and no other process holds the
+fence, the runtime suspends the run with its inputs bound to it, and their
+waiters get `RequeuedAcrossStop` within that wait: the inputs run when the
+fence is re-acquired (the run resumes in the same process) or at the next
+start. When another process holds the fence, the store keeps the session's
+inputs as last committed for that owner, and every waiter in this process
+gets `RequeuedAcrossStop` too (see
+[Durable runs](/guides/durable-runs#one-writer-fenced)).
+
 - The generated wait-failure resolver classes such a wait: session not
   running, reason `requeued_across_stop`, resumable, and the surface's
   pre-admission released. It answers the same after the session is gone.
