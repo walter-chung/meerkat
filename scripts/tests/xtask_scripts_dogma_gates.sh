@@ -380,6 +380,9 @@ trap 'rm -rf "$tlc_env_tmp"' EXIT
 # input_controller_hold_audit.sh requires its nine witnesses violated, and
 # with --mutants each seeded defect's property or the generated
 # input_controller_holds_are_kept_unstaged_governed_inputs invariant violated.
+# superseded_ack_retention_audit.sh (schedule_lifecycle) requires its three
+# witnesses violated, and with --mutants each seeded defect's invariant
+# violated.
 printf '%s\n' \
   '#!/bin/sh' \
   'printf "%s\n" "$JAVA_TOOL_OPTIONS" > "$TLC_JAVA_OPTIONS_CAPTURE"' \
@@ -637,6 +640,11 @@ printf '%s\n' \
   'echo "Error: Action property AuditResumedRunWaitsForDestination is violated."' \
   'echo "Error: Action property AuditResumedRunBindsItsDestination is violated."' \
   'echo "Error: Invariant input_controller_holds_are_kept_unstaged_governed_inputs is violated."' \
+  'echo "Error: Invariant NotAuditWitnessReviseDropsEarlierAck is violated."' \
+  'echo "Error: Invariant NotAuditWitnessLateAckAccepted is violated."' \
+  'echo "Error: Invariant NotAuditWitnessDeleteDropsEarlierAck is violated."' \
+  'echo "Error: Invariant AuditAckSetAnswersTheLatestSupersession is violated."' \
+  'echo "Error: Invariant AuditLatestSupersessionAcksAreKept is violated."' \
   'echo "State 1: <Initial predicate>"' \
   > "$tlc_env_tmp/tlc"
 chmod +x "$tlc_env_tmp/tlc"
