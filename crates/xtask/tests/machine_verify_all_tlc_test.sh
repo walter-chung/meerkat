@@ -287,11 +287,13 @@ fi
 # executor attached or none: the audit checks that the run's turn returns to
 # Ready, that its input stays staged and bound with its stage attempts, that
 # no fence-gap suspension comes while the registration drains, that a cancel
-# or stop the run accepted before the gap stands as its stop intent, that a
-# run whose stop was asked never resumes and is settled only as cancelled,
-# and that a requeue stop keeps nothing of a run whose stop was asked, while
-# the same process resumes any other suspended run and starts its turn
-# again. It requires twelve witnesses reached, a graceful end and a crash
+# (the run's own or an ambient one) or stop the run accepted before the gap
+# stands as its stop intent, as an ambient cancel of the suspended run does,
+# that a run whose stop was asked never resumes and is settled only as
+# cancelled, and that a requeue stop keeps nothing of a run whose stop or
+# ambient cancel was asked, while the same process resumes any other
+# suspended run and starts its turn again. It requires thirteen witnesses
+# reached, a graceful end and a crash
 # among them; its --mutants mode (by hand) refuses seventeen seeded defects
 # against every invariant but the two stop-intent ones and nine stop-intent
 # and fence-gap defects each against its target invariant alone. 32 steps

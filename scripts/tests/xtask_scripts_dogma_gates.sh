@@ -335,7 +335,7 @@ trap 'rm -rf "$tlc_env_tmp"' EXIT
 # and with --mutants each seeded defect's property violated.
 # run_start_hold_audit.sh requires each of its seven reachability witnesses
 # to be reported violated.
-# requeue_across_stop_audit.sh requires each of its twelve reachability
+# requeue_across_stop_audit.sh requires each of its thirteen reachability
 # witnesses to be reported violated.
 # materialization_rollback_keep_audit.sh requires each of its eleven
 # reachability witnesses violated, and with --mutants each seeded defect's
@@ -424,6 +424,7 @@ printf '%s\n' \
   'echo "Error: Invariant NotAuditWitnessIdleFenceGapRunResumes is violated."' \
   'echo "Error: Invariant NotAuditWitnessStoppedSuspendedRunEnds is violated."' \
   'echo "Error: Invariant NotAuditWitnessStoppedGapRunSettled is violated."' \
+  'echo "Error: Invariant NotAuditWitnessAmbientCancelledGapRunSettled is violated."' \
   'echo "Error: Invariant NotAuditWitnessKeptQueuedInputRuns is violated."' \
   'echo "Error: Invariant NotAuditWitnessKeptRequeuedInputRuns is violated."' \
   'echo "Error: Invariant NotAuditWitnessAdmittedInputStoppedUnderKeep is violated."' \

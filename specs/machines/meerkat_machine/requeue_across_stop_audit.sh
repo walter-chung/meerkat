@@ -219,7 +219,7 @@ fi
 for witness in RetainedRunsAfterGracefulStop RetainedRunsAfterCrash ExpiredSettled \
   StagedNotRetained StopAbandonsEligible PlainStopAbandons RequeuedWaitAnswered \
   SuspendedRunResumes FenceGapRunResumes IdleFenceGapRunResumes \
-  StoppedSuspendedRunEnds StoppedGapRunSettled; do
+  StoppedSuspendedRunEnds StoppedGapRunSettled AmbientCancelledGapRunSettled; do
   cfg="${work_dir}/witness-${witness}.cfg"
   write_cfg "${cfg}" TRUE "
   NotAuditWitness${witness}"

@@ -22,10 +22,12 @@
 \* ends A Abandoned(Cancelled)), leaves it running, or, under Requeue,
 \* suspends it (SuspendRunForStop: the run stops being current and is marked
 \* resumable, so the stop keeps A Staged and bound to it), then stops the
-\* runtime. A stop of A's run (StopCurrentRunForRun) may come first, at any
-\* point before the stop transaction: then the stop keeps nothing of the
-\* run, suspended or not. That branch ends in process 1: it never restarts
-\* and never takes the gap path, since what it checks is process 1's. The
+\* runtime. A stop of A's run (StopCurrentRunForRun), or an ambient cancel
+\* accepted while it runs (CancelAfterBoundary, its boundary dispatch
+\* outstanding), may come first, at any point before the stop transaction:
+\* then the stop keeps nothing of the run, suspended or not. That branch ends
+\* in process 1: it never restarts and never takes the gap path, since what
+\* it checks is process 1's. The
 \* stop classifies each non-terminal input twice, as the shell does: once
 \* for the carriers before the exit and once for the cleanup after it (the
 \* shell refuses a stop whose two answers differ). After the stop it
@@ -78,9 +80,10 @@
 \*     undirected prompt, so this property says nothing about that arm.)
 \*   AuditRetainNeverObjectiveBound: a kept input is never objective-bound,
 \*     so a kickoff the stopping process records failed is never run later.
-\*   AuditStoppedRunInputNotRetained: once a stop of A's run was asked, no
-\*     stop keeps A, even when the requeue stop suspended the run (the
-\*     resumable run's Retain arm reads the stop intent).
+\*   AuditStoppedRunInputNotRetained: once a stop of A's run, or an ambient
+\*     cancel of it, was asked, no stop keeps A, even when the requeue stop
+\*     suspended the run (the suspension carries the cancel as the run's stop
+\*     intent, and the resumable run's Retain arm reads that intent).
 \*   AuditStopVerdictIsAFunction: during a stop transaction exactly one of
 \*     the two verdict arms is enabled for each input still to classify.
 \*   AuditRequeuedWaitResolvesInEveryPhase: in every state of both
@@ -94,8 +97,10 @@
 \* (SuspendRunForStop with the FenceGap cause): the run's turn has started
 \* (and may have applied its primitive) when the gap comes, no unregister
 \* has begun, or one begins first; before the gap the run may also have
-\* accepted a cancel at its next boundary or a stop, or ended its turn
-\* cancelled. A stop may also be asked of the suspended run, and a run whose
+\* accepted a cancel at its next boundary, an ambient cancel (its boundary
+\* dispatch outstanding, the turn's own flag unset) or a stop, or ended its
+\* turn cancelled. A stop, or an ambient cancel with the executor attached,
+\* may also be asked of the suspended run, and a run whose
 \* stop was asked is then settled (SettleResumableRun), the shell asking for
 \* either reason. The same process otherwise starts the marked run again
 \* (Prepare), resumes it (ResumeRun) and starts its turn again. The path runs twice: with an
@@ -112,9 +117,10 @@
 \*   AuditFenceGapNeverWhileDraining: no fence-gap suspension happens while
 \*     the registration drains for an unregister; such a registration
 \*     suspends only for its stop.
-\*   AuditFenceGapKeepsStopIntent: a cancel or a stop the run accepted
-\*     before the gap stands as its stop intent while the run is marked
-\*     resumable (the resumed turn's start would clear the cancel).
+\*   AuditFenceGapKeepsStopIntent: a cancel (the run's own or an ambient
+\*     one) or a stop the run accepted before the gap stands as its stop
+\*     intent while the run is marked resumable (the resumed turn's start
+\*     would clear the cancel).
 \*   AuditStoppedGapRunNeverResumes: a run whose stop was asked, before the
 \*     gap or while suspended, is never resumed.
 \*   AuditStoppedGapRunSettledCancelled: a run whose stop was asked is
@@ -126,7 +132,10 @@
 \* bound inputs with the settlement's reason, which this path leaves out.
 \*
 \* AuditWitness* operators are reachability goals the runner checks as
-\* expected violations, so the invariants are not vacuous. The runner's
+\* expected violations, so the invariants are not vacuous. Among them,
+\* AmbientCancelledGapRunSettled: a run suspended with no intent standing and
+\* never stopped while suspended is still settled as cancelled after an
+\* ambient cancel of it, so that cancel stands as its stop intent. The runner's
 \* --mutants mode seeds seventeen defects, at least one per invariant, into a
 \* copy of the generated model (or, for the serve-before-settle control, the
 \* audit's settlement order) and requires TLC to refuse each with the
@@ -385,12 +394,16 @@ AuditSuspendRun ==
 
 \* A stop of A's run (a run stop, or an interrupt at a closed store fence)
 \* is asked before the stop transaction, once: before or after an unregister
-\* begins, before or after nothing else.
+\* begins, before or after nothing else. An ambient cancel accepted while the
+\* run is current (no run named; its boundary dispatch stays outstanding) asks
+\* the same: a requeue stop that suspends the run then carries it as the
+\* run's stop intent.
 AuditP1StopIntent ==
     /\ audit_stage = "P1"
     /\ ~audit_gap_idle
     /\ ~audit_p1_stop
-    /\ StopCurrentRunForRunRunning(AuditRun)
+    /\ \/ StopCurrentRunForRunRunning(AuditRun)
+       \/ CancelAfterBoundary("audit")
     /\ audit_p1_stop' = TRUE
     /\ UNCHANGED <<audit_stage, setupVars, regionVars, historyVars, runVars, restartVars,
                    audit_wait_answered, audit_suspended, audit_resumed, gapVars>>
@@ -534,6 +547,15 @@ AuditGapCancelIntent ==
     /\ CancelAfterBoundaryForRunRunning(AuditRun, "audit")
     /\ KeepAudit
 
+\* Or it may accept an ambient cancel (no run named) while it waits at the
+\* fence: its boundary dispatch is outstanding and the turn's own cancel
+\* flag stays unset.
+AuditGapAmbientCancelIntent ==
+    /\ audit_stage = "Gap"
+    /\ ~audit_gap_suspended
+    /\ CancelAfterBoundary("audit")
+    /\ KeepAudit
+
 AuditGapStopIntent ==
     /\ audit_stage = "Gap"
     /\ ~audit_gap_suspended
@@ -570,7 +592,9 @@ AuditGapSuspend ==
     /\ audit_gap_suspended' = TRUE
     /\ audit_gap_attempts' = Attempts(AuditA)
     /\ audit_gap_while_draining' = (registration_phase = "Draining")
-    /\ audit_gap_intent_at_suspend' = (cancel_after_boundary = TRUE \/ run_stop_requested = Some(AuditRun))
+    /\ audit_gap_intent_at_suspend' = \/ cancel_after_boundary = TRUE
+                                      \/ boundary_cancel_dispatch_pending = TRUE
+                                      \/ run_stop_requested = Some(AuditRun)
     /\ UNCHANGED <<audit_stage, setupVars, regionVars, historyVars, runVars, restartVars,
                    audit_wait_answered, audit_suspended, audit_resumed, audit_p1_stop,
                    audit_gap_resumed, audit_gap_restarted, audit_gap_idle, audit_gap_stopped,
@@ -590,6 +614,17 @@ AuditGapStopSuspended ==
                    audit_gap_suspended, audit_gap_attempts, audit_gap_resumed,
                    audit_gap_restarted, audit_gap_while_draining, audit_gap_idle,
                    audit_gap_intent_at_suspend, audit_gap_resumed_stopped, audit_gap_settled>>
+
+\* An ambient cancel (no run named) accepted while the suspended run waits for
+\* the fence, with the executor attached and no run current: it stands as
+\* that run's stop intent, as a stop of it does. (With no executor attached
+\* the machine takes no ambient cancel.)
+AuditGapAmbientCancelSuspended ==
+    /\ audit_stage = "Gap"
+    /\ audit_gap_suspended
+    /\ ~audit_gap_resumed
+    /\ CancelAfterBoundaryAttached("audit")
+    /\ KeepAudit
 
 \* Once the fence is back, a suspended run whose stop was asked is settled,
 \* not resumed: the shell asks to settle it as a refused resume or as
@@ -845,11 +880,13 @@ AuditNext ==
     \/ AuditGapStartTurn
     \/ AuditGapApplyPrimitive
     \/ AuditGapCancelIntent
+    \/ AuditGapAmbientCancelIntent
     \/ AuditGapStopIntent
     \/ AuditGapTurnCancelled
     \/ AuditGapBeginUnregister
     \/ AuditGapSuspend
     \/ AuditGapStopSuspended
+    \/ AuditGapAmbientCancelSuspended
     \/ AuditGapSettleStopped
     \/ AuditGapResume
 
@@ -1062,9 +1099,18 @@ AuditWitnessStoppedSuspendedRunEnds ==
 \* A suspended run whose stop was asked is settled as cancelled.
 AuditWitnessStoppedGapRunSettled == audit_gap_settled = "Cancelled"
 
+\* A run suspended with no cancel or stop standing, and never stopped while
+\* suspended, is still settled as cancelled: an ambient cancel of it while
+\* it waited for the fence stands as its stop intent.
+AuditWitnessAmbientCancelledGapRunSettled ==
+    /\ audit_gap_settled = "Cancelled"
+    /\ ~audit_gap_intent_at_suspend
+    /\ ~audit_gap_stopped
+
 NotAuditWitnessSuspendedRunResumes == ~AuditWitnessSuspendedRunResumes
 NotAuditWitnessFenceGapRunResumes == ~AuditWitnessFenceGapRunResumes
 NotAuditWitnessIdleFenceGapRunResumes == ~AuditWitnessIdleFenceGapRunResumes
 NotAuditWitnessStoppedSuspendedRunEnds == ~AuditWitnessStoppedSuspendedRunEnds
 NotAuditWitnessStoppedGapRunSettled == ~AuditWitnessStoppedGapRunSettled
+NotAuditWitnessAmbientCancelledGapRunSettled == ~AuditWitnessAmbientCancelledGapRunSettled
 ====
