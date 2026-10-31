@@ -204,8 +204,9 @@ them.
   - `meerkat_schedule_list` returns one page of summaries,
     `{"schedules": [...], "page": {"returned", "has_more", "next_cursor"}}`,
     in creation order (creation time, then schedule id): 50 schedules unless
-    `limit` asks for another size, at most 200, and `cursor` takes
-    `page.next_cursor` to continue. A summary carries `schedule_id`, `name`
+    `limit` asks for another size, at most 200 (a larger `limit` returns 200
+    with `page.has_more`), and `cursor` takes `page.next_cursor` to
+    continue. A summary carries `schedule_id`, `name`
     (its first 200 characters), `phase`, `revision`, `trigger`, the target's
     kind and ids (`target`), `action_head` (the first 160 characters of the
     action text: a prompt, the content a member is sent, a helper's prompt
@@ -214,8 +215,8 @@ them.
     unpaged, in the persistence shape, whose machine state repeated the
     trigger, the whole target and every revision's superseded acks, so a
     realm of a few dozen long-prompt schedules filled much of a context
-    window in one reply. A `limit` outside 1-200 or a cursor this listing
-    did not write is refused as invalid arguments.
+    window in one reply. A `limit` of 0, a negative or non-integer `limit`,
+    or a cursor this listing did not write is refused as invalid arguments.
   - Every tool that returns one schedule (`meerkat_schedule_get`,
     `meerkat_schedule_create`, `meerkat_schedule_update`,
     `meerkat_schedule_pause`, `meerkat_schedule_resume` and
@@ -223,11 +224,18 @@ them.
     `schedule/get` (`meerkat_contracts::wire::Schedule`): the same fields,
     without `machine_state`.
   - `meerkat_schedule_occurrences` pages every list reply: 50 occurrences
-    unless `limit` asks for another size, at most 200 (500 before, and with
-    only `schedule_id` it returned every occurrence unpaged). Its full rows
-    (`view: "full"`, the default, and an `occurrence_id` read) are the
-    public shape of `schedule/occurrences`, without `machine_state` and
-    `claim_token`.
+    unless `limit` asks for another size, at most 200, and a larger `limit`
+    returns 200 (it took up to 500 before, and with only `schedule_id` it
+    returned every occurrence unpaged). A page's rows are summaries by
+    default (`view: "summary"`; whole occurrences were the default before):
+    ids, phase, due time, attempts, the last receipt summarized, the
+    target's kind and ids, the runtime outcome's `kind` with a
+    `detail_head`, and a `failure_detail_head`, each head the first 160
+    characters of its text (the summary view carried the whole outcome,
+    callback payload included, and the whole `failure_detail` before). Whole
+    occurrences (`view: "full"`, and by default an `occurrence_id` read) are
+    the public shape of `schedule/occurrences`, without `machine_state` and
+    `claim_token`. Malformed options are refused as the listing's are.
 
   The host listings do not move: RPC `schedule/list` and `schedule/get`,
   REST `GET /schedules`, the Python SDK's `list_schedules` and the
@@ -612,8 +620,15 @@ them.
   `meerkat_schedule_list` reads one with `meerkat_schedule_get`, or every
   schedule whole with the host listing (`schedule/list`, `GET /schedules`);
   one that read `machine_state` from a schedule tool reply reads the public
-  fields beside it; one that read a schedule's whole occurrence history
-  with only `schedule_id` follows `page.next_cursor`. See Breaking.
+  fields beside it; one that read a schedule's occurrence history with only
+  `schedule_id` now gets pages of summaries, passes `view: "full"` for
+  whole occurrences and follows `page.next_cursor`; one that passed a
+  `limit` over 200 gets pages of 200. Bulk readers of schedules and
+  occurrences use the typed host surfaces, not the agent tools: RPC
+  `schedule/list` and `schedule/occurrences`, REST `GET /schedules` and
+  `GET /schedules/{id}/occurrences`, the Python SDK's `list_schedules` and
+  `list_schedule_occurrences`, and the TypeScript SDK's `listSchedules` and
+  `listScheduleOccurrences`. See Breaking.
 
 - No storage migration. A session's compaction cadence gains two optional
   fields, written only when set; 0.9.8 and earlier ignore them, and a cadence

@@ -65,7 +65,7 @@ struct ScheduleIdArgs {
 
 /// Arguments of `meerkat_schedule_occurrences`. Only `schedule_id` is
 /// required; with nothing else set the tool returns the first page of the
-/// schedule's occurrences in full.
+/// schedule's occurrences as summaries.
 #[derive(Debug, Deserialize)]
 struct OccurrencesArgs {
     schedule_id: String,
@@ -86,15 +86,21 @@ struct OccurrencesArgs {
 }
 
 impl OccurrencesArgs {
+    /// The view the reply renders: the one asked for, else summaries for a
+    /// page and the whole occurrence for an `occurrence_id` read. A page of
+    /// whole occurrences carries every target body, so it is opt-in.
     fn view(&self) -> OccurrencesView {
-        self.view.unwrap_or_default()
+        self.view.unwrap_or(if self.occurrence_id.is_some() {
+            OccurrencesView::Full
+        } else {
+            OccurrencesView::Summary
+        })
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum OccurrencesView {
-    #[default]
     Full,
     Summary,
 }
@@ -112,6 +118,9 @@ const SCHEDULE_CURSOR_PREFIX: &str = "s1";
 const ACTION_HEAD_CHARS: usize = 160;
 /// Characters of a schedule's name a list summary carries.
 const SUMMARY_NAME_CHARS: usize = 200;
+/// Characters of a failure or runtime outcome detail an occurrence summary
+/// carries.
+const DETAIL_HEAD_CHARS: usize = 160;
 /// The target fields a summary keeps: what kind of target it is and which
 /// session, identity, mob, member, flow or host runnable it names. Everything
 /// else (the action, prompt, helper options, materialization spec, flow and
@@ -177,8 +186,9 @@ pub fn schedule_tools_list() -> Vec<Value> {
                 "name, phase, revision, trigger, the target's kind and ids, the first 160 characters ",
                 "of the action text (action_head; action_chars is the text's full length) and the ",
                 "created and updated times. Read a schedule's full action, policies and options with ",
-                "meerkat_schedule_get. limit sets the page size (default 50, maximum 200); pass the ",
-                "reply's opaque page.next_cursor as cursor to continue after its last row.",
+                "meerkat_schedule_get. limit sets the page size (default 50, at most 200: a larger limit ",
+                "returns 200); pass the reply's opaque page.next_cursor as cursor to continue after its ",
+                "last row.",
             ),
             list_schema(),
         ),
@@ -209,13 +219,15 @@ pub fn schedule_tools_list() -> Vec<Value> {
                 "pending (not yet due), claimed (picked up by driver), dispatching (delivery in progress), ",
                 "awaiting_completion, completed, skipped, misfired, superseded, or delivery_failed. Use this ",
                 "to verify a schedule is firing correctly, diagnose misfires, or check delivery history. ",
-                "Every list reply is one page in due order: limit sets its size (default 50, maximum ",
-                "200) and the reply's opaque page.next_cursor continues after its last row. To read ",
-                "less: occurrence_id returns that one occurrence with all of its delivery receipts (not ",
-                "found if it belongs to another schedule); due_after_utc / due_before_utc (inclusive, ",
-                "RFC 3339 with any offset) and phase filter the rows; view=summary drops the trigger and ",
-                "the target action and prompt (view=full, the default, returns each occurrence with its ",
-                "trigger and target once). A receipt with stage ",
+                "Every list reply is one page of summaries in due order: limit sets its size (default ",
+                "50, at most 200: a larger limit returns 200) and the reply's opaque page.next_cursor ",
+                "continues after its last row. A summary carries the occurrence's ids, phase, due time, ",
+                "attempts, last receipt, the target's kind and ids, and the first 160 characters of a ",
+                "runtime outcome or failure detail; view=full returns each occurrence whole, with its ",
+                "trigger and target once. occurrence_id returns that one occurrence whole with all of ",
+                "its delivery receipts (not found if it belongs to another schedule; view=summary ",
+                "shortens it); due_after_utc / due_before_utc (inclusive, RFC 3339 with any offset) and ",
+                "phase filter the rows. A receipt with stage ",
                 "completed records that delivery finished, not the outcome of the work the target did; a ",
                 "missing or null materialized_session_id means the runtime session is unknown.",
             ),
@@ -823,17 +835,16 @@ fn encode(name: &str, value: impl Serialize) -> Result<Value, ScheduleToolError>
     })
 }
 
-/// The page size a `limit` option asks for: `DEFAULT_PAGE` without one, and
-/// refused outside `1..=MAX_PAGE`.
+/// The page size a `limit` option asks for: `DEFAULT_PAGE` without one, at
+/// most `MAX_PAGE` (a larger limit returns that many rows, and the page's
+/// `has_more` says more follow), and refused at 0. A negative or non-integer
+/// limit never gets here: its arguments do not parse.
 fn page_limit(limit: Option<usize>) -> Result<usize, ScheduleToolError> {
     match limit {
         Some(0) => Err(ScheduleToolError::invalid_arguments(
             "limit must be at least 1",
         )),
-        Some(limit) if limit > MAX_PAGE => Err(ScheduleToolError::invalid_arguments(format!(
-            "limit must be at most {MAX_PAGE}"
-        ))),
-        Some(limit) => Ok(limit),
+        Some(limit) => Ok(limit.min(MAX_PAGE)),
         None => Ok(DEFAULT_PAGE),
     }
 }
@@ -1357,7 +1368,9 @@ fn render_occurrence(
 }
 
 /// A compact occurrence: identity, timing, delivery state and the target's
-/// kind, without the trigger, the target's action payload or machine state.
+/// kind and ids, without the trigger, the target's action payload or
+/// machine state. Every field is bounded: the failure detail and the runtime
+/// outcome's detail or callback payload are cut to heads.
 fn occurrence_summary(occurrence: &Occurrence) -> Result<Value, ScheduleToolError> {
     let target = summary_target(&encode(
         "meerkat_schedule_occurrences",
@@ -1366,30 +1379,59 @@ fn occurrence_summary(occurrence: &Occurrence) -> Result<Value, ScheduleToolErro
     let (due_at_local, timezone) =
         local_due_at(&occurrence.trigger_snapshot, occurrence.due_at_utc).unzip();
     let last_receipt = occurrence.last_receipt.as_ref().map(receipt_summary);
-    encode(
-        "meerkat_schedule_occurrences",
-        json!({
-            "occurrence_id": occurrence.occurrence_id,
-            "schedule_id": occurrence.schedule_id,
-            "schedule_revision": occurrence.schedule_revision,
-            "occurrence_ordinal": occurrence.occurrence_ordinal,
-            "phase": occurrence.phase,
-            "due_at_utc": occurrence.due_at_utc,
-            "due_at_local": due_at_local,
-            "timezone": timezone,
-            "attempt_count": occurrence.attempt_count,
-            "created_at_utc": occurrence.created_at_utc,
-            "claimed_at_utc": occurrence.claimed_at_utc,
-            "dispatched_at_utc": occurrence.dispatched_at_utc,
-            "completed_at_utc": occurrence.completed_at_utc,
-            "superseded_by_revision": occurrence.superseded_by_revision,
-            "last_receipt": last_receipt,
-            "runtime_outcome": occurrence.runtime_outcome,
-            "failure_class": occurrence.failure_class,
-            "failure_detail": occurrence.failure_detail,
-            "target": target,
-        }),
-    )
+    let runtime_outcome = occurrence
+        .runtime_outcome
+        .as_ref()
+        .map(runtime_outcome_summary)
+        .transpose()?;
+    let mut row = json!({
+        "occurrence_id": occurrence.occurrence_id,
+        "schedule_id": occurrence.schedule_id,
+        "schedule_revision": occurrence.schedule_revision,
+        "occurrence_ordinal": occurrence.occurrence_ordinal,
+        "phase": occurrence.phase,
+        "due_at_utc": occurrence.due_at_utc,
+        "due_at_local": due_at_local,
+        "timezone": timezone,
+        "attempt_count": occurrence.attempt_count,
+        "created_at_utc": occurrence.created_at_utc,
+        "claimed_at_utc": occurrence.claimed_at_utc,
+        "dispatched_at_utc": occurrence.dispatched_at_utc,
+        "completed_at_utc": occurrence.completed_at_utc,
+        "superseded_by_revision": occurrence.superseded_by_revision,
+        "last_receipt": last_receipt,
+        "runtime_outcome": runtime_outcome,
+        "failure_class": occurrence.failure_class,
+        "target": target,
+    });
+    if let Some(detail) = occurrence.failure_detail.as_deref() {
+        row["failure_detail_head"] = json!(bounded_head(detail, DETAIL_HEAD_CHARS));
+    }
+    encode("meerkat_schedule_occurrences", row)
+}
+
+/// A runtime outcome's kind, with a bounded head of its detail (or of its
+/// callback payload) for the kinds that carry one.
+fn runtime_outcome_summary(outcome: &RuntimeDeliveryOutcome) -> Result<Value, ScheduleToolError> {
+    let encoded = encode("meerkat_schedule_occurrences", outcome)?;
+    let mut summary = Map::new();
+    if let Some(kind) = encoded.get("kind") {
+        summary.insert("kind".to_string(), kind.clone());
+    }
+    match outcome {
+        RuntimeDeliveryOutcome::AdmissionAccepted
+        | RuntimeDeliveryOutcome::AdmissionDeduplicated => {}
+        RuntimeDeliveryOutcome::AdmissionRejected { .. }
+        | RuntimeDeliveryOutcome::CompletionAbandoned { .. }
+        | RuntimeDeliveryOutcome::CompletionCallbackPending { .. }
+        | RuntimeDeliveryOutcome::CompletionRuntimeTerminated { .. } => {
+            summary.insert(
+                "detail_head".to_string(),
+                json!(bounded_head(&outcome.detail(), DETAIL_HEAD_CHARS)),
+            );
+        }
+    }
+    Ok(Value::Object(summary))
 }
 
 /// A delivery receipt without its detail, correlation id or runtime outcome
@@ -1617,8 +1659,7 @@ fn list_schema() -> Value {
             "limit": {
                 "type": "integer",
                 "minimum": 1,
-                "maximum": MAX_PAGE,
-                "description": "Return at most this many schedules in creation order: default 50, maximum 200. Every reply carries page.returned (rows in this page), page.has_more and page.next_cursor.",
+                "description": "Return at most this many schedules in creation order: default 50, at most 200 (a larger limit returns 200). Every reply carries page.returned (rows in this page), page.has_more and page.next_cursor.",
             },
             "cursor": {
                 "type": "string",
@@ -1658,8 +1699,7 @@ fn occurrences_schema() -> Value {
             "limit": {
                 "type": "integer",
                 "minimum": 1,
-                "maximum": MAX_PAGE,
-                "description": "Return at most this many occurrences in due order: default 50, maximum 200. Every list reply is paged and carries page.returned (rows in this page), page.has_more and page.next_cursor.",
+                "description": "Return at most this many occurrences in due order: default 50, at most 200 (a larger limit returns 200). Every list reply is paged and carries page.returned (rows in this page), page.has_more and page.next_cursor.",
             },
             "cursor": {
                 "type": "string",
@@ -1667,8 +1707,8 @@ fn occurrences_schema() -> Value {
             },
             "view": {
                 "type": "string",
-                "enum": ["full", "summary"],
-                "description": "full (default) returns whole occurrence objects, each with its trigger and target once; summary returns ids, phase, due time in UTC and in the trigger's timezone, attempts, the last receipt, the runtime outcome and which target it names, without the trigger or the target action or prompt. Applies to the list and to an occurrence_id read alike; in a summary occurrence_id read the receipts are summarized too (no detail, correlation id or runtime outcome).",
+                "enum": ["summary", "full"],
+                "description": "summary (the default for a page) returns ids, phase, due time in UTC and in the trigger's timezone, attempts, the last receipt, the runtime outcome's kind and which target it names, with the first 160 characters of a runtime outcome or failure detail, and without the trigger or the target action or prompt; full (the default for an occurrence_id read) returns whole occurrence objects, each with its trigger and target once. In a summary occurrence_id read the receipts are summarized too (no detail, correlation id or runtime outcome).",
             },
         },
         "required": ["schedule_id"],
