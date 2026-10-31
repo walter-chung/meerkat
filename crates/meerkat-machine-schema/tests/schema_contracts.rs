@@ -2843,15 +2843,15 @@ fn superseded_ack_retention_violations(
     violations
 }
 
-fn transitions_named<'a>(
-    schema: &'a meerkat_machine_schema::MachineSchema,
+fn transitions_named(
+    schema: &meerkat_machine_schema::MachineSchema,
     pick: impl Fn(&meerkat_machine_schema::TransitionSchema) -> bool,
-) -> std::collections::BTreeSet<&'a str> {
+) -> std::collections::BTreeSet<String> {
     schema
         .transitions
         .iter()
         .filter(|transition| pick(transition))
-        .map(|transition| transition.name.as_str())
+        .map(|transition| transition.name.as_str().to_owned())
         .collect()
 }
 
@@ -2863,22 +2863,28 @@ fn schedule_lifecycle_keeps_only_the_latest_supersessions_acks() {
             .updates
             .iter()
             .any(|update| update_writes(update, "revision"))),
-        std::collections::BTreeSet::from([
-            "DeleteActive",
-            "DeletePaused",
-            "ReviseActive",
-            "RevisePaused"
-        ]),
+        std::collections::BTreeSet::from(
+            [
+                "DeleteActive",
+                "DeletePaused",
+                "ReviseActive",
+                "RevisePaused"
+            ]
+            .map(String::from)
+        ),
         "the supersessions whose acknowledgements the set answers"
     );
     assert_eq!(
         transitions_named(&schema, |transition| transition.on.variant_str()
             == "ConfirmOccurrencesSuperseded"),
-        std::collections::BTreeSet::from([
-            "ConfirmOccurrencesSupersededActive",
-            "ConfirmOccurrencesSupersededDeleted",
-            "ConfirmOccurrencesSupersededPaused"
-        ]),
+        std::collections::BTreeSet::from(
+            [
+                "ConfirmOccurrencesSupersededActive",
+                "ConfirmOccurrencesSupersededDeleted",
+                "ConfirmOccurrencesSupersededPaused",
+            ]
+            .map(String::from)
+        ),
         "an acknowledgement is accepted in every phase"
     );
     assert_eq!(

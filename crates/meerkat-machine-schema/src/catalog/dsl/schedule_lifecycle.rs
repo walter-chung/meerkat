@@ -570,7 +570,7 @@ mod tests {
     }
 
     fn ids(values: &[&str]) -> std::collections::BTreeSet<String> {
-        values.iter().map(|value| (*value).to_owned()).collect()
+        values.iter().map(ToString::to_string).collect()
     }
 
     /// Each revise supersedes at its new revision, and its acknowledgements

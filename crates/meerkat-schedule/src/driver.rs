@@ -6927,7 +6927,7 @@ mod tests {
         for _ in 0..50 {
             let occurrences = service.list_occurrences(schedule_id).await?;
             if let Some(occurrence) = occurrences.into_iter().find(|occurrence| {
-                &occurrence.occurrence_id == occurrence_id
+                occurrence.occurrence_id == *occurrence_id
                     && occurrence
                         .machine_state
                         .late_completion_resolution

@@ -4609,7 +4609,7 @@ mod tests {
         assert_eq!(late, deleted);
 
         let repeated = Schedule::apply(
-            Some(deleted.clone()),
+            Some(deleted),
             ScheduleLifecycleInput::Delete { at_utc: Utc::now() },
         )?;
         assert!(repeated.effects().is_empty());

@@ -2054,7 +2054,7 @@ mod tests {
             );
             assert_eq!(
                 latest,
-                BTreeSet::from([in_flight.occurrence_id.clone()]),
+                BTreeSet::from([in_flight.occurrence_id]),
                 "revise {round} supersedes exactly the claim in flight"
             );
             assert_eq!(
