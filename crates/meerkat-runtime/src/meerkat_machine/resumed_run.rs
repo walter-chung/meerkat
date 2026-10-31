@@ -371,6 +371,7 @@ impl super::driver::DriverEntry {
             crate::meerkat_machine::dsl::MeerkatMachineInput::SuspendRunForStop {
                 run_id: crate::meerkat_machine::dsl::RunId::from_domain(run_id),
                 durable_session,
+                cause: crate::meerkat_machine::dsl::RunSuspensionCause::RequeueStop,
             },
             "SuspendRunForStop",
         )

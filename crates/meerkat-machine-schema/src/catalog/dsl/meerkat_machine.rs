@@ -2913,6 +2913,22 @@ pub enum UnregisterQueuedInputsDisposition {
     Keep,
 }
 
+/// Why the runtime suspends a durable session's in-flight run
+/// (`SuspendRunForStop`). Either way the run stops being current and is
+/// marked resumable at its last committed round, with its inputs bound and
+/// their stage attempts unchanged; the cause decides who resumes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum RunSuspensionCause {
+    /// A graceful stop that keeps queued work (an unregister that
+    /// requeues): the next start resumes the run.
+    #[default]
+    RequeueStop,
+    /// A store fence gap: the session store's writer stayed stopped through
+    /// the run's whole bounded dispatch wait, and no other writer was found.
+    /// This registration resumes the run once the store's fence is restored.
+    FenceGap,
+}
+
 /// Generated verdict of a runtime stop for one non-terminal input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum StopInputDisposition {
@@ -7284,10 +7300,15 @@ macro_rules! meerkat_catalog_machine_dsl {
             ResumeRun { run_id: RunId },
             ReleaseResumableRun { run_id: RunId },
             SettleResumableRun { run_id: RunId, reason: Enum<InputAbandonReason> },
-            // A graceful requeue stop keeps a durable session's in-flight run
-            // resumable. `durable_session` is the shell's observation that the
-            // session commits every round (a persistent driver).
-            SuspendRunForStop { run_id: RunId, durable_session: bool },
+            // A graceful requeue stop, or a store fence gap, keeps a durable
+            // session's in-flight run resumable. `durable_session` is the
+            // shell's observation that the session commits every round (a
+            // persistent driver); `cause` is why the run stopped.
+            SuspendRunForStop {
+                run_id: RunId,
+                durable_session: bool,
+                cause: Enum<RunSuspensionCause>,
+            },
             // An Applied or AppliedPendingConsumption contributor of `run_id`
             // returns to `lane`: a failed run's replayed contributor, or a
             // kept input of a resumable run that is released.
@@ -8684,7 +8705,8 @@ macro_rules! meerkat_catalog_machine_dsl {
             ResumableRunReleased { run_id: RunId },
             // The shell abandons the run's bound inputs with `reason`.
             ResumableRunSettled { run_id: RunId, reason: Enum<InputAbandonReason> },
-            // A graceful requeue stop left the in-flight run resumable.
+            // A graceful requeue stop, or a store fence gap, left the
+            // in-flight run resumable.
             RunSuspendedForStop { run_id: RunId },
             // A session's runtime registration was released: every
             // unregister (a Session-owned registration's empty-resume teardown
@@ -25098,9 +25120,9 @@ macro_rules! meerkat_catalog_machine_dsl {
             to Retired
         }
 
-        // A graceful requeue stop (a deploy) keeps a durable session's
-        // in-flight run resumable at its last committed round, exactly as a
-        // crash does. The shell has already stopped the turn without a
+        // A graceful requeue stop (a deploy, `cause` RequeueStop) keeps a
+        // durable session's in-flight run resumable at its last committed
+        // round, exactly as a crash does. The shell has already stopped the turn without a
         // closing save or a boundary. The run stops being current, the
         // pre-run phase is restored, and the run is marked resumable, so the
         // stop classifier keeps its bound inputs bound and the stored cursor
@@ -25111,7 +25133,7 @@ macro_rules! meerkat_catalog_machine_dsl {
         // or a run with a published live-boundary join is not suspended: the
         // shell ends it as before.
         transition SuspendRunForStopRunningToIdle {
-            on input SuspendRunForStop { run_id, durable_session }
+            on input SuspendRunForStop { run_id, durable_session, cause }
             guard { self.lifecycle_phase == Phase::Running }
             guard "pre_run_phase_matches_idle" { self.pre_run_phase == Some(PreRunPhase::Idle) }
             guard "current_run_id_matches_binding" { self.current_run_id == Some(run_id) }
@@ -25119,7 +25141,8 @@ macro_rules! meerkat_catalog_machine_dsl {
             // marked resumable (it would resume after its own outcome).
             guard "run_turn_not_terminal" { self.turn_terminal_run_id != Some(run_id) }
             guard "requeue_stop" {
-                self.registration_phase == RegistrationPhase::Draining
+                cause == RunSuspensionCause::RequeueStop
+                && self.registration_phase == RegistrationPhase::Draining
                 && self.unregister_queued_inputs == UnregisterQueuedInputsDisposition::Requeue
             }
             guard "durable_session" { durable_session == true }
@@ -25143,7 +25166,7 @@ macro_rules! meerkat_catalog_machine_dsl {
             emit RunSuspendedForStop { run_id: run_id }
         }
         transition SuspendRunForStopRunningToAttached {
-            on input SuspendRunForStop { run_id, durable_session }
+            on input SuspendRunForStop { run_id, durable_session, cause }
             guard { self.lifecycle_phase == Phase::Running }
             guard "pre_run_phase_matches_attached" { self.pre_run_phase == Some(PreRunPhase::Attached) }
             guard "current_run_id_matches_binding" { self.current_run_id == Some(run_id) }
@@ -25151,7 +25174,8 @@ macro_rules! meerkat_catalog_machine_dsl {
             // marked resumable (it would resume after its own outcome).
             guard "run_turn_not_terminal" { self.turn_terminal_run_id != Some(run_id) }
             guard "requeue_stop" {
-                self.registration_phase == RegistrationPhase::Draining
+                cause == RunSuspensionCause::RequeueStop
+                && self.registration_phase == RegistrationPhase::Draining
                 && self.unregister_queued_inputs == UnregisterQueuedInputsDisposition::Requeue
             }
             guard "durable_session" { durable_session == true }
@@ -25170,6 +25194,84 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.current_run_id = None;
                 self.pre_run_phase = None;
                 self.resumable_run_id = Some(run_id);
+            }
+            to Attached
+            emit RunSuspendedForStop { run_id: run_id }
+        }
+
+        // A store fence gap suspends a durable session's in-flight run the
+        // same way, outside any stop: the session store's writer stayed
+        // stopped through the run's whole bounded dispatch wait and no other
+        // writer was found, so the shell dropped the turn at that wait,
+        // with no terminal and no closing write. The run stops being current
+        // and is marked resumable, its inputs stay bound with their stage
+        // attempts unchanged, and this registration's runtime loop resumes it
+        // (`ResumeRun`) once the store's fence is restored. The resume
+        // starts the run's turn again, so its turn returns to `Ready`; the
+        // requeue arms above leave the turn to the next start, whose machine
+        // is fresh. A registration draining for its unregister suspends only
+        // for its stop, through the arms above, and a run whose turn terminal
+        // is published, a session without per-round commits, or a run with a
+        // published live-boundary join is not suspended: the shell ends it as
+        // before.
+        transition SuspendRunForStopFenceGapRunningToIdle {
+            on input SuspendRunForStop { run_id, durable_session, cause }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "pre_run_phase_matches_idle" { self.pre_run_phase == Some(PreRunPhase::Idle) }
+            guard "current_run_id_matches_binding" { self.current_run_id == Some(run_id) }
+            guard "run_turn_not_terminal" { self.turn_terminal_run_id != Some(run_id) }
+            guard "fence_gap_outside_unregister" {
+                cause == RunSuspensionCause::FenceGap
+                && self.registration_phase != RegistrationPhase::Draining
+            }
+            guard "durable_session" { durable_session == true }
+            guard "no_other_resumable_run" { self.resumable_run_id == None }
+            guard "live_boundary_joins_retained_and_applied" {
+                for_all(joined_input_id in self.input_live_boundary_join_phase.keys(),
+                    self.input_live_boundary_join_phase.get_cloned(joined_input_id)
+                        == Some(LiveBoundaryJoinPhase::Retained)
+                    && (self.input_phases.get_cloned(joined_input_id) == Some(InputPhase::Applied)
+                        || self.input_phases.get_cloned(joined_input_id)
+                            == Some(InputPhase::AppliedPendingConsumption)))
+            }
+            update {
+                self.input_live_boundary_join_run = EmptyMap;
+                self.input_live_boundary_join_phase = EmptyMap;
+                self.current_run_id = None;
+                self.pre_run_phase = None;
+                self.resumable_run_id = Some(run_id);
+                self.turn_phase = TurnPhase::Ready;
+            }
+            to Idle
+            emit RunSuspendedForStop { run_id: run_id }
+        }
+        transition SuspendRunForStopFenceGapRunningToAttached {
+            on input SuspendRunForStop { run_id, durable_session, cause }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "pre_run_phase_matches_attached" { self.pre_run_phase == Some(PreRunPhase::Attached) }
+            guard "current_run_id_matches_binding" { self.current_run_id == Some(run_id) }
+            guard "run_turn_not_terminal" { self.turn_terminal_run_id != Some(run_id) }
+            guard "fence_gap_outside_unregister" {
+                cause == RunSuspensionCause::FenceGap
+                && self.registration_phase != RegistrationPhase::Draining
+            }
+            guard "durable_session" { durable_session == true }
+            guard "no_other_resumable_run" { self.resumable_run_id == None }
+            guard "live_boundary_joins_retained_and_applied" {
+                for_all(joined_input_id in self.input_live_boundary_join_phase.keys(),
+                    self.input_live_boundary_join_phase.get_cloned(joined_input_id)
+                        == Some(LiveBoundaryJoinPhase::Retained)
+                    && (self.input_phases.get_cloned(joined_input_id) == Some(InputPhase::Applied)
+                        || self.input_phases.get_cloned(joined_input_id)
+                            == Some(InputPhase::AppliedPendingConsumption)))
+            }
+            update {
+                self.input_live_boundary_join_run = EmptyMap;
+                self.input_live_boundary_join_phase = EmptyMap;
+                self.current_run_id = None;
+                self.pre_run_phase = None;
+                self.resumable_run_id = Some(run_id);
+                self.turn_phase = TurnPhase::Ready;
             }
             to Attached
             emit RunSuspendedForStop { run_id: run_id }

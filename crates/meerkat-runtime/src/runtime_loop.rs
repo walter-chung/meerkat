@@ -7643,6 +7643,7 @@ async fn realize_suspended_run(
         &mut d,
         run_id,
         durable_session,
+        crate::meerkat_machine::dsl::RunSuspensionCause::RequeueStop,
     ) {
         Ok(true) => {
             tracing::info!(

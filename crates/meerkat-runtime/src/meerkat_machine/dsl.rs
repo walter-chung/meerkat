@@ -3014,8 +3014,8 @@ pub enum LiveContextRowDisposition {
 pub use meerkat_machine_schema::catalog::dsl::meerkat_machine::{
     DurableRecoveryOwnership, LiveContextDeliveryReadiness, LiveContextPayloadAvailability,
     LiveContextPreparationFailure, LiveContextPreparationPhase, LiveContextRowAuthor,
-    LiveContextRowSource, LiveConversationStartCause, RunStartHoldReason, StopInputDisposition,
-    UnregisterQueuedInputsDisposition,
+    LiveContextRowSource, LiveConversationStartCause, RunStartHoldReason, RunSuspensionCause,
+    StopInputDisposition, UnregisterQueuedInputsDisposition,
 };
 pub use meerkat_machine_schema::catalog::dsl::meerkat_machine::{
     EmptyResumeRetirementVerdict, SessionResidencyOwner,

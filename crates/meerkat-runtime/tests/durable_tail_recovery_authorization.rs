@@ -1090,6 +1090,7 @@ fn requeue_stop_suspends_a_durable_in_flight_run() {
             mm_dsl::MeerkatMachineInput::SuspendRunForStop {
                 run_id: run.clone(),
                 durable_session: false,
+                cause: mm_dsl::RunSuspensionCause::RequeueStop,
             },
         )
         .is_err(),
@@ -1109,6 +1110,7 @@ fn requeue_stop_suspends_a_durable_in_flight_run() {
             mm_dsl::MeerkatMachineInput::SuspendRunForStop {
                 run_id: run.clone(),
                 durable_session: true,
+                cause: mm_dsl::RunSuspensionCause::RequeueStop,
             },
         )
         .is_err(),
@@ -1123,6 +1125,7 @@ fn requeue_stop_suspends_a_durable_in_flight_run() {
         mm_dsl::MeerkatMachineInput::SuspendRunForStop {
             run_id: run.clone(),
             durable_session: true,
+            cause: mm_dsl::RunSuspensionCause::RequeueStop,
         },
     )
     .expect("a durable session's run is suspended");
@@ -1130,6 +1133,135 @@ fn requeue_stop_suspends_a_durable_in_flight_run() {
     assert_eq!(durable.state().current_run_id, None);
     assert_eq!(durable.state().resumable_run_id, Some(run));
     assert_eq!(durable.state().turn_terminal_run_id, None);
+}
+
+/// A store fence gap suspends a durable session's in-flight run outside any
+/// stop: the run stops being current, is marked resumable with no turn
+/// terminal, and its turn returns to `Ready`. The same registration then
+/// resumes it: `Prepare` and `ResumeRun` make it current again and its turn
+/// starts again, all under its own run id. A registration draining for its
+/// unregister suspends only for its stop, a run whose turn terminal is
+/// published is never suspended, a session without per-round commits is not
+/// suspended, and a requeue stop's cause is refused outside a stop.
+#[test]
+fn a_fence_gap_suspends_a_durable_in_flight_run_and_the_registration_resumes_it() {
+    let run = mm_dsl::RunId("run-in-flight".to_string());
+    let session = mm_dsl::SessionId("session-recovery".to_string());
+    let active_running = || mm_dsl::MeerkatMachineState {
+        lifecycle_phase: mm_dsl::MeerkatPhase::Running,
+        session_id: Some(session.clone()),
+        current_run_id: Some(run.clone()),
+        pre_run_phase: Some(mm_dsl::PreRunPhase::Idle),
+        registration_phase: mm_dsl::RegistrationPhase::Active,
+        turn_phase: mm_dsl::TurnPhase::CallingLlm,
+        ..Default::default()
+    };
+    let suspend = |durable_session: bool, cause: mm_dsl::RunSuspensionCause| {
+        mm_dsl::MeerkatMachineInput::SuspendRunForStop {
+            run_id: run.clone(),
+            durable_session,
+            cause,
+        }
+    };
+    let recover = |state: mm_dsl::MeerkatMachineState| {
+        mm_dsl::MeerkatMachineAuthority::recover_from_state(state)
+            .expect("the running state must be recoverable")
+    };
+
+    let mut not_durable = recover(active_running());
+    assert!(
+        mm_dsl::MeerkatMachineMutator::apply(
+            &mut not_durable,
+            suspend(false, mm_dsl::RunSuspensionCause::FenceGap)
+        )
+        .is_err(),
+        "a session without per-round commits is not suspended"
+    );
+
+    let mut no_stop = recover(active_running());
+    assert!(
+        mm_dsl::MeerkatMachineMutator::apply(
+            &mut no_stop,
+            suspend(true, mm_dsl::RunSuspensionCause::RequeueStop)
+        )
+        .is_err(),
+        "a requeue stop's cause needs a stop that requeues"
+    );
+
+    let mut ended = recover(mm_dsl::MeerkatMachineState {
+        turn_terminal_run_id: Some(run.clone()),
+        terminal_outcome: Some(mm_dsl::TurnTerminalOutcome::Completed),
+        ..active_running()
+    });
+    assert!(
+        mm_dsl::MeerkatMachineMutator::apply(
+            &mut ended,
+            suspend(true, mm_dsl::RunSuspensionCause::FenceGap)
+        )
+        .is_err(),
+        "a run whose turn terminal is published ended; it is never marked resumable"
+    );
+
+    let mut draining = recover(mm_dsl::MeerkatMachineState {
+        registration_phase: mm_dsl::RegistrationPhase::Draining,
+        unregister_queued_inputs: mm_dsl::UnregisterQueuedInputsDisposition::Requeue,
+        unregister_requeue_max_age_ms: 900_000,
+        ..active_running()
+    });
+    assert!(
+        mm_dsl::MeerkatMachineMutator::apply(
+            &mut draining,
+            suspend(true, mm_dsl::RunSuspensionCause::FenceGap)
+        )
+        .is_err(),
+        "a registration draining for its unregister suspends only for its stop"
+    );
+
+    let mut durable = recover(active_running());
+    mm_dsl::MeerkatMachineMutator::apply(
+        &mut durable,
+        suspend(true, mm_dsl::RunSuspensionCause::FenceGap),
+    )
+    .expect("a fence gap suspends a durable session's run");
+    assert_eq!(durable.state().lifecycle_phase, mm_dsl::MeerkatPhase::Idle);
+    assert_eq!(durable.state().current_run_id, None);
+    assert_eq!(durable.state().resumable_run_id, Some(run.clone()));
+    assert_eq!(durable.state().turn_terminal_run_id, None);
+    assert_eq!(durable.state().turn_phase, mm_dsl::TurnPhase::Ready);
+
+    mm_dsl::MeerkatMachineMutator::apply(
+        &mut durable,
+        mm_dsl::MeerkatMachineInput::Prepare {
+            session_id: session.clone(),
+            run_id: run.clone(),
+        },
+    )
+    .expect("the registration starts the marked run again");
+    mm_dsl::MeerkatMachineMutator::apply(
+        &mut durable,
+        mm_dsl::MeerkatMachineInput::ResumeRun {
+            run_id: run.clone(),
+        },
+    )
+    .expect("the marked run resumes");
+    assert_eq!(durable.state().resumable_run_id, None);
+    assert_eq!(durable.state().current_run_id, Some(run.clone()));
+    mm_dsl::MeerkatMachineMutator::apply(
+        &mut durable,
+        mm_dsl::MeerkatMachineInput::StartConversationRun {
+            run_id: run.clone(),
+            primitive_kind: mm_dsl::TurnPrimitiveKind::ConversationTurn,
+            admitted_content_shape: mm_dsl::ContentShape::Conversation,
+            vision_enabled: false,
+            image_tool_results_enabled: false,
+            max_extraction_retries: 0,
+        },
+    )
+    .expect("the resumed run's turn starts again");
+    assert_eq!(
+        durable.state().turn_phase,
+        mm_dsl::TurnPhase::ApplyingPrimitive
+    );
 }
 
 // ---------------------------------------------------------------------------
