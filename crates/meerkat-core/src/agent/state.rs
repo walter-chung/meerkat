@@ -4497,9 +4497,34 @@ where
                     .into_iter()
                     .flatten()
                     .max();
+                    // Another provider or model (a fallback, a hot swap)
+                    // counts with another tokenizer: its count anchors
+                    // nothing for this one, and the next answer anchors again.
+                    let (active_provider, active_model) =
+                        (self.client.provider(), self.client.model());
+                    if self
+                        .compaction_cadence
+                        .last_answered_request
+                        .as_ref()
+                        .is_some_and(|answered| !answered.counted_by(active_provider, active_model))
+                    {
+                        self.compaction_cadence.last_answered_request = None;
+                    }
+                    let answered_request = self
+                        .compaction_cadence
+                        .last_answered_request
+                        .as_ref()
+                        .and_then(|answered| {
+                            let rows = usize::try_from(answered.transcript_rows).ok()?;
+                            Some(crate::agent::compact::AnsweredRequestAnchor {
+                                presented_tokens: answered.presented_tokens,
+                                appended_rows: self.session.messages().get(rows..)?,
+                            })
+                        });
                     let mut ctx = crate::agent::compact::build_compaction_context(
                         &model_messages,
                         self.last_input_tokens,
+                        answered_request,
                         request_context_budget,
                         provider_request_pressure,
                         last_guarded_boundary,
@@ -4507,6 +4532,8 @@ where
                     );
                     ctx.last_rewrite_history_tokens =
                         self.compaction_cadence.last_rewrite_history_tokens;
+                    ctx.last_context_refusal_boundary_index =
+                        self.compaction_cadence.last_context_refusal_boundary_index;
                     if compactor.should_compact(&ctx) {
                         // A writer past its self-fence window sends no
                         // summarization request either.
@@ -4528,6 +4555,9 @@ where
                             self.compaction_cadence
                                 .last_compaction_attempt_boundary_index =
                                 Some(current_boundary_index);
+                            // An attempt clears a context refusal whatever it
+                            // finds, so a refusal costs one attempt.
+                            self.compaction_cadence.last_context_refusal_boundary_index = None;
                             let cadence = self.compaction_cadence.clone();
                             crate::agent::compact::persist_compaction_cadence(
                                 &mut self.session,
@@ -4564,6 +4594,11 @@ where
                         // which is how a cleared refusal self-heals.
                         self.compaction_cadence
                             .last_compaction_attempt_boundary_index = Some(current_boundary_index);
+                        // The attempt also answers a context refusal, whether
+                        // it commits or not: it is recorded with the attempt
+                        // index and no failure branch restores it, so one
+                        // refusal costs one attempt and cannot loop.
+                        self.compaction_cadence.last_context_refusal_boundary_index = None;
                         // The accumulator serves the parent revision in
                         // O(delta); it is contractually byte-identical to
                         // `transcript_messages_digest(self.session.messages())`
@@ -5233,6 +5268,11 @@ where
                                 // provisional tail is not attributable to it.
                                 self.round_commits.note_transcript_rewrite();
                                 self.last_input_tokens = 0;
+                                // The anchor counted the transcript this
+                                // rewrite replaced; the next answer anchors
+                                // again. A rollback of the rewrite restores
+                                // it with the rest of the cadence.
+                                self.compaction_cadence.last_answered_request = None;
                                 self.post_compaction_pressure_check = provider_request_pressure
                                     .map(|pressure| {
                                         crate::ProviderRequestPressure::new(
@@ -5873,6 +5913,11 @@ where
             restored_cadence.session_boundary_index = attempted_cadence.session_boundary_index;
             restored_cadence.last_compaction_attempt_boundary_index =
                 attempted_cadence.last_compaction_attempt_boundary_index;
+            // The attempt ran: the context refusal it answered stays
+            // answered, like the attempt index. The anchor is restored with
+            // the transcript it counted.
+            restored_cadence.last_context_refusal_boundary_index =
+                attempted_cadence.last_context_refusal_boundary_index;
             self.session = restored_session;
             self.tool_application_observations
                 .refresh(self.session.messages());
@@ -8354,6 +8399,7 @@ where
         ctx: &CallingLlmTurnCtx<'_>,
         error: &AgentError,
     ) -> Result<CallingLlmGate<Gate>, AgentError> {
+        self.record_context_refusal(error);
         // Recoverable LLM failures reaching this point have exhausted retry
         // authority; non-recoverable LLM failures keep their typed LLM cause.
         let retry_failure = crate::retry::LlmRetryFailure::from_agent_error(error);
@@ -8379,6 +8425,74 @@ where
         Ok(CallingLlmGate::Done(
             self.build_result(ctx.turn_count, ctx.tool_call_count).await,
         ))
+    }
+
+    /// Anchor the projection of the next request's input on the request the
+    /// provider just answered
+    /// ([`crate::compact::SessionCompactionCadence::last_answered_request`]):
+    /// its presented tokens, the transcript rows it was composed from (its
+    /// response is not in the transcript yet) and the provider and model that
+    /// counted them. An answered request also ends a context refusal. Only a
+    /// compactor reads the cadence, so an agent without one records nothing.
+    fn record_answered_request(
+        &mut self,
+        presented_tokens: u64,
+        provider: crate::Provider,
+        model: &str,
+    ) {
+        if self.compactor.is_none() {
+            return;
+        }
+        self.compaction_cadence.last_answered_request =
+            Some(crate::compact::AnsweredRequestInput {
+                presented_tokens,
+                transcript_rows: u64::try_from(self.session.messages().len()).unwrap_or(u64::MAX),
+                provider: provider.as_str().to_string(),
+                model: model.to_string(),
+            });
+        self.compaction_cadence.last_context_refusal_boundary_index = None;
+        self.persist_compaction_cadence_or_warn();
+    }
+
+    /// Record a main request the provider refused for not fitting the
+    /// model's context
+    /// ([`crate::compact::SessionCompactionCadence::last_context_refusal_boundary_index`]):
+    /// the refused request reported no usage, so without the fact the next
+    /// check would see what this one saw and send the same request again. The
+    /// refused run's own failure is unchanged.
+    fn record_context_refusal(&mut self, error: &AgentError) {
+        let refused_for_context = matches!(
+            error,
+            AgentError::Llm {
+                reason: LlmFailureReason::ContextExceeded { .. },
+                ..
+            }
+        );
+        if self.compactor.is_none() || !refused_for_context {
+            return;
+        }
+        // The refused request's boundary: its check moved the index past it.
+        self.compaction_cadence.last_context_refusal_boundary_index = Some(
+            self.compaction_cadence
+                .session_boundary_index
+                .saturating_sub(1),
+        );
+        self.persist_compaction_cadence_or_warn();
+    }
+
+    /// Write the cadence into the session metadata, where the run's next
+    /// checkpoint persists it. A cadence that cannot be encoded fails no
+    /// turn: the next boundary writes it again.
+    fn persist_compaction_cadence_or_warn(&mut self) {
+        let cadence = self.compaction_cadence.clone();
+        if let Err(error) =
+            crate::agent::compact::persist_compaction_cadence(&mut self.session, &cadence)
+        {
+            tracing::warn!(
+                %error,
+                "session compaction cadence metadata could not be written; the next boundary writes it"
+            );
+        }
     }
 
     /// Classify one already-measured request budget against the active model
@@ -8776,6 +8890,11 @@ where
         if let Some(turn_usage) = turn_usage.as_ref() {
             self.budget.record_turn_usage(turn_usage);
             self.last_input_tokens = turn_usage.presented_tokens();
+            self.record_answered_request(
+                turn_usage.presented_tokens(),
+                response_provider,
+                &response_model,
+            );
             self.session.record_turn_usage(turn_usage);
             self.run_request_usage.push(turn_usage.clone());
             // Extraction publishes no `turn_completed`; its rows ride the

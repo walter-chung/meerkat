@@ -516,13 +516,29 @@ pub fn estimate_request_bytes(messages: &[Message]) -> Result<u64, CompactionErr
     Ok(estimate_transcript_pressure(messages)?.request_bytes)
 }
 
+/// The last answered model request, as [`build_compaction_context`] projects
+/// the next request's input from it: the input tokens the provider presented
+/// for it and the transcript rows appended after it was composed.
+#[derive(Debug, Clone, Copy)]
+pub struct AnsweredRequestAnchor<'a> {
+    /// Input tokens the provider presented for the answered request.
+    pub presented_tokens: u64,
+    /// The transcript rows appended since that request was composed.
+    pub appended_rows: &'a [Message],
+}
+
 /// Build a `CompactionContext` from current agent state.
 ///
 /// Falls back to 0 estimated tokens if serialization fails (non-fatal for
 /// context building — the should_compact check will use last_input_tokens).
+/// The input projection is the anchor's presented tokens plus the estimate
+/// of only `answered_request`'s appended rows; `None` without an anchor, or
+/// when those rows cannot be measured. The refusal fact and the rewrite
+/// evidence are the agent's cadence, which it fills in.
 pub fn build_compaction_context(
     messages: &[Message],
     last_input_tokens: u64,
+    answered_request: Option<AnsweredRequestAnchor<'_>>,
     request_context_budget: Option<crate::ContextBudgetFact>,
     provider_request_pressure: Option<crate::ProviderRequestPressure>,
     last_compaction_boundary_index: Option<u64>,
@@ -536,6 +552,19 @@ pub fn build_compaction_context(
                 (0, 0)
             }
         };
+    let projected_input_tokens =
+        answered_request.and_then(|anchor| match estimate_tokens(anchor.appended_rows) {
+            Ok(appended_tokens) => Some(crate::compact::InputTokenProjection {
+                anchor_tokens: anchor.presented_tokens,
+                appended_tokens,
+            }),
+            Err(err) => {
+                tracing::warn!(
+                    "failed to estimate the rows appended since the last answered request: {err}"
+                );
+                None
+            }
+        });
 
     CompactionContext {
         last_input_tokens,
@@ -547,6 +576,8 @@ pub fn build_compaction_context(
         last_compaction_boundary_index,
         session_boundary_index,
         last_rewrite_history_tokens: None,
+        projected_input_tokens,
+        last_context_refusal_boundary_index: None,
     }
 }
 
@@ -599,9 +630,7 @@ pub fn load_compaction_cadence(
         None => {
             let cadence = SessionCompactionCadence {
                 session_boundary_index: infer_session_boundary_index(session.messages()),
-                last_compaction_boundary_index: None,
-                last_compaction_attempt_boundary_index: None,
-                last_rewrite_history_tokens: None,
+                ..SessionCompactionCadence::default()
             };
             persist_compaction_cadence(session, &cadence)
                 .map_err(CompactionCadenceError::PersistFailed)?;

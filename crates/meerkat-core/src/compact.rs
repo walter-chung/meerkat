@@ -23,6 +23,17 @@ pub struct SessionCompactionCadence {
     /// Boundary index where compaction was last attempted, successful or not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_compaction_attempt_boundary_index: Option<u64>,
+    /// Boundary index of the last main model request the provider refused
+    /// because it did not fit the model's context, while no compaction
+    /// attempt and no answered request has followed it.
+    ///
+    /// A refused request reports no usage, so no measure moves and the next
+    /// run would send the same request again. The fact is the evidence for
+    /// [`CompactionContext::last_context_refusal_boundary_index`]: the next
+    /// check compacts once, and that attempt clears it whether it commits or
+    /// not. The run that was refused stays failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_context_refusal_boundary_index: Option<u64>,
     /// Estimated history tokens the last compaction rewrite left: the
     /// committed rewrite's transcript, or the unchanged transcript of a
     /// rewrite rejected as a no-op. A failed attempt leaves it as it was.
@@ -33,6 +44,67 @@ pub struct SessionCompactionCadence {
     /// before 0.9.4, which neither writes nor reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_rewrite_history_tokens: Option<u64>,
+    /// The last answered model request: the anchor of
+    /// [`CompactionContext::projected_input_tokens`].
+    ///
+    /// Set when a response reports its usage, dropped by a committed
+    /// transcript rewrite (and restored with the transcript when that
+    /// rewrite rolls back), and dropped by the next check when the active
+    /// provider or model is not the one that counted it. Persisted, so an
+    /// agent rebuilt from its store projects its first request too. `None`
+    /// before the first answered request and for a session last written by a
+    /// binary that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_answered_request: Option<AnsweredRequestInput>,
+}
+
+/// The input of the last model request a provider answered: the anchor of
+/// the projection of the next request's input tokens.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct AnsweredRequestInput {
+    /// Input tokens the provider presented for that request (its normalized
+    /// count, cache reads and writes included).
+    pub presented_tokens: u64,
+    /// Transcript rows the request was composed from: everything before the
+    /// response it got. The rows after them are what the next request adds.
+    pub transcript_rows: u64,
+    /// The provider that counted them (`Provider::as_str`).
+    pub provider: String,
+    /// The model that counted them.
+    pub model: String,
+}
+
+impl AnsweredRequestInput {
+    /// Whether `provider` and `model` counted these tokens: another
+    /// tokenizer's count is not this one's.
+    #[must_use]
+    pub fn counted_by(&self, provider: crate::Provider, model: &str) -> bool {
+        self.provider == provider.as_str() && self.model == model
+    }
+}
+
+/// The projected input tokens of the request a boundary would send: the
+/// provider's count for the last answered request plus the transcript
+/// estimate of only the rows appended since.
+///
+/// The prefix the provider counted is exact, so only the appended rows are
+/// estimated, whatever the estimator's error on the rest of the transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputTokenProjection {
+    /// Input tokens the provider presented for the last answered request.
+    pub anchor_tokens: u64,
+    /// Estimated tokens of the transcript rows appended since, in the unit
+    /// of [`CompactionContext::estimated_history_tokens`].
+    pub appended_tokens: u64,
+}
+
+impl InputTokenProjection {
+    /// The projected input tokens: the anchor plus the appended estimate.
+    #[must_use]
+    pub fn projected_tokens(self) -> u64 {
+        self.anchor_tokens.saturating_add(self.appended_tokens)
+    }
 }
 
 /// Context provided to `Compactor::should_compact` for trigger decisions.
@@ -101,6 +173,30 @@ pub struct CompactionContext {
     /// above the threshold, that floor alone crosses it, and compacting again
     /// cannot bring the history under it.
     pub last_rewrite_history_tokens: Option<u64>,
+    /// Projected input tokens of the request this boundary would send: the
+    /// provider's count for the last answered request plus the estimate of
+    /// only the transcript rows appended since.
+    ///
+    /// `last_input_tokens` lags this boundary by exactly what it appended
+    /// (a tool result, for one), and the two transcript estimates count text
+    /// bytes, which under-reads dense content such as JSON listings; the
+    /// projection keeps the provider's exact count for everything it counted
+    /// and estimates only the growth.
+    ///
+    /// `None` without an anchor: before the first answered request, after a
+    /// committed rewrite until the next answer, when another provider or
+    /// model counted the last answer, and for a session last written by a
+    /// binary that predates the anchor.
+    pub projected_input_tokens: Option<InputTokenProjection>,
+    /// Boundary index of the last main request the provider refused for not
+    /// fitting the model's context, while no compaction attempt and no
+    /// answered request has followed it
+    /// ([`SessionCompactionCadence::last_context_refusal_boundary_index`]).
+    ///
+    /// The refused request reported no usage, so no other measure here moved
+    /// since it was sent; without compacting, the next request is the same
+    /// one again.
+    pub last_context_refusal_boundary_index: Option<u64>,
 }
 
 /// Provider-authored witness for the exact JSON body an invocation may send.

@@ -589,6 +589,21 @@ impl Compactor for DefaultCompactor {
                 ),
             };
         let byte_trigger = byte_threshold.is_some_and(|threshold| request_bytes >= threshold);
+        // The projected input of this request: the provider's own count for
+        // the last answered request plus the transcript estimate of only the
+        // rows appended since. `last_input_tokens` lags by exactly those rows
+        // (one tool result can be most of a window), and the two estimates
+        // above count text bytes, which under-reads dense content such as
+        // JSON listings; the projection keeps the exact count for everything
+        // the provider counted and estimates only the growth.
+        let projection = ctx.projected_input_tokens;
+        let projection_trigger = projection.is_some_and(|projection| {
+            projection.projected_tokens() >= self.config.auto_compact_threshold
+        });
+        // A request the provider refused for not fitting the model's context.
+        // It reported no usage, so no measure above moved since it was sent:
+        // without compacting, the next request is the same one again.
+        let context_refused = ctx.last_context_refusal_boundary_index.is_some();
 
         // Cadence is a cost policy, not recovery authority. It may suppress a
         // provider-reported high-water mark while the current transcript is
@@ -627,6 +642,21 @@ impl Compactor for DefaultCompactor {
         // unless the System rows alone approach the provider's request cap,
         // which also puts the history far over the token threshold and the
         // request over the model window.
+        //
+        // A projection crossing is recoverable when the growth since the last
+        // answered request made it: that request presented under the
+        // threshold, and what was appended since is what a rewrite removes.
+        // When the anchor alone is at or over the threshold (the answered
+        // request already held the newest round a rewrite keeps), the
+        // projection is a provider-reported high-water mark like
+        // `last_input_tokens`, and waits for the cadence. A committed rewrite
+        // drops the anchor, so the next answer re-anchors with what the
+        // rewrite left.
+        //
+        // A context refusal is recovery by definition: the refused request
+        // did not fit, so it bypasses the threshold and the cadence. The
+        // attempt it causes clears it, committed or not, so one refusal costs
+        // one attempt.
         let history_floor_crosses = ctx
             .last_rewrite_history_tokens
             .is_some_and(|left| left >= self.config.auto_compact_threshold);
@@ -658,7 +688,12 @@ impl Compactor for DefaultCompactor {
                  derives from the model window, or shrink the System rows"
             );
         }
-        let requires_capacity_recovery = history_recovers || byte_trigger;
+        let projection_crossed_by_growth = projection_trigger
+            && projection.is_some_and(|projection| {
+                projection.anchor_tokens < self.config.auto_compact_threshold
+            });
+        let requires_capacity_recovery =
+            history_recovers || byte_trigger || projection_crossed_by_growth || context_refused;
         if !requires_capacity_recovery
             && let Some(last) = ctx.last_compaction_boundary_index
             && ctx.session_boundary_index.saturating_sub(last)
@@ -666,10 +701,19 @@ impl Compactor for DefaultCompactor {
         {
             return false;
         }
-        if input_trigger || history_trigger || byte_trigger || forecast_trigger {
+        let fires = input_trigger
+            || history_trigger
+            || byte_trigger
+            || forecast_trigger
+            || projection_trigger
+            || context_refused;
+        if fires {
             tracing::trace!(
                 input_tokens = ctx.last_input_tokens,
                 estimated_history_tokens = ctx.estimated_history_tokens,
+                projected_input_tokens = projection.map(|projection| projection.projected_tokens()),
+                projection_anchor_tokens = projection.map(|projection| projection.anchor_tokens),
+                last_context_refusal_boundary_index = ctx.last_context_refusal_boundary_index,
                 request_forecast_tokens,
                 request_forecast_provenance = ctx
                     .request_context_budget
@@ -683,7 +727,9 @@ impl Compactor for DefaultCompactor {
                 threshold = self.config.auto_compact_threshold,
                 byte_threshold,
                 request_measurement,
-                branch = if input_trigger {
+                branch = if context_refused {
+                    "context_refusal"
+                } else if input_trigger {
                     "last_input_tokens"
                 } else if history_trigger {
                     "estimated_history_tokens_fallback"
@@ -691,13 +737,15 @@ impl Compactor for DefaultCompactor {
                     "provider_request_bytes"
                 } else if byte_trigger {
                     "estimated_request_bytes"
+                } else if projection_trigger {
+                    "projected_input_tokens"
                 } else {
                     "request_context_budget_forecast"
                 },
                 "compaction trigger fired",
             );
         }
-        input_trigger || history_trigger || byte_trigger || forecast_trigger
+        fires
     }
 
     fn prepare_for_summarization(

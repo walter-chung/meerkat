@@ -236,12 +236,12 @@ pub use comms::{
     SessionEventSubscription, StreamError, StreamScope, encoded_envelope_len,
 };
 pub use compact::{
-    COMPACTION_SUMMARY_PREFIX, CompactionConfig, CompactionContext, CompactionCurator,
-    CompactionCuratorError, CompactionDiscard, CompactionResult, CompactionRetained,
-    CompactionSummary, CompactionWindow, Compactor, CuratedCompactionSummary,
-    ProviderRequestPressure, SESSION_COMPACTION_CADENCE_KEY, SessionCompactionCadence,
-    SummarizationSource, SummarizationSourceBound, SummarizationSourceBudget,
-    SummarizationTrimStage,
+    AnsweredRequestInput, COMPACTION_SUMMARY_PREFIX, CompactionConfig, CompactionContext,
+    CompactionCurator, CompactionCuratorError, CompactionDiscard, CompactionResult,
+    CompactionRetained, CompactionSummary, CompactionWindow, Compactor, CuratedCompactionSummary,
+    InputTokenProjection, ProviderRequestPressure, SESSION_COMPACTION_CADENCE_KEY,
+    SessionCompactionCadence, SummarizationSource, SummarizationSourceBound,
+    SummarizationSourceBudget, SummarizationTrimStage,
 };
 pub use completion_feed::{
     CompletionBatch, CompletionEnrichmentData, CompletionEnrichmentProvider, CompletionEntry,

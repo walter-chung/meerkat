@@ -233,6 +233,19 @@ them.
   REST `GET /schedules`, the Python SDK's `list_schedules` and the
   TypeScript SDK's `listSchedules` return every schedule whole, as before.
 
+- `meerkat-core`: `CompactionContext` gains `projected_input_tokens:
+  Option<InputTokenProjection>` and `last_context_refusal_boundary_index:
+  Option<u64>`, and `SessionCompactionCadence` gains
+  `last_context_refusal_boundary_index: Option<u64>` and
+  `last_answered_request: Option<AnsweredRequestInput>` (see Fixed). Both
+  structs are exhaustive: a struct literal names the new fields (`None`
+  measures as before) or, for `SessionCompactionCadence`, ends with
+  `..Default::default()`; `CompactionContext` has no `Default`.
+  `meerkat_core::agent::compact::build_compaction_context` takes the last
+  answered request (`Option<AnsweredRequestAnchor<'_>>`) as its new third
+  parameter; `None` measures as before. A custom `Compactor` may read the
+  two new context fields or ignore them; no existing field changes meaning.
+
 ### Added
 
 - `meerkat-runtime`: `PromptInput::detached_job_completed_with_handling`
@@ -304,7 +317,53 @@ them.
   the same way on the dispatch and entered paths, and answers `Unavailable`
   only past the bounds; its prepared path does not wait.
 
+- `meerkat-core`: `InputTokenProjection` (the projection of a request's input
+  tokens: `anchor_tokens`, `appended_tokens` and `projected_tokens()`),
+  `AnsweredRequestInput` (the anchor a session's compaction cadence persists:
+  the last answered request's presented tokens, the transcript rows it was
+  composed from, and the provider and model that counted them, with
+  `counted_by`) and `agent::compact::AnsweredRequestAnchor` (that anchor's
+  presented tokens and the rows appended since, as `build_compaction_context`
+  measures them).
+
 ### Fixed
+
+- `meerkat-core` and `meerkat-session`: one tool result no longer carries a
+  session's next request past the model's context window unnoticed. The
+  compaction check runs before every request, but the provider's count it
+  read (`last_input_tokens`) lagged by exactly the rows the boundary
+  appended, and the history estimate and request forecast count text bytes
+  (four a token), which under-read JSON-dense content. A session just under
+  its threshold that received a large tool result (a schedule listing, for
+  one) sent a request past the window, and the provider refused it.
+  `build_compaction_context` now projects each request's input tokens: the
+  provider's count for the last answered request plus the estimate of only
+  the rows appended since (`CompactionContext::projected_input_tokens`).
+  `DefaultCompactor` compacts when the projection reaches the threshold; the
+  cadence cannot veto a crossing the growth since the answered request made,
+  and a projection whose answered request alone was over the threshold waits
+  for the cadence as the provider's count does. The anchor is set by every
+  answered request, dropped by a committed rewrite (and restored when the
+  rewrite rolls back) and when the active provider or model is not the one
+  that counted it, and persisted in the session's compaction cadence, so an
+  agent rebuilt from its store projects its first request too.
+
+- `meerkat-core` and `meerkat-session`: a session whose request the provider
+  refused for not fitting the model's context no longer stays wedged. The
+  refused request reported no usage, so the next run's first check saw the
+  same counts and sent the same request again, and so did every run after
+  it. The refusal is now recorded in the session's compaction cadence
+  (`last_context_refusal_boundary_index`), and the next check compacts the
+  whole transcript once, whatever the thresholds and the cadence say: a turn
+  too large for the window is summarized instead of being sent again. The
+  attempt clears the fact whether it commits or not, so a refusal costs one
+  compaction and cannot loop; an answered request clears it too. The refused
+  run still fails as before. When that run had committed a round (the
+  reported case: a tool result too large for the window), its closing save
+  persists the fact, so an agent rebuilt from the store after a restart
+  compacts first too (see Known limitations for a run's first request). A
+  custom `Compactor` receives the fact as
+  `CompactionContext::last_context_refusal_boundary_index`.
 
 - `meerkat-core`: a pending or approved human consent (R3) is now kept
   across unrelated authorization changes and past the end of its decision's
@@ -554,7 +613,41 @@ them.
   fields beside it; one that read a schedule's whole occurrence history
   with only `schedule_id` follows `page.next_cursor`. See Breaking.
 
+- No storage migration. A session's compaction cadence gains two optional
+  fields, written only when set; 0.9.8 and earlier ignore them, and a cadence
+  they wrote reads without them, so its first answered request on this
+  release sets the anchor.
+
+- A host that builds `CompactionContext` or `SessionCompactionCadence` by
+  struct literal, or calls `build_compaction_context`, adds the new fields or
+  argument (see Breaking). A custom `Compactor` that wants the projection or
+  the refusal reads the new context fields; one that ignores them decides as
+  before.
+
+- A lower explicit `auto_compact_threshold` (config, or a mob profile's)
+  still widens the headroom the derived four-fifths of the context window
+  leaves for what one boundary appends.
+
 ### Known limitations
+
+- `meerkat-core`: a run whose own newest round is larger than what the
+  context window leaves once the rows before the run are folded still fails
+  with a context refusal: a compaction inside a run keeps the run's request
+  and newest round verbatim. The next run compacts first and continues (see
+  Fixed).
+
+- `meerkat-core`: when the provider refuses a run's first request for not
+  fitting the context, nothing of that run is saved, so the refusal fact is
+  held by the live agent only: that agent's next run compacts first, but an
+  agent rebuilt from the store sends the request once more before it
+  compacts, and a host that rebuilds the agent for every run (a session not
+  kept alive) keeps meeting the refusal. This is how a session wedged by an
+  earlier release presents (it has no persisted anchor); a host that keeps
+  its agents alive heals it on the run after the first refusal.
+
+- `meerkat-schedule`: a schedule's superseded acks still grow with every
+  revision. `meerkat_schedule_list` summaries leave them out;
+  `meerkat_schedule_get` and the host APIs return them with the schedule.
 
 - `meerkat-runtime`: a governed input admitted under its own authority
   association (a governed prompt, for example) that a graceful requeue stop
