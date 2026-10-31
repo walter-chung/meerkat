@@ -114,8 +114,9 @@ compaction covers the whole transcript (the next run's first) compacts it
 once, whatever the measures and the cadence say: a turn too large for the
 window is summarized instead of being sent again. That attempt clears the
 refusal whether it commits or not, so a refusal costs one compaction and
-cannot loop. A check inside a run neither sees nor clears it, since a
-compaction there keeps the run's request and newest round. The refused
+cannot loop; an answered request that carried every result whole clears it
+too, since the transcript then fits. A check inside a run does not see it,
+since a compaction there keeps the run's request and newest round. The refused
 run's failed boundary commits the refusal with the session, also when the
 refused request was the run's first, so an agent rebuilt from the store
 (after a restart, or for a session not kept alive) compacts first too. That
@@ -139,10 +140,12 @@ publishes `tool_results_bounded_for_request` (the run, each call with the
 bytes its head kept and the whole result's size, and the limit), the answer
 to that request anchors no projection, and the bound records the same fact a
 context refusal does, so the next run's first check compacts the whole
-transcript once instead of sending the whole result again. The compaction
-check itself measures the request as composed, before the bound. A request
-whose projection reads under the window (the estimate counts four bytes a
-token) can still be refused, and then heals as above.
+transcript once instead of sending the whole result again. The bounded
+request's own answer keeps the fact; an answer to a request sent whole clears
+it, as for a refusal. The compaction check itself measures the request as
+composed, before the bound. A request whose projection reads under the window
+(the estimate counts four bytes a token) can still be refused, and then heals
+as above.
 
 ## Summary authority
 

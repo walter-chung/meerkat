@@ -257,6 +257,23 @@ them.
   parameter; `None` measures as before. A custom `Compactor` may read the
   two new context fields or ignore them; no existing field changes meaning.
 
+- `meerkat-core`: `AgentEvent` gains the variant
+  `ToolResultsBoundedForRequest { run_id, results, axis }`, wire type
+  `tool_results_bounded_for_request`, with the new `BoundedToolResult`
+  (`tool_use_id`, `tool_name`, `kept_bytes`, `total_bytes`) and the new enum
+  `ToolResultBoundAxis` (`request_bytes`, `context_window`;
+  non-exhaustive). It is published before a model request that carries
+  some of its run's own tool results shortened for that request only (see
+  Fixed): each call, the bytes of its text the request kept and the bytes
+  of the whole result, and the limit the request did not fit with them
+  whole. Before, only the marker the model reads said so. `AgentEvent` is
+  non-exhaustive, so a Rust match already has a wildcard arm; the published
+  event catalog (`meerkat_contracts::KNOWN_AGENT_EVENT_TYPES`) lists the new
+  type, and the generated SDK inventories with it. An SDK of this version
+  surfaces the event as its unknown-event form with the whole payload
+  (Python, TypeScript) or as its generated event type (Web); an SDK of 0.9.8
+  or earlier refuses the unknown type, as for any newer contract.
+
 ### Added
 
 - `meerkat-runtime`: `PromptInput::detached_job_completed_with_handling`
@@ -341,21 +358,6 @@ them.
   cadence the agent's session carries; a host that swaps in a durable
   snapshot of the session calls it after the swap.
 
-- `meerkat-core`: `AgentEvent::ToolResultsBoundedForRequest { run_id,
-  results, axis }`, wire type `tool_results_bounded_for_request`, with the
-  new `BoundedToolResult` (`tool_use_id`, `tool_name`, `kept_bytes`,
-  `total_bytes`) and the non-exhaustive enum `ToolResultBoundAxis`
-  (`request_bytes`, `context_window`). It is published before a model
-  request that carries some of its run's own tool results shortened for that
-  request only (see Fixed): each call, the bytes of its text the request
-  kept and the bytes of the whole result, and the limit the request did not
-  fit with them whole. Before, only the marker the model reads said so.
-  `AgentEvent` is non-exhaustive, so a Rust match already has a wildcard
-  arm; the published event catalog (`meerkat_contracts::KNOWN_AGENT_EVENT_TYPES`)
-  and the generated SDK inventories list the new type. The Python and
-  TypeScript SDKs surface it as their unknown-event form with the whole
-  payload, and the Web SDK as its generated event type.
-
 ### Fixed
 
 - `meerkat-core` and `meerkat-session`: one tool result no longer carries a
@@ -394,10 +396,11 @@ them.
   once, whatever the thresholds and the cadence say: a turn too large for
   the window is summarized instead of being sent again. The attempt clears
   the fact whether it commits or not, so a refusal costs one compaction and
-  cannot loop. A check inside a run neither sees nor clears it, since a
-  compaction there keeps the run's request and newest round. The refused
-  run still fails as before, and its hard-failure boundary commits the
-  fact with the session (the run's closing save, or, for a refusal of the
+  cannot loop; an answered request that carried every result whole clears
+  it too, since the transcript then fits. A check inside a run does not see
+  it, since a compaction there keeps the run's request and newest round. The
+  refused run still fails as before, and its hard-failure boundary commits
+  the fact with the session (the run's closing save, or, for a refusal of the
   run's first request, the failed run's applied boundary), so a new agent
   built from the store (after a restart, for a session not kept alive, for
   a command-line resume) compacts first too, as does a session wedged by an
@@ -418,15 +421,17 @@ them.
   share keeps the head of its text and a marker naming the call, for that
   request only, the share sized from the token overage at two bytes a
   token. The stored transcript keeps every result whole. On either axis the
-  bound is now announced (`tool_results_bounded_for_request`, see Added),
+  bound is now announced (`tool_results_bounded_for_request`, see Breaking),
   the answer to a bounded request no longer anchors the input projection
   (its count understates the transcript, so the anchor stays on the request
   before it), and the bound records the fact a context refusal records, so
   the next run's first check compacts the whole transcript once instead of
-  sending the whole result again. The compaction check measures the request
-  as composed, before the bound, in tokens as in bytes. After a model
-  fallback the bound cuts from the whole results again, so the marker and
-  the event state each result's whole size.
+  sending the whole result again. The bounded request's own answer keeps
+  the fact; an answer to a request sent whole clears it, as for a refusal.
+  The compaction check measures the request as composed, before the bound,
+  in tokens as in bytes. After a model fallback the bound cuts from the
+  whole results again, so the marker and the event state each result's
+  whole size.
 
 - `meerkat-core`: a pending or approved human consent (R3) is now kept
   across unrelated authorization changes and past the end of its decision's
@@ -700,10 +705,11 @@ them.
 
 - Upgrade the SDKs with the server: a Python, TypeScript or Web SDK of
   0.9.8 or earlier refuses the new `tool_results_bounded_for_request` event
-  type, as it does any event type newer than its contract. A host that reads
-  the stored cadence's `last_context_refusal_boundary_index` sees it set by
-  a bounded request too, and kept until a compaction of the whole transcript
-  (an answered request no longer clears it).
+  type, as it does any event type newer than its contract (see Breaking). A
+  host that reads the stored cadence's `last_context_refusal_boundary_index`
+  sees it set by a bounded request too; it is kept until a compaction of the
+  whole transcript or an answered request sent whole, and the answer to a
+  bounded request keeps it.
 
 ### Known limitations
 
