@@ -88,6 +88,14 @@ struct LlmRetryRequest<'a> {
     /// retry loop so ordinary calls do not deep-clone the accumulated
     /// transcript merely to obtain a mutable fallback/retry buffer.
     messages: Arc<Vec<Message>>,
+    /// The open run's tool results `messages` carries shortened, each with
+    /// the whole result it was cut from, so a bound against a model
+    /// fallback's limits cuts from the whole results again.
+    bounded_whole: Vec<(crate::types::ToolResult, crate::types::ToolResult)>,
+    /// Whether the request the provider answers carried the open run's tool
+    /// results shortened; a bound against a model fallback's limits sets it
+    /// anew.
+    request_bounded: &'a mut bool,
     tools: Arc<[Arc<ToolDef>]>,
     max_tokens: u32,
     temperature: Option<f32>,
@@ -100,6 +108,18 @@ struct LlmRetryRequest<'a> {
     extraction_output_schema: Option<crate::types::OutputSchema>,
     allow_empty_success: bool,
     durable_visibility_parent: &'a mut Option<crate::SessionToolVisibilityState>,
+}
+
+/// One model request as composed, before the open run's own tool results
+/// were bounded for it: its measurements are the true pressure the parked
+/// compaction check sees.
+struct UnboundedRequest {
+    /// The provider-lowered body pressure of the request as composed.
+    pressure: Option<crate::ProviderRequestPressure>,
+    /// Its whole-request token budget, when it could be measured.
+    budget: Option<crate::ContextBudgetFact>,
+    /// What the bound did to the request.
+    bound: crate::agent::compact::RequestBound,
 }
 
 enum LlmRetryOutcome {
@@ -821,6 +841,11 @@ struct CallingLlmTurnCtx<'a> {
     responding_operation_id: &'a mut Option<crate::OperationId>,
     model_operation_sequence: &'a mut u64,
     deferred_tool_failure: &'a mut Option<crate::session::DeferredToolBatchFailure>,
+    /// Whether the model request this boundary sent carried the open run's
+    /// own tool results shortened for it only: its answer then anchors no
+    /// input projection. Set when the request is sent, and again when a
+    /// retry sends it bounded anew.
+    request_bounded: bool,
     turn_count: u32,
     tool_call_count: u32,
 }
@@ -3296,6 +3321,8 @@ where
             assistant_message_id,
             event_tx,
             messages,
+            mut bounded_whole,
+            request_bounded,
             tools,
             max_tokens,
             temperature,
@@ -3317,10 +3344,13 @@ where
         let mut attempt = 0u32;
         let mut retry_request_pressure_recheck = false;
         // Once per call: after a model fallback, the open run's oversized
-        // tool results give way against the fallback's cap as they do
-        // against the primary's at the boundary. The unbounded measurement
-        // is kept for the compaction check, as at the boundary.
-        let mut fallback_unbounded_request_pressure = None;
+        // tool results give way against the fallback's cap and input budget
+        // as they do against the primary's at the boundary, cut from the whole
+        // results. The unbounded measurements are kept for the compaction
+        // check, and the bound is announced before the request is sent, as at
+        // the boundary.
+        let mut fallback_unbounded_request: Option<Box<UnboundedRequest>> = None;
+        let mut fallback_bound_notice: Option<Box<AgentEvent>> = None;
         let mut next_request_attempt = Some(prepared_attempt);
         let mut authorization_reprepared = false;
         // One bounded wait state per model call: its wall-clock deadline and
@@ -3467,24 +3497,41 @@ where
                         return Err(error);
                     }
                 };
-                if fallback_unbounded_request_pressure.is_none()
-                    && let Some(pressure) = request_pressure
-                    && let Some(max_bytes) = self
-                        .compactor
-                        .as_ref()
-                        .and_then(|compactor| compactor.request_byte_cap(pressure))
-                        .or(pressure.max_bytes)
-                    && let Some(run_id) = self.runtime_started_run_id.as_ref()
-                    && let Some(bounded) =
-                        crate::agent::compact::bound_open_run_tool_results_for_request(
-                            &current_messages,
-                            run_id,
-                            pressure.encoded_bytes,
-                            max_bytes,
-                        )
+                let profile = self.request_model_profile(*controller_feedback);
+                let request_context_budget = self.context_budget_fact_for_profile(
+                    &current_messages,
+                    &current_tools,
+                    current_max_tokens,
+                    request_pressure,
+                    profile.as_ref(),
+                );
+                let bounded = if fallback_unbounded_request.is_none() {
+                    self.bound_open_run_request(
+                        &current_messages,
+                        request_pressure,
+                        request_context_budget
+                            .as_ref()
+                            .ok()
+                            .and_then(Option::as_ref),
+                        &bounded_whole,
+                    )
+                } else {
+                    None
+                };
+                if let Some(crate::agent::compact::BoundedRunRequest {
+                    messages: bounded_messages,
+                    mut bound,
+                }) = bounded
                 {
-                    fallback_unbounded_request_pressure = Some(pressure);
-                    current_messages = Arc::new(bounded);
+                    fallback_bound_notice = bound.notice().map(Box::new);
+                    *request_bounded = fallback_bound_notice.is_some();
+                    bounded_whole = std::mem::take(&mut bound.whole);
+                    fallback_unbounded_request = Some(Box::new(UnboundedRequest {
+                        pressure: request_pressure,
+                        budget: request_context_budget.ok().flatten(),
+                        bound,
+                    }));
+                    current_messages = Arc::new(bounded_messages);
                     retry_request_pressure_recheck = true;
                     continue;
                 }
@@ -3504,14 +3551,7 @@ where
                         None
                     }
                 });
-                let profile = self.request_model_profile(*controller_feedback);
-                let request_context_budget = self.context_budget_fact_for_profile(
-                    &current_messages,
-                    &current_tools,
-                    current_max_tokens,
-                    request_pressure,
-                    profile.as_ref(),
-                )?;
+                let request_context_budget = request_context_budget?;
                 let context_budget_error =
                     self.context_budget_refusal_error(request_context_budget.as_ref());
                 let preflight_error = request_byte_error.or(context_budget_error);
@@ -3527,9 +3567,13 @@ where
                     {
                         let prior_completed_boundary =
                             self.compaction_cadence.last_compaction_boundary_index;
-                        self.pending_compaction_request_pressure =
-                            fallback_unbounded_request_pressure.or(request_pressure);
-                        self.pending_compaction_request_budget = request_context_budget.clone();
+                        let (compaction_pressure, compaction_budget) =
+                            match fallback_unbounded_request.as_deref() {
+                                Some(unbounded) => (unbounded.pressure, unbounded.budget.clone()),
+                                None => (request_pressure, request_context_budget.clone()),
+                            };
+                        self.pending_compaction_request_pressure = compaction_pressure;
+                        self.pending_compaction_request_budget = compaction_budget;
                         let transition = TurnExecutionTransition {
                             prev_phase: TurnPhase::CallingLlm,
                             next_phase: TurnPhase::CallingLlm,
@@ -3547,6 +3591,19 @@ where
                         return Err(error);
                     }
                 }
+            }
+
+            // A bound against a model fallback's limits goes out with this
+            // attempt: announce it and record it, as at the boundary. Boxed,
+            // so the retry loop's own frame carries no event.
+            if let Some(notice) = fallback_bound_notice.take() {
+                self.record_transcript_did_not_fit();
+                let _ = Box::pin(crate::event_tap::tap_emit(
+                    &self.event_tap,
+                    event_tx.as_ref(),
+                    *notice,
+                ))
+                .await;
             }
 
             // 4. Determine whether to wrap the call and select timeout source
@@ -4532,8 +4589,25 @@ where
                     );
                     ctx.last_rewrite_history_tokens =
                         self.compaction_cadence.last_rewrite_history_tokens;
-                    ctx.last_context_refusal_boundary_index =
-                        self.compaction_cadence.last_context_refusal_boundary_index;
+                    // The transcript holds content a request could not carry
+                    // (a context refusal, or a request that carried the open
+                    // run's own results shortened). Only a compaction of the
+                    // whole transcript folds it: inside a run a compaction
+                    // keeps the run's request and newest round, so the fact
+                    // waits for a check whose scope is the whole transcript,
+                    // a run's first.
+                    ctx.last_context_refusal_boundary_index = self
+                        .compaction_cadence
+                        .last_context_refusal_boundary_index
+                        .filter(|_| {
+                            matches!(
+                                crate::agent::compact::compaction_scope(
+                                    self.session.messages(),
+                                    self.runtime_started_run_id.as_ref(),
+                                ),
+                                Some(crate::agent::compact::CompactionScope::Whole)
+                            )
+                        });
                     if compactor.should_compact(&ctx) {
                         // A writer past its self-fence window sends no
                         // summarization request either.
@@ -4555,9 +4629,10 @@ where
                             self.compaction_cadence
                                 .last_compaction_attempt_boundary_index =
                                 Some(current_boundary_index);
-                            // An attempt clears a context refusal whatever it
-                            // finds, so a refusal costs one attempt.
-                            self.compaction_cadence.last_context_refusal_boundary_index = None;
+                            // A skipped attempt is inside a run, whose request
+                            // and newest round it keeps: a fact that the
+                            // transcript holds content a request could not
+                            // carry waits for the next run's first check.
                             let cadence = self.compaction_cadence.clone();
                             crate::agent::compact::persist_compaction_cadence(
                                 &mut self.session,
@@ -4594,11 +4669,18 @@ where
                         // which is how a cleared refusal self-heals.
                         self.compaction_cadence
                             .last_compaction_attempt_boundary_index = Some(current_boundary_index);
-                        // The attempt also answers a context refusal, whether
-                        // it commits or not: it is recorded with the attempt
+                        // A compaction of the whole transcript also answers
+                        // the fact that it holds content a request could not
+                        // carry (a context refusal, or a request that carried
+                        // the open run's results shortened), whether it
+                        // commits or not: it is recorded with the attempt
                         // index and no failure branch restores it, so one
-                        // refusal costs one attempt and cannot loop.
-                        self.compaction_cadence.last_context_refusal_boundary_index = None;
+                        // refusal or bound costs one attempt and cannot loop.
+                        // An attempt inside a run keeps the run's request and
+                        // newest round, so there the fact waits.
+                        if matches!(scope, crate::agent::compact::CompactionScope::Whole) {
+                            self.compaction_cadence.last_context_refusal_boundary_index = None;
+                        }
                         // The accumulator serves the parent revision in
                         // O(delta); it is contractually byte-identical to
                         // `transcript_messages_digest(self.session.messages())`
@@ -6641,6 +6723,7 @@ where
                         responding_operation_id: &mut responding_operation_id,
                         model_operation_sequence: &mut model_operation_sequence,
                         deferred_tool_failure: &mut deferred_tool_failure,
+                        request_bounded: false,
                         turn_count,
                         tool_call_count,
                     };
@@ -8071,13 +8154,28 @@ where
         let mut route_stabilization_attempt = 0_u8;
         // At most once per request: the open run's own oversized tool results
         // give way (bounded for this request only) when they push the request
-        // past the provider cap, because no compaction folds the run's newest
-        // round. The unbounded measurement is kept: it is the true pressure
-        // the compaction trigger and its post-compaction baseline see, so a
+        // past the provider cap, or its composed input past the model's input
+        // budget (the context window less the output reserve, or the input
+        // ceiling), because no compaction folds the run's newest round. The
+        // unbounded measurements are kept: they are the true pressure the
+        // compaction trigger and its post-compaction baseline see, so a
         // compaction gets the first chance and the bounded request is only
         // what is sent when none commits.
-        let mut unbounded_request_pressure = None;
-        let (prepared_attempt, request_pressure) = loop {
+        //
+        // One measurement of each composed request serves the bound, the
+        // parked compaction check and the pre-dispatch refusal below. A
+        // committed rewrite returns `Repoll` and recomposes everything, so the
+        // fact can never outlive the request it describes.
+        //
+        // A measurement failure is deliberately not raised here. It stays owned
+        // by the refusal site further down, which is where it terminalized
+        // before the compaction check needed the same measurement: an
+        // unserializable tool definition must not preempt the byte-cap terminal
+        // and replace its typed `RequestTooLarge` cause with an internal error.
+        // The trigger sees an absent budget for that boundary and falls back to
+        // its other measures, and the bound sees no token overage.
+        let mut unbounded_request: Option<Box<UnboundedRequest>> = None;
+        let (prepared_attempt, request_pressure, request_context_budget_result) = loop {
             let attempt = match self.prepare_authorized_model_attempt(
                 Arc::clone(&request_messages),
                 Arc::clone(&call_tool_defs),
@@ -8113,27 +8211,34 @@ where
             };
             match attempt.request_pressure() {
                 Ok(pressure) => {
-                    if unbounded_request_pressure.is_none()
-                        && let Some(measured) = pressure
-                        && let Some(max_bytes) = self
-                            .compactor
-                            .as_ref()
-                            .and_then(|compactor| compactor.request_byte_cap(measured))
-                            .or(measured.max_bytes)
-                        && let Some(run_id) = self.runtime_started_run_id.as_ref()
-                        && let Some(bounded) =
-                            crate::agent::compact::bound_open_run_tool_results_for_request(
-                                &request_messages,
-                                run_id,
-                                measured.encoded_bytes,
-                                max_bytes,
-                            )
-                    {
-                        unbounded_request_pressure = Some(measured);
-                        request_messages = Arc::new(bounded);
+                    let profile = self.request_model_profile(*ctx.controller_feedback);
+                    let budget = self.context_budget_fact_for_profile(
+                        &request_messages,
+                        &call_tool_defs,
+                        prepared.effective_max_tokens,
+                        pressure,
+                        profile.as_ref(),
+                    );
+                    let bounded = if unbounded_request.is_none() {
+                        self.bound_open_run_request(
+                            &request_messages,
+                            pressure,
+                            budget.as_ref().ok().and_then(Option::as_ref),
+                            &[],
+                        )
+                    } else {
+                        None
+                    };
+                    if let Some(bounded) = bounded {
+                        unbounded_request = Some(Box::new(UnboundedRequest {
+                            pressure,
+                            budget: budget.ok().flatten(),
+                            bound: bounded.bound,
+                        }));
+                        request_messages = Arc::new(bounded.messages);
                         continue;
                     }
-                    break (attempt, pressure);
+                    break (attempt, pressure, budget);
                 }
                 Err(error)
                     if agent_error_is_authorization_route_changed(&error)
@@ -8194,37 +8299,24 @@ where
             }
         }
 
-        // One measurement of this exact composed request serves both the parked
-        // compaction check and the pre-dispatch refusal below. A committed
-        // rewrite returns `Repoll` and recomposes everything, so the fact can
-        // never outlive the request it describes.
-        //
-        // A measurement failure is deliberately not raised here. It stays owned
-        // by the refusal site further down, which is where it terminalized
-        // before the compaction check needed the same measurement: an
-        // unserializable tool definition must not preempt the byte-cap terminal
-        // and replace its typed `RequestTooLarge` cause with an internal error.
-        // The trigger sees an absent budget for that boundary and falls back to
-        // its other measures.
-        let profile = self.request_model_profile(*ctx.controller_feedback);
-        let request_context_budget_result = self.context_budget_fact_for_profile(
-            &request_messages,
-            &call_tool_defs,
-            prepared.effective_max_tokens,
-            request_pressure,
-            profile.as_ref(),
-        );
-
         if self.pending_compaction_boundary_index.is_some() {
             let prior_completed_boundary = self.compaction_cadence.last_compaction_boundary_index;
             let prior_message_count = self.session.messages().len();
-            self.pending_compaction_request_pressure =
-                unbounded_request_pressure.or(request_pressure);
-            self.pending_compaction_request_budget = request_context_budget_result
-                .as_ref()
-                .ok()
-                .cloned()
-                .flatten();
+            // The check measures the request as composed, before a bound
+            // shortened it for this request only.
+            let (compaction_pressure, compaction_budget) = match unbounded_request.as_deref() {
+                Some(unbounded) => (unbounded.pressure, unbounded.budget.clone()),
+                None => (
+                    request_pressure,
+                    request_context_budget_result
+                        .as_ref()
+                        .ok()
+                        .cloned()
+                        .flatten(),
+                ),
+            };
+            self.pending_compaction_request_pressure = compaction_pressure;
+            self.pending_compaction_request_budget = compaction_budget;
             let transition = TurnExecutionTransition {
                 prev_phase: TurnPhase::CallingLlm,
                 next_phase: TurnPhase::CallingLlm,
@@ -8288,6 +8380,23 @@ where
                 .complete_calling_llm_request_failure(ctx, prepared.in_extraction, error)
                 .await;
         }
+        // The request goes out bounded: announce the bound, record that the
+        // transcript holds content a request could not carry (the next run's
+        // first request would carry it whole again), and keep the answer from
+        // anchoring the input projection, since its count understates the
+        // transcript.
+        let bound = unbounded_request.map(|unbounded| unbounded.bound);
+        ctx.request_bounded = bound
+            .as_ref()
+            .is_some_and(|bound| !bound.results.is_empty());
+        if let Some(notice) = bound
+            .as_ref()
+            .and_then(crate::agent::compact::RequestBound::notice)
+        {
+            self.record_transcript_did_not_fit();
+            emit_phase_event!(self, ctx, notice);
+        }
+        let bounded_whole = bound.map(|bound| bound.whole).unwrap_or_default();
         let result = match self
             .call_llm_with_retry(LlmRetryRequest {
                 run_id: ctx.run_id,
@@ -8295,6 +8404,8 @@ where
                 assistant_message_id: prepared.assistant_message_id,
                 event_tx: ctx.event_tx,
                 messages: request_messages,
+                bounded_whole,
+                request_bounded: &mut ctx.request_bounded,
                 tools: call_tool_defs,
                 max_tokens: prepared.effective_max_tokens,
                 temperature: prepared.effective_temperature,
@@ -8432,15 +8543,19 @@ where
     /// ([`crate::compact::SessionCompactionCadence::last_answered_request`]):
     /// its presented tokens, the transcript rows it was composed from (its
     /// response is not in the transcript yet) and the provider and model that
-    /// counted them. An answered request also ends a context refusal. Only a
-    /// compactor reads the cadence, so an agent without one records nothing.
+    /// counted them. A request that carried the open run's own tool results
+    /// shortened (`request_bounded`) anchors nothing: it presented less than
+    /// the transcript holds, so the anchor stays on the request before it.
+    /// Only a compactor reads the cadence, so an agent without one records
+    /// nothing.
     fn record_answered_request(
         &mut self,
         presented_tokens: u64,
         provider: crate::Provider,
         model: &str,
+        request_bounded: bool,
     ) {
-        if self.compactor.is_none() {
+        if self.compactor.is_none() || request_bounded {
             return;
         }
         self.compaction_cadence.last_answered_request =
@@ -8450,16 +8565,14 @@ where
                 provider: provider.as_str().to_string(),
                 model: model.to_string(),
             });
-        self.compaction_cadence.last_context_refusal_boundary_index = None;
         self.persist_compaction_cadence_or_warn();
     }
 
     /// Record a main request the provider refused for not fitting the
-    /// model's context
-    /// ([`crate::compact::SessionCompactionCadence::last_context_refusal_boundary_index`]):
-    /// the refused request reported no usage, so without the fact the next
-    /// check would see what this one saw and send the same request again. The
-    /// refused run's own failure is unchanged.
+    /// model's context: the refused request reported no usage, so without the
+    /// fact the next check would see what this one saw and send the same
+    /// request again ([`Self::record_transcript_did_not_fit`]). The refused
+    /// run's own failure is unchanged.
     fn record_context_refusal(&mut self, error: &AgentError) {
         let refused_for_context = matches!(
             error,
@@ -8468,10 +8581,25 @@ where
                 ..
             }
         );
-        if self.compactor.is_none() || !refused_for_context {
+        if refused_for_context {
+            self.record_transcript_did_not_fit();
+        }
+    }
+
+    /// Record that the transcript holds content the main model request of
+    /// this boundary could not carry
+    /// ([`crate::compact::SessionCompactionCadence::last_context_refusal_boundary_index`]):
+    /// the provider refused the request for the model's context, or the
+    /// request carried the open run's own tool results shortened for it only.
+    /// Either way the next run's first request would carry the same content
+    /// again, so the next check whose compaction covers the whole transcript
+    /// compacts once. Only a compactor reads the cadence, so an agent without
+    /// one records nothing.
+    fn record_transcript_did_not_fit(&mut self) {
+        if self.compactor.is_none() {
             return;
         }
-        // The refused request's boundary: its check moved the index past it.
+        // The request's boundary: its check moved the index past it.
         self.compaction_cadence.last_context_refusal_boundary_index = Some(
             self.compaction_cadence
                 .session_boundary_index
@@ -8626,6 +8754,39 @@ where
             max_output_tokens,
             provider_request_pressure,
             self.active_model_profile.as_ref(),
+        )
+    }
+
+    /// The request `messages` with the open run's own tool results bounded
+    /// for it only, when the request is over the effective request byte cap
+    /// (`pressure`) or projects over the model's input budget (`budget`) and
+    /// the run's results can give way
+    /// ([`crate::agent::compact::bound_open_run_tool_results_for_request`]).
+    /// `whole` pairs results the request already carries shortened with the
+    /// whole results they were cut from.
+    fn bound_open_run_request(
+        &self,
+        messages: &[Message],
+        pressure: Option<crate::ProviderRequestPressure>,
+        budget: Option<&crate::ContextBudgetFact>,
+        whole: &[(crate::types::ToolResult, crate::types::ToolResult)],
+    ) -> Option<crate::agent::compact::BoundedRunRequest> {
+        let run_id = self.runtime_started_run_id.as_ref()?;
+        let request_bytes = pressure.and_then(|measured| {
+            self.compactor
+                .as_ref()
+                .and_then(|compactor| compactor.request_byte_cap(measured))
+                .or(measured.max_bytes)
+                .map(|max_bytes| (measured.encoded_bytes, max_bytes))
+        });
+        crate::agent::compact::bound_open_run_tool_results_for_request(
+            messages,
+            run_id,
+            crate::agent::compact::RequestOverage {
+                request_bytes,
+                context_tokens: budget.map(|budget| budget.overage_tokens),
+            },
+            whole,
         )
     }
 
@@ -8894,6 +9055,7 @@ where
                 turn_usage.presented_tokens(),
                 response_provider,
                 &response_model,
+                ctx.request_bounded,
             );
             self.session.record_turn_usage(turn_usage);
             self.run_request_usage.push(turn_usage.clone());
@@ -16664,13 +16826,13 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<crate::event::AgentEvent>(256);
         let second = agent.run_with_events("second".into(), tx).await;
         let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
-        if let Err(error) = &second {
-            panic!(
-                "the run completes with its result bounded for the request; requests refused \
-                 for context: {}; error: {error:?}",
-                client.refused()
-            );
-        }
+        assert!(
+            second.is_ok(),
+            "the run completes with its result bounded for the request; requests refused for \
+             context: {}; error: {:?}",
+            client.refused(),
+            second.err()
+        );
 
         assert_eq!(client.refused(), 0, "no request was refused for context");
         assert_eq!(client.summary_requests(), 1, "the earlier run folded first");

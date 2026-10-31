@@ -600,9 +600,13 @@ impl Compactor for DefaultCompactor {
         let projection_trigger = projection.is_some_and(|projection| {
             projection.projected_tokens() >= self.config.auto_compact_threshold
         });
-        // A request the provider refused for not fitting the model's context.
-        // It reported no usage, so no measure above moved since it was sent:
-        // without compacting, the next request is the same one again.
+        // A request that did not fit: the provider refused it for the model's
+        // context (it reported no usage, so no measure above moved since it
+        // was sent), or it carried the open run's own tool results shortened
+        // for that request only (the transcript keeps them whole). Either way,
+        // without compacting, the next request carries the same content again.
+        // The agent shows the fact only at a check whose compaction covers the
+        // whole transcript.
         let context_refused = ctx.last_context_refusal_boundary_index.is_some();
 
         // Cadence is a cost policy, not recovery authority. It may suppress a
@@ -656,10 +660,9 @@ impl Compactor for DefaultCompactor {
         // growth crossing waits for the cadence unless that growth covers the
         // window overage.
         //
-        // A context refusal is recovery by definition: the refused request
-        // did not fit, so it bypasses the threshold and the cadence. The
-        // attempt it causes clears it, committed or not, so one refusal costs
-        // one attempt.
+        // A request that did not fit is recovery by definition, so it bypasses
+        // the threshold and the cadence. The attempt it causes clears it,
+        // committed or not, so one refusal or bound costs one attempt.
         let history_floor_crosses = ctx
             .last_rewrite_history_tokens
             .is_some_and(|left| left >= self.config.auto_compact_threshold);

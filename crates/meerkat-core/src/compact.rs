@@ -23,15 +23,20 @@ pub struct SessionCompactionCadence {
     /// Boundary index where compaction was last attempted, successful or not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_compaction_attempt_boundary_index: Option<u64>,
-    /// Boundary index of the last main model request the provider refused
-    /// because it did not fit the model's context, while no compaction
-    /// attempt and no answered request has followed it.
+    /// Boundary index of the last main model request that did not fit: the
+    /// provider refused it because it did not fit the model's context, or it
+    /// carried the open run's own tool results shortened for that request
+    /// only. Kept until a compaction of the whole transcript is attempted.
     ///
-    /// A refused request reports no usage, so no measure moves and the next
-    /// run would send the same request again. The fact is the evidence for
-    /// [`CompactionContext::last_context_refusal_boundary_index`]: the next
-    /// check compacts once, and that attempt clears it whether it commits or
-    /// not. The run that was refused stays failed.
+    /// Either way the transcript holds content a request could not carry: a
+    /// refused request reports no usage, so no measure moves, and a shortened
+    /// result stays whole in the transcript, so the next run would send the
+    /// same content again. The fact is the evidence for
+    /// [`CompactionContext::last_context_refusal_boundary_index`], shown at a
+    /// check whose compaction covers the whole transcript (a run's first
+    /// check), since a compaction inside a run keeps the run's request and
+    /// newest round. That check compacts once, and the attempt clears the
+    /// fact whether it commits or not. The run that was refused stays failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_context_refusal_boundary_index: Option<u64>,
     /// Estimated history tokens the last compaction rewrite left: the
@@ -50,10 +55,12 @@ pub struct SessionCompactionCadence {
     /// Set when a response reports its usage, dropped by a committed
     /// transcript rewrite (and restored with the transcript when that
     /// rewrite rolls back), and dropped by the next check when the active
-    /// provider or model is not the one that counted it. Persisted, so an
-    /// agent rebuilt from its store projects its first request too. `None`
-    /// before the first answered request and for a session last written by a
-    /// binary that predates it.
+    /// provider or model is not the one that counted it. A response to a
+    /// request that carried the open run's own tool results shortened sets
+    /// nothing: that request presented less than the transcript holds.
+    /// Persisted, so an agent rebuilt from its store projects its first
+    /// request too. `None` before the first answered request and for a
+    /// session last written by a binary that predates it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_answered_request: Option<AnsweredRequestInput>,
 }
@@ -188,14 +195,18 @@ pub struct CompactionContext {
     /// model counted the last answer, and for a session last written by a
     /// binary that predates the anchor.
     pub projected_input_tokens: Option<InputTokenProjection>,
-    /// Boundary index of the last main request the provider refused for not
-    /// fitting the model's context, while no compaction attempt and no
-    /// answered request has followed it
+    /// Boundary index of the last main request that did not fit, refused by
+    /// the provider for the model's context or sent with the open run's own
+    /// tool results shortened, until a compaction of the whole transcript is
+    /// attempted
     /// ([`SessionCompactionCadence::last_context_refusal_boundary_index`]).
+    /// Set only at a check whose compaction covers the whole transcript (a
+    /// run's first check): inside a run a compaction keeps the run's request
+    /// and newest round, which hold what did not fit.
     ///
-    /// The refused request reported no usage, so no other measure here moved
-    /// since it was sent; without compacting, the next request is the same
-    /// one again.
+    /// No other measure here shows it: a refused request reported no usage,
+    /// and a shortened result stays whole in the transcript, so without
+    /// compacting the next request carries the same content again.
     pub last_context_refusal_boundary_index: Option<u64>,
 }
 
@@ -452,8 +463,10 @@ impl Default for CompactionConfig {
 /// Serialized source bytes a model-derived summarization budget allows per
 /// token of the summarizing model's input window: half the transcript
 /// estimator's four bytes per token, so a source that tokenizes densely
-/// (code, JSON, non-Latin scripts) still fits the window.
-const SUMMARIZATION_SOURCE_BYTES_PER_TOKEN: u64 = 2;
+/// (code, JSON, non-Latin scripts) still fits the window. The request-only
+/// bound of an open run's tool results converts its token room to bytes at
+/// the same rate.
+pub(crate) const SUMMARIZATION_SOURCE_BYTES_PER_TOKEN: u64 = 2;
 /// Fraction of the compaction threshold available to the source when the
 /// summarizing model declares no context window. The threshold is normally
 /// four-fifths of a context window; a quarter of it leaves room for JSON

@@ -9,7 +9,7 @@ use crate::compact::{
     CompactionResult, CompactionRetained, CompactionSummary, CompactionWindow, Compactor,
     SESSION_COMPACTION_CADENCE_KEY, SessionCompactionCadence,
 };
-use crate::event::AgentEvent;
+use crate::event::{AgentEvent, BoundedToolResult, ToolResultBoundAxis};
 #[cfg(target_arch = "wasm32")]
 use crate::tokio;
 use crate::types::{AssistantBlock, Message, StopReason, TurnUsage, Usage};
@@ -1122,26 +1122,101 @@ fn rebuild_open_run_rounds(
 /// The least a bounded tool result of the open run keeps of its text.
 const MIN_BOUNDED_RUN_RESULT_BYTES: usize = 4 * 1024;
 
-/// The model request `request` with the open run's oversized tool results
-/// bounded, when the request (`encoded_bytes`) exceeds `max_bytes` and the
-/// run's own results are what can give way. `None` when nothing is bounded.
+/// How far one model request is over the limits that the open run's own
+/// tool results can give way to, for that request only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RequestOverage {
+    /// The provider-lowered body's encoded bytes and the effective request
+    /// byte cap; over only when the first is the larger.
+    pub(crate) request_bytes: Option<(u64, u64)>,
+    /// Tokens the composed request's input projects over the model's input
+    /// budget, the context window less the output reserve or the input
+    /// ceiling ([`crate::ContextBudgetFact::overage_tokens`]); over only when
+    /// above zero.
+    pub(crate) context_tokens: Option<u64>,
+}
+
+/// A model request that carries the open run's own tool results bounded for
+/// it only.
+#[derive(Debug)]
+pub(crate) struct BoundedRunRequest {
+    /// The request as it is sent.
+    pub(crate) messages: Vec<Message>,
+    /// What the bound did to it.
+    pub(crate) bound: RequestBound,
+}
+
+/// The open run's tool results one model request carries shortened.
+#[derive(Debug)]
+pub(crate) struct RequestBound {
+    /// The run whose results the request carries shortened.
+    pub(crate) run_id: crate::lifecycle::RunId,
+    /// The shortened results, in request order. Empty when the bound only
+    /// gave back whole the results an earlier bound of the request shortened.
+    pub(crate) results: Vec<BoundedToolResult>,
+    /// The limit that set the share each result keeps.
+    pub(crate) axis: ToolResultBoundAxis,
+    /// Each shortened result as the request carries it, with the whole result
+    /// it was cut from, so a later bound of the same request (after a model
+    /// fallback) cuts from the whole result again.
+    pub(crate) whole: Vec<(crate::types::ToolResult, crate::types::ToolResult)>,
+}
+
+impl RequestBound {
+    /// The notice announcing this bound; `None` when the request carries no
+    /// result shortened.
+    pub(crate) fn notice(&self) -> Option<AgentEvent> {
+        (!self.results.is_empty()).then(|| AgentEvent::ToolResultsBoundedForRequest {
+            run_id: self.run_id.clone(),
+            results: self.results.clone(),
+            axis: self.axis,
+        })
+    }
+}
+
+/// The model request `request` with the open run's own oversized tool
+/// results bounded for it only, when the request is over a limit in
+/// `overage` that the run's results can give way to: the request byte cap,
+/// or the model's input budget. `None` when the request is over no limit,
+/// holds no result of the run, or would be sent as it is.
 ///
 /// A compaction never folds the open run's newest round, so a run whose own
-/// tool results are larger than the provider accepts would fail every
-/// request. For this request only, each result in a tool-results row of the
-/// run (after the run's floor in the request, whose rows keep their
+/// tool results are larger than the provider or the model takes would fail
+/// every request. For this request only, each result in a tool-results row
+/// of the run (after the run's floor in the request, whose rows keep their
 /// identity) that answers a call the run made keeps its identity
 /// (`tool_use_id`, `is_error`) and the head of its text, with a marker
 /// naming the call, so the model still sees every call it made and that its
 /// result was cut. An earlier run's result is never bounded, even under a
 /// reused call id. The stored transcript keeps every result whole.
+///
+/// Each result keeps an equal share of the room the rest of the request
+/// leaves the run's results, less a tenth for the markers and the provider's
+/// escaping of the heads, and at least [`MIN_BOUNDED_RUN_RESULT_BYTES`]; over
+/// both limits, the smaller share, whose limit is the bound's axis. On the
+/// byte axis the room is the cap less the request's other bytes. On the
+/// token axis it is the estimated tokens of the run's results less the
+/// overage, at two bytes a token
+/// ([`crate::compact::SUMMARIZATION_SOURCE_BYTES_PER_TOKEN`]): the estimator
+/// counts four, so a head of dense text (JSON, code) still fits.
+///
+/// `whole` pairs results the request already carries shortened (by an
+/// earlier bound, before a model fallback) with the results they were cut
+/// from: each is cut again from its whole result, or given back whole when
+/// that fits the share.
 pub(crate) fn bound_open_run_tool_results_for_request(
     request: &[Message],
     run_id: &crate::lifecycle::RunId,
-    encoded_bytes: u64,
-    max_bytes: u64,
-) -> Option<Vec<Message>> {
-    if encoded_bytes <= max_bytes {
+    overage: RequestOverage,
+    whole: &[(crate::types::ToolResult, crate::types::ToolResult)],
+) -> Option<BoundedRunRequest> {
+    let over_bytes = overage
+        .request_bytes
+        .filter(|(encoded_bytes, max_bytes)| encoded_bytes > max_bytes);
+    let over_tokens = overage
+        .context_tokens
+        .filter(|overage_tokens| *overage_tokens > 0);
+    if over_bytes.is_none() && over_tokens.is_none() {
         return None;
     }
     let floor = open_run_floor(request, run_id)?;
@@ -1172,62 +1247,101 @@ pub(crate) fn bound_open_run_tool_results_for_request(
     if run_results.is_empty() {
         return None;
     }
-    let run_bytes = run_results
-        .iter()
-        .map(|result| content_bytes(result))
-        .fold(0usize, usize::saturating_add);
-    let encoded = usize::try_from(encoded_bytes).unwrap_or(usize::MAX);
-    let cap = usize::try_from(max_bytes).unwrap_or(usize::MAX);
-    // What the rest of the request leaves, with a tenth kept for the markers
-    // and the provider's escaping of the heads.
-    let other_bytes = encoded.saturating_sub(run_bytes);
-    let room = cap.saturating_sub(other_bytes) / 10 * 9;
-    let share = (room / run_results.len()).max(MIN_BOUNDED_RUN_RESULT_BYTES);
-    let mut bounded_any = false;
-    let bounded = request
-        .iter()
-        .enumerate()
-        .map(|(offset, message)| {
-            let Message::ToolResults {
-                results,
-                created_at,
-            } = message
-            else {
-                return message.clone();
+    let count = run_results.len();
+    // What a limit leaves the run's results, with a tenth kept for the
+    // markers and the provider's escaping of the heads.
+    let share_of = |room: usize| (room / 10 * 9 / count).max(MIN_BOUNDED_RUN_RESULT_BYTES);
+    let byte_share = over_bytes.map(|(encoded_bytes, max_bytes)| {
+        let run_bytes = run_results
+            .iter()
+            .map(|result| content_bytes(result))
+            .fold(0usize, usize::saturating_add);
+        let encoded = usize::try_from(encoded_bytes).unwrap_or(usize::MAX);
+        let cap = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+        let other_bytes = encoded.saturating_sub(run_bytes);
+        share_of(cap.saturating_sub(other_bytes))
+    });
+    let token_share = over_tokens.map(|overage_tokens| {
+        let run_tokens = run_results
+            .iter()
+            .map(|result| estimate_content_blocks(&result.content).0)
+            .fold(0u64, u64::saturating_add);
+        let room = run_tokens
+            .saturating_sub(overage_tokens)
+            .saturating_mul(crate::compact::SUMMARIZATION_SOURCE_BYTES_PER_TOKEN);
+        share_of(usize::try_from(room).unwrap_or(usize::MAX))
+    });
+    let (share, axis) = match (byte_share, token_share) {
+        (Some(bytes), Some(tokens)) if tokens < bytes => {
+            (tokens, ToolResultBoundAxis::ContextWindow)
+        }
+        (Some(bytes), _) => (bytes, ToolResultBoundAxis::RequestBytes),
+        (None, Some(tokens)) => (tokens, ToolResultBoundAxis::ContextWindow),
+        (None, None) => return None,
+    };
+    let mut messages = Vec::with_capacity(request.len());
+    let mut shortened = Vec::new();
+    let mut pairs = Vec::new();
+    let mut changed = false;
+    for (offset, message) in request.iter().enumerate() {
+        let Message::ToolResults {
+            results,
+            created_at,
+        } = message
+        else {
+            messages.push(message.clone());
+            continue;
+        };
+        if offset < floor {
+            messages.push(message.clone());
+            continue;
+        }
+        let mut row = Vec::with_capacity(results.len());
+        for result in results {
+            let Some(name) = run_calls.get(result.tool_use_id.as_str()) else {
+                row.push(result.clone());
+                continue;
             };
-            if offset < floor {
-                return message.clone();
-            }
-            let results = results
+            let source = whole
                 .iter()
-                .map(|result| {
-                    let Some(name) = run_calls.get(result.tool_use_id.as_str()) else {
-                        return result.clone();
-                    };
-                    if content_bytes(result) <= share {
-                        return result.clone();
-                    }
-                    bounded_any = true;
-                    bounded_run_tool_result(result, name, share)
-                })
-                .collect();
-            Message::ToolResults {
-                results,
-                created_at: *created_at,
+                .find(|(carried, _)| carried == result)
+                .map_or(result, |(_, uncut)| uncut);
+            if content_bytes(source) <= share {
+                changed |= source != result;
+                row.push(source.clone());
+                continue;
             }
-        })
-        .collect::<Vec<_>>();
-    bounded_any.then_some(bounded)
+            let (bounded, fact) = bounded_run_tool_result(source, name, share);
+            changed |= bounded != *result;
+            pairs.push((bounded.clone(), source.clone()));
+            shortened.push(fact);
+            row.push(bounded);
+        }
+        messages.push(Message::ToolResults {
+            results: row,
+            created_at: *created_at,
+        });
+    }
+    changed.then(|| BoundedRunRequest {
+        messages,
+        bound: RequestBound {
+            run_id: run_id.clone(),
+            results: shortened,
+            axis,
+            whole: pairs,
+        },
+    })
 }
 
 /// `result` with its content cut to the first `max_text_bytes` bytes of its
 /// text projection (media as placeholders) and a model-visible marker naming
-/// the tool call and how much of its result this request shows.
+/// the tool call and how much of its result this request shows, with the
+/// typed account of the cut.
 fn bounded_run_tool_result(
     result: &crate::types::ToolResult,
     tool_name: &str,
     max_text_bytes: usize,
-) -> crate::types::ToolResult {
+) -> (crate::types::ToolResult, BoundedToolResult) {
     let text = result
         .content
         .iter()
@@ -1253,7 +1367,13 @@ fn bounded_run_tool_result(
             ),
         },
     ];
-    bounded
+    let fact = BoundedToolResult {
+        tool_use_id: result.tool_use_id.clone(),
+        tool_name: tool_name.to_string(),
+        kept_bytes: u64::try_from(kept).unwrap_or(u64::MAX),
+        total_bytes: u64::try_from(text.len()).unwrap_or(u64::MAX),
+    };
+    (bounded, fact)
 }
 
 /// Whether `rows` hold anything a rewrite can fold: a response (an
@@ -3936,21 +4056,68 @@ mod tests {
         .expect("the rebuild is valid");
     }
 
+    /// `encoded_bytes` of request against the request byte cap `max_bytes`.
+    fn over_cap(encoded_bytes: u64, max_bytes: u64) -> RequestOverage {
+        RequestOverage {
+            request_bytes: Some((encoded_bytes, max_bytes)),
+            context_tokens: None,
+        }
+    }
+
+    /// A request `overage_tokens` over the model's input budget.
+    fn over_window(overage_tokens: u64) -> RequestOverage {
+        RequestOverage {
+            request_bytes: None,
+            context_tokens: Some(overage_tokens),
+        }
+    }
+
+    /// The text blocks of the first result in the tool-results row at
+    /// `offset` of `request`.
+    fn result_texts(request: &[Message], offset: usize) -> Vec<String> {
+        let Message::ToolResults { results, .. } = &request[offset] else {
+            panic!("row {offset} is a tool-results row");
+        };
+        results[0]
+            .content
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text { text } => text.clone(),
+                _ => panic!("the result holds text only"),
+            })
+            .collect()
+    }
+
     /// The open run's own result alone exceeds the provider cap. For that
     /// request only, the result keeps its identity and the head of its text
     /// with a marker naming the call; every other row is unchanged, and a
-    /// request within the cap is left alone.
+    /// request within the cap is left alone. The bound names the call, both
+    /// sizes and the request-byte axis, and its notice announces them.
     #[test]
     fn an_over_cap_open_run_result_is_bounded_for_the_request_only() {
         let run_id = crate::lifecycle::RunId::new();
         let request = run_rows(&run_id, 600_000);
 
         assert!(
-            bound_open_run_tool_results_for_request(&request, &run_id, 90_000, 100_000).is_none(),
+            bound_open_run_tool_results_for_request(
+                &request,
+                &run_id,
+                over_cap(90_000, 100_000),
+                &[]
+            )
+            .is_none(),
             "a request within the cap is sent as composed"
         );
-        let bounded = bound_open_run_tool_results_for_request(&request, &run_id, 700_000, 100_000)
-            .expect("the over-cap request is bounded");
+        let BoundedRunRequest {
+            messages: bounded,
+            bound,
+        } = bound_open_run_tool_results_for_request(
+            &request,
+            &run_id,
+            over_cap(700_000, 100_000),
+            &[],
+        )
+        .expect("the over-cap request is bounded");
 
         assert_eq!(bounded.len(), request.len());
         for offset in 0..4 {
@@ -3996,16 +4163,183 @@ mod tests {
             marker.contains("600000"),
             "the marker states the full size: {marker}"
         );
+        assert_eq!(bound.run_id, run_id);
+        assert_eq!(bound.axis, ToolResultBoundAxis::RequestBytes);
+        assert_eq!(
+            bound.results,
+            vec![BoundedToolResult {
+                tool_use_id: "tc_1".to_string(),
+                tool_name: "list_records".to_string(),
+                kept_bytes: u64::try_from(head.len()).unwrap(),
+                total_bytes: 600_000,
+            }]
+        );
+        let Some(AgentEvent::ToolResultsBoundedForRequest {
+            run_id: announced_run,
+            results: announced,
+            axis: ToolResultBoundAxis::RequestBytes,
+        }) = bound.notice()
+        else {
+            panic!("the bound is announced on its axis");
+        };
+        assert_eq!(announced_run, run_id);
+        assert_eq!(announced, bound.results);
 
         assert!(
             bound_open_run_tool_results_for_request(
                 &request,
                 &crate::lifecycle::RunId::new(),
-                700_000,
-                100_000
+                over_cap(700_000, 100_000),
+                &[]
             )
             .is_none(),
             "another run's results are never bounded"
+        );
+    }
+
+    /// The open run's 400 KB result (100k estimated tokens) in a request 60k
+    /// tokens over the model's input budget keeps the 40k tokens left, at two
+    /// bytes a token, less a tenth for the marker: a 72,000-byte head, on the
+    /// context-window axis, with the whole size in the marker and the
+    /// account. A request within the budget is sent as composed, and an
+    /// overage the run's results cannot cover leaves the least head.
+    #[test]
+    fn an_open_run_result_over_the_input_budget_keeps_its_token_room() {
+        let run_id = crate::lifecycle::RunId::new();
+        let request = run_rows(&run_id, 400_000);
+
+        assert!(
+            bound_open_run_tool_results_for_request(&request, &run_id, over_window(0), &[])
+                .is_none(),
+            "a request within the budget is sent as composed"
+        );
+        let bounded =
+            bound_open_run_tool_results_for_request(&request, &run_id, over_window(60_000), &[])
+                .expect("the request over the budget is bounded");
+        let texts = result_texts(&bounded.messages, 4);
+        assert_eq!(texts.len(), 2, "the head and the marker");
+        assert_eq!(
+            texts[0].len(),
+            72_000,
+            "40k tokens left, at two bytes a token, less a tenth"
+        );
+        assert!(
+            texts[1].contains("400000"),
+            "the marker states the whole size: {}",
+            texts[1]
+        );
+        assert_eq!(bounded.bound.axis, ToolResultBoundAxis::ContextWindow);
+        assert_eq!(
+            bounded.bound.results,
+            vec![BoundedToolResult {
+                tool_use_id: "tc_1".to_string(),
+                tool_name: "list_records".to_string(),
+                kept_bytes: 72_000,
+                total_bytes: 400_000,
+            }]
+        );
+
+        let starved =
+            bound_open_run_tool_results_for_request(&request, &run_id, over_window(500_000), &[])
+                .expect("an overage past the run's results still bounds them");
+        assert_eq!(
+            result_texts(&starved.messages, 4)[0].len(),
+            MIN_BOUNDED_RUN_RESULT_BYTES,
+            "the least head"
+        );
+    }
+
+    /// Over both limits, the smaller share bounds the request and names its
+    /// axis: against a 400 KB cap the model's input budget leaves less room,
+    /// against a 100 KB cap the cap does.
+    #[test]
+    fn over_both_limits_the_smaller_share_bounds_and_names_its_axis() {
+        let run_id = crate::lifecycle::RunId::new();
+        let request = run_rows(&run_id, 400_000);
+        let both = |max_bytes: u64| RequestOverage {
+            request_bytes: Some((450_000, max_bytes)),
+            context_tokens: Some(60_000),
+        };
+
+        let window = bound_open_run_tool_results_for_request(&request, &run_id, both(400_000), &[])
+            .expect("over both limits");
+        assert_eq!(window.bound.axis, ToolResultBoundAxis::ContextWindow);
+        assert_eq!(result_texts(&window.messages, 4)[0].len(), 72_000);
+
+        let cap = bound_open_run_tool_results_for_request(&request, &run_id, both(100_000), &[])
+            .expect("over both limits");
+        assert_eq!(cap.bound.axis, ToolResultBoundAxis::RequestBytes);
+        let head = result_texts(&cap.messages, 4)[0].len();
+        assert!(
+            head < 72_000 && head >= MIN_BOUNDED_RUN_RESULT_BYTES,
+            "the cap leaves the smaller head: {head}"
+        );
+    }
+
+    /// A request that already carries the result shortened (after a model
+    /// fallback the bounded request is measured against the new model) is
+    /// bounded again from the whole result its pairs name: the new head is a
+    /// prefix of the whole text, and the marker and the account state the
+    /// whole size. Without the pairs the shortened text would pass for the
+    /// whole result.
+    #[test]
+    fn a_bound_of_a_bounded_request_cuts_again_from_the_whole_result() {
+        let run_id = crate::lifecycle::RunId::new();
+        let request = run_rows(&run_id, 400_000);
+        let first =
+            bound_open_run_tool_results_for_request(&request, &run_id, over_window(60_000), &[])
+                .expect("the request over the budget is bounded");
+        let carried_bytes =
+            u64::try_from(serde_json::to_vec(&first.messages).unwrap().len()).unwrap();
+
+        let again = bound_open_run_tool_results_for_request(
+            &first.messages,
+            &run_id,
+            over_cap(carried_bytes, 40_000),
+            &first.bound.whole,
+        )
+        .expect("the bounded request over the fallback's cap is bounded again");
+        let texts = result_texts(&again.messages, 4);
+        assert!(
+            texts[0].len() < 72_000 && texts[0].len() >= MIN_BOUNDED_RUN_RESULT_BYTES,
+            "the cap leaves a smaller head: {}",
+            texts[0].len()
+        );
+        assert!(
+            texts[0].bytes().all(|byte| byte == b'r'),
+            "the head is the start of the whole result"
+        );
+        assert!(
+            texts[1].contains("400000"),
+            "the marker states the whole size: {}",
+            texts[1]
+        );
+        assert_eq!(again.bound.axis, ToolResultBoundAxis::RequestBytes);
+        assert_eq!(again.bound.results.len(), 1);
+        assert_eq!(again.bound.results[0].total_bytes, 400_000);
+        assert_eq!(
+            again.bound.results[0].kept_bytes,
+            u64::try_from(texts[0].len()).unwrap()
+        );
+        let [(carried, uncut)] = again.bound.whole.as_slice() else {
+            panic!("the one shortened result is paired with its whole result");
+        };
+        let Message::ToolResults { results, .. } = &again.messages[4] else {
+            panic!("the run's result row");
+        };
+        assert_eq!(carried, &results[0]);
+        assert_eq!(uncut.text_content().len(), 400_000);
+
+        let blind = bound_open_run_tool_results_for_request(
+            &first.messages,
+            &run_id,
+            over_cap(carried_bytes, 40_000),
+            &[],
+        )
+        .expect("the bounded request over the fallback's cap is bounded again");
+        assert_ne!(
+            blind.bound.results[0].total_bytes, 400_000,
+            "without the pairs the shortened text passes for the whole result"
         );
     }
 
@@ -4025,8 +4359,14 @@ mod tests {
             call_row(Some(&run), "tc_1"),
             result_row("tc_1", 300_000),
         ];
-        let bounded = bound_open_run_tool_results_for_request(&request, &run, 700_000, 100_000)
-            .expect("the over-cap request is bounded");
+        let bounded = bound_open_run_tool_results_for_request(
+            &request,
+            &run,
+            over_cap(700_000, 100_000),
+            &[],
+        )
+        .expect("the over-cap request is bounded")
+        .messages;
         assert_eq!(
             bounded[2], request[2],
             "the earlier run's result is untouched"
