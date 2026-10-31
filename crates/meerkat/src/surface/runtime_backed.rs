@@ -2143,6 +2143,28 @@ impl<B: SessionAgentBuilder + 'static> CoreExecutorInterruptHandle
             })
             .map_err(|error| CoreExecutorError::control_failed_runtime(error.to_string()))
     }
+
+    /// Suspend the exact run, as a graceful requeue stop asks and a stop at a
+    /// store fence gap does: the turn is dropped as a hard interrupt drops
+    /// it, and the run ends suspended, its last round commit kept.
+    async fn suspend_run_if_current(
+        &self,
+        expected_run_id: &meerkat_core::RunId,
+        _reason: String,
+    ) -> Result<bool, CoreExecutorError> {
+        self.service
+            .suspend_run_with_machine_authority(
+                &self.session_id,
+                expected_run_id,
+                self.adapter.session_control_authority(),
+            )
+            .await
+            .or_else(|error| match error {
+                SessionError::NotRunning { .. } => Ok(false),
+                error => Err(error),
+            })
+            .map_err(|error| CoreExecutorError::control_failed_runtime(error.to_string()))
+    }
 }
 
 impl<B: SessionAgentBuilder + 'static> PersistentRuntimeExecutor<B> {

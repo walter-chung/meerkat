@@ -12297,6 +12297,37 @@ impl meerkat_core::lifecycle::CoreExecutorInterruptHandle for CliRuntimeInterrup
                 )
             })
     }
+
+    /// Suspend the exact run of a persistent session, as a graceful requeue
+    /// stop asks and a stop at a store fence gap does; a session without one
+    /// cannot suspend, and its stop is a hard interrupt.
+    async fn suspend_run_if_current(
+        &self,
+        expected_run_id: &meerkat_core::RunId,
+        _reason: String,
+    ) -> Result<bool, meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+        #[cfg(feature = "session-store")]
+        if let Some(persistent) = self.persistent_service.as_ref() {
+            return persistent
+                .suspend_run_with_machine_authority(
+                    &self.session_id,
+                    expected_run_id,
+                    self.runtime_adapter.session_control_authority(),
+                )
+                .await
+                .or_else(|err| match err {
+                    meerkat::SessionError::NotRunning { .. } => Ok(false),
+                    err => Err(err),
+                })
+                .map_err(|err| {
+                    meerkat_core::lifecycle::core_executor::CoreExecutorError::control_failed_runtime(
+                        err.to_string(),
+                    )
+                });
+        }
+        let _ = expected_run_id;
+        Ok(false)
+    }
 }
 
 #[async_trait::async_trait]

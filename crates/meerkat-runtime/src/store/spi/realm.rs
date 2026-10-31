@@ -577,6 +577,11 @@ pub struct SpiRealm {
     fence_gate: tokio::sync::RwLock<()>,
     /// Serializes re-acquires.
     renew_gate: Mutex<()>,
+    /// The re-acquire [`Self::ensure_lease`] runs on a task of its own, while
+    /// one is in flight: every caller of a stopped writer waits on that one
+    /// attempt, so waits that give up during an outage leave one attempt
+    /// behind them, not one each.
+    reacquire_in_flight: StdMutex<Option<SharedReacquire>>,
     /// The version of every visible scope as this writer last saw or wrote
     /// it: a re-acquire compares a fresh listing with it to prove no other
     /// writer committed while this one was stopped.
@@ -624,11 +629,11 @@ impl SelfFence for SpiRealm {
 
     /// While the window is open, the reading as it is: a clock read, no
     /// store I/O. Otherwise the dispatch waits for the re-acquire a write
-    /// would wait for ([`SpiRealm::ensure_lease`]: it waits behind a
-    /// re-acquire in flight and, when that one did not resume the writer,
-    /// runs one of its own, on a task of its own, so giving up on it leaves
-    /// it running), for at most [`SpiRealm::dispatch_wait_bound`], and reads
-    /// the window again: open only when a re-acquire resumed the writer. A
+    /// would wait for ([`SpiRealm::ensure_lease`]: it joins the re-acquire in
+    /// flight, or starts one on a task of its own when none is, so the realm
+    /// runs one at a time and giving up on it leaves that one running), for
+    /// at most [`SpiRealm::dispatch_wait_bound`], and reads the window again:
+    /// open only when a re-acquire resumed the writer. A
     /// re-acquire that fails without proving another writer (the store
     /// refused an acquire, or the renew after it failed) is tried again
     /// after one renew interval, as the realm's own renewal does, until the
@@ -718,6 +723,20 @@ pub(crate) fn dispatch_wait_bound(
         .saturating_add(renew_timeout)
 }
 
+/// The re-acquire in flight, shared by every caller that waits on it.
+type SharedReacquire =
+    futures::future::Shared<futures::future::BoxFuture<'static, Result<(), SpiError>>>;
+
+/// Clears the realm's re-acquire slot when the re-acquire task ends, however
+/// it ends.
+struct ClearReacquireInFlight(Arc<SpiRealm>);
+
+impl Drop for ClearReacquireInFlight {
+    fn drop(&mut self) {
+        *lock(&self.0.reacquire_in_flight) = None;
+    }
+}
+
 fn lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
@@ -772,6 +791,7 @@ impl SpiRealm {
             stopped: AtomicBool::new(false),
             fence_gate: tokio::sync::RwLock::new(()),
             renew_gate: Mutex::new(()),
+            reacquire_in_flight: StdMutex::new(None),
             known_heads: StdMutex::new(HashMap::new()),
             uncertain: StdMutex::new(HashMap::new()),
             realm_poison: StdMutex::new(None),
@@ -940,18 +960,40 @@ impl SpiRealm {
             return Ok(());
         }
         self.stop("the self-fence window closed");
-        // The re-acquire runs on a task of its own: a caller dropped
-        // after the host granted a token must not leave that token
-        // unrecorded, or the next renew would answer fenced out.
+        self.shared_reacquire()?.await
+    }
+
+    /// The re-acquire every caller of a stopped writer waits on: the one in
+    /// flight, or a new one when none is. It runs on a task of its own: a
+    /// caller dropped after the host granted a token must not leave that
+    /// token unrecorded, or the next renew would answer fenced out. The task
+    /// clears the slot as it ends, so the next caller of a writer still
+    /// stopped starts the next attempt.
+    fn shared_reacquire(&self) -> Result<SharedReacquire, SpiError> {
+        use futures::FutureExt as _;
+        let mut slot = lock(&self.reacquire_in_flight);
+        if let Some(attempt) = slot.as_ref() {
+            return Ok(attempt.clone());
+        }
         let Some(realm) = self.me.upgrade() else {
             return Err(SpiError::LeaseLapsed("the realm is closing".into()));
         };
-        match tokio::spawn(async move { realm.reacquire().await }).await {
-            Ok(outcome) => outcome,
-            Err(error) => Err(SpiError::LeaseLapsed(format!(
-                "the re-acquire task failed: {error}"
-            ))),
+        let task = tokio::spawn(async move {
+            let _clear = ClearReacquireInFlight(Arc::clone(&realm));
+            realm.reacquire().await
+        });
+        let attempt = async move {
+            match task.await {
+                Ok(outcome) => outcome,
+                Err(error) => Err(SpiError::LeaseLapsed(format!(
+                    "the re-acquire task failed: {error}"
+                ))),
+            }
         }
+        .boxed()
+        .shared();
+        *slot = Some(attempt.clone());
+        Ok(attempt)
     }
 
     /// Acquire the fence again after a stop, and resume only when no other

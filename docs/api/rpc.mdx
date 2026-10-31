@@ -1475,7 +1475,11 @@ The call returns once every contributor has reached its terminal. The receipt
 - `stopped`: the run was current. `contributors` lists every input bound to it,
   with the delivered `completion` class and the committed `terminal` class. A
   cancelled joined steer reports `completion: "runtime_terminated"` with
-  `terminal: "cancelled"`; read `terminal` for the lifecycle fact.
+  `terminal: "cancelled"`; read `terminal` for the lifecycle fact. A run a
+  store fence gap suspended, or one whose session store's writer is stopped,
+  is stopped without waiting: `contributors` is empty, the run never
+  resumes, and its inputs end `cancelled` once the store takes writes again;
+  read their outcome later.
 - `not_current`: the run is no longer (or never was) current. Nothing was
   touched, and newer runs and queued input are not interrupted.
 - `not_stoppable`: the run is still bound, but a runtime stop or teardown owns

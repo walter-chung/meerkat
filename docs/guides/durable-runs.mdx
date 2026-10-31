@@ -437,9 +437,9 @@ fence:
   background. After a failed renew, or once its self-fence window has
   closed, the holder writes nothing and dispatches nothing until it
   acquires the fence again with a new token, which it does by itself before
-  its next write; if another process took the fence or committed meanwhile,
-  the realm stops until it is opened again. A later renew never restores
-  it. A renew answered `FencedOut` means another process holds the fence,
+  its next write, one attempt at a time however many writes and runs wait
+  for it; if another process took the fence or committed meanwhile, the
+  realm stops until it is opened again. A later renew never restores it. A renew answered `FencedOut` means another process holds the fence,
   and the realm stops until it is opened again.
 - **A stop is a pause.** A run that reaches a model call or a tool call
   while the holder is stopped (a renew failed or timed out, or its window
@@ -459,14 +459,22 @@ fence:
   yet. The gap may last any number of waits. A round commit that meets
   the stopped holder waits and suspends the run the same way (the commit
   is written again, once, when the acquire succeeds within the wait); the
-  round it was writing is done again on resume, as after a crash. A turn
+  round it was writing is done again on resume, as after a crash. A
+  closing save (the write after the run's final answer) waits and is
+  written again the same way, but it cannot suspend the run, whose turn
+  has already ended: a gap that outlasts its wait fails the turn. A turn
   that no runtime run backs (a direct turn) fails with a retryable storage
   error instead.
 - **A stop asked of the run still ends it.** A cancel the run accepted
-  before the gap, or an interrupt or a stop of the suspended run, ends the
-  run: it never resumes, and once the fence is back it is settled, its
-  inputs abandoned as cancelled. Ending it needs a write, so it ends only
-  then.
+  before the gap, an interrupt or a stop that reaches the run while the
+  holder is stopped (which suspends the run rather than interrupting it),
+  or an interrupt or a stop of the suspended run, ends the run: it never
+  resumes. Callers waiting on its inputs are answered
+  `requeued_across_stop` within the wait, as for any suspended run, and
+  once the fence is back the run is settled, its inputs abandoned as
+  cancelled. Ending it needs a write, so it ends only then. A stop of such
+  a run returns at once and lists no contributor: read the inputs' outcome
+  later. A graceful stop that requeues keeps none of its inputs.
 - **Another process ends this one's runs.** When the acquire finds that
   another process holds the fence or committed meanwhile, or a renew or a
   commit is answered `FencedOut`, the run is refused and the live session
@@ -613,11 +621,21 @@ Before you run a host store in production, run the host store chapter of the
   whose member turn a fence gap suspends reads the `requeued_across_stop`
   answer as a stop's and ends; the member's input still runs once the fence
   is back, with no one waiting for it.
-- A stop asked of a suspended run is kept in memory until the fence is
-  back: a process that ends before then loses it, and the next start
-  resumes the run. A cancel at the next boundary (`cancel_after_boundary`)
-  asked while the run is suspended finds no running turn and is refused;
-  interrupt or stop the run instead.
+- A stop intent of a suspended run (a cancel it accepted before the gap,
+  or a stop or an interrupt at the fence or during the gap) is kept in
+  memory until the fence is back: a process that ends before then loses it,
+  and the next start resumes the run; another process that takes the
+  session over runs its inputs; and a host runtime that stops under the
+  session, whose registration then reloads, loses it too. A cancel at the
+  next boundary (`cancel_after_boundary`) asked while the run is suspended
+  finds no running turn and is refused; interrupt or stop the run instead.
+  A stop that races the gap's own suspension of the run can fail with an
+  internal error naming an input whose wait was answered
+  `requeued_across_stop`; read the inputs' outcome later.
+- A gap that outlasts the wait at a run's closing save, after its final
+  answer, still fails the turn and tears the live session down: the turn's
+  terminal is recorded before that save, so the run cannot be suspended
+  there.
 - A gap met while a run re-bases its session (after a compaction, on a
   WholeBlob realm whose store supports it) is not suspended: the re-base's
   outcome is unknown, so the session reloads, as before.

@@ -1121,25 +1121,26 @@ struct StoreCheckpointer {
     run_suspension: std::sync::OnceLock<crate::ephemeral::RunSuspensionHandle>,
 }
 
-/// What a refused round commit met at the session store's fence.
+/// What a refused checkpoint (a round commit or a closing save) met at the
+/// session store's fence.
 enum CommitFenceGap {
     /// No fence gap: the writer was not stopped, or another writer holds the
     /// fence. The refusal stands.
     NoGap,
-    /// The writer's re-acquire restored it: the commit is written again,
-    /// once.
+    /// The writer's re-acquire restored it: the checkpoint is written
+    /// again, once.
     Restored,
     /// The writer stayed stopped through the whole wait, and no other writer
     /// was found (a store fence gap).
     Closed(meerkat_core::host_store::SelfFenceWindow),
 }
 
-/// Whether a round commit refused while `fence`'s writer may have been
+/// Whether a checkpoint refused while `fence`'s writer may have been
 /// stopped met a store fence gap, waiting for the writer's re-acquire as a
 /// dispatch does ([`meerkat_core::host_store::SelfFence::dispatch_window`]).
-/// `open_before` is whether the writer's window was open when the commit
-/// began: a writer that was not stopped then, and is not now, refused for
-/// another reason.
+/// `open_before` is whether the writer's window was open when the
+/// checkpoint began: a writer that was not stopped then, and is not now,
+/// refused for another reason.
 async fn commit_fence_gap(
     fence: &dyn meerkat_core::host_store::SelfFence,
     open_before: bool,
@@ -3089,19 +3090,20 @@ impl meerkat_core::SessionCheckpointer for StoreCheckpointer {
         }
     }
 
-    /// A round commit refused while the store's writer was stopped meets the
-    /// gap as a dispatch does
+    /// A round commit or a closing save refused while the store's writer was
+    /// stopped meets the gap as a dispatch does
     /// ([`meerkat_core::SessionCheckpointer::dispatch_fence_ready`]). When
     /// the refusal could be the gap's (the writer was stopped before the
-    /// commit, or is now, and no other writer is proven), the commit waits,
+    /// write, or is now, and no other writer is proven), the write waits,
     /// bounded, for the writer's re-acquire and is written again, once, when
     /// that restored the writer. When the writer stays stopped through the
-    /// whole wait, the runtime's run on this actor is suspended there, as at
-    /// a dispatch: nothing of the round was written, so the run resumes from
-    /// its last round commit and does the round again, as after a crash. A
-    /// refusal of the teardown class, a closing save's (the run's cursor is
-    /// gone by then), and one of a run the runtime did not dispatch here,
-    /// stand as before.
+    /// whole wait, a round commit of the runtime's run on this actor
+    /// suspends the run there, as at a dispatch: nothing of the round was
+    /// written, so the run resumes from its last round commit and does the
+    /// round again, as after a crash. A closing save comes after the run's
+    /// terminal (its cursor is gone by then), so its refusal stands, as does
+    /// a round commit's of a run the runtime did not dispatch here, and a
+    /// refusal of the teardown class.
     async fn checkpoint_run(
         &self,
         session: &mut Session,
@@ -3117,22 +3119,24 @@ impl meerkat_core::SessionCheckpointer for StoreCheckpointer {
         let Some(fence) = fence else {
             return Err(error);
         };
-        if error.requires_session_teardown() || !round_commit_of(session, run_id) {
+        if error.requires_session_teardown() {
             return Err(error);
         }
+        let round_commit = round_commit_of(session, run_id);
         match commit_fence_gap(fence.as_ref(), open_before).await {
             CommitFenceGap::NoGap => Err(error),
             CommitFenceGap::Restored => {
                 tracing::info!(
                     %run_id,
                     %error,
-                    "a round commit refused while the session store's writer was stopped is \
+                    round_commit,
+                    "a checkpoint refused while the session store's writer was stopped is \
                      written again: the writer's fence is back"
                 );
                 self.checkpoint_run_once(session, run_id, previous).await
             }
             CommitFenceGap::Closed(window) => {
-                if self.suspend_runtime_run(run_id) {
+                if round_commit && self.suspend_runtime_run(run_id) {
                     tracing::warn!(
                         %run_id,
                         %error,

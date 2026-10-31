@@ -350,12 +350,14 @@ pub trait SessionCheckpointer: Send + Sync {
     /// before any of its tools runs. Only a session that never committed a
     /// boundary has no base to chain a provisional tail from.
     ///
-    /// A round commit refused while the writer of a fenced store is stopped
-    /// may wait for its re-acquire, as [`Self::dispatch_fence_ready`] does,
-    /// and be written again once; when the writer stays stopped (a store
-    /// fence gap), a checkpointer whose host dispatched the run may have it
-    /// suspended there instead of answering, so the run resumes from its last
-    /// round commit and does the refused round again.
+    /// A round commit or a closing save refused while the writer of a fenced
+    /// store is stopped may wait for its re-acquire, as
+    /// [`Self::dispatch_fence_ready`] does, and be written again once. When
+    /// the writer stays stopped (a store fence gap), a checkpointer whose
+    /// host dispatched the run may have it suspended at a round commit
+    /// instead of answering, so the run resumes from its last round commit
+    /// and does the refused round again; a closing save, written after the
+    /// run's terminal, answers its refusal.
     async fn checkpoint_run(
         &self,
         session: &mut crate::Session,

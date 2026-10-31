@@ -2124,30 +2124,39 @@ async fn a_takeover_met_by_a_dispatch_whose_window_reads_open_refuses_it() {
 /// written again. The round's call runs once and the run completes once.
 #[tokio::test(start_paused = true)]
 async fn a_round_commit_refused_in_a_short_gap_is_written_again_and_the_run_completes_once() {
-    let run = run_with_stop(
+    // The round's call, then the answer: no second round.
+    let mut row = FenceRow::open_scripted(
         ClosesDuring::RoundModelCall,
         Stop::TimedOutRenew(Reacquire::FailsFor(SHORT_GAP)),
         Turn::Queued,
+        vec![ModelStep::StopThenTools],
     )
     .await;
+    let answer = row.run_turn(PAUSED_DEADLINE).await;
     assert!(
-        run.completed(),
-        "the round commit waits for the re-acquire and the run completes: {}",
-        run.answer_text()
+        matches!(
+            answer,
+            TurnAnswer::Queued(Ok(CompletionOutcome::Completed(_)))
+        ),
+        "the round commit waits for the re-acquire and the run completes: {answer:?}"
     );
     assert_eq!(
-        run.model_requests, 2,
+        row.model_requests(),
+        2,
         "the round and the answer, each asked once"
     );
-    assert_eq!(run.dispatched, 1, "the round's call runs once");
-    assert!(run.lease_live_after, "the re-acquire resumed the writer");
+    assert_eq!(row.dispatched(), 1, "the round's call runs once");
+    assert!(
+        row.realm.lease_is_live(),
+        "the re-acquire resumed the writer"
+    );
     assert_eq!(
-        run.input_phases,
+        row.input_phases().await,
         Some(vec![Some(InputLifecycleState::Consumed)]),
         "the run's one input is consumed once"
     );
     assert_eq!(
-        run.row.committed_rows().await,
+        row.committed_rows().await,
         vec![
             "user probe once".to_string(),
             "assistant tool use".to_string(),

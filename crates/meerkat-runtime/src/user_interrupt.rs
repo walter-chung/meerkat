@@ -195,6 +195,13 @@ impl MeerkatMachine {
         result
     }
 
+    /// Hard-cancel the session's current run. A run whose session store's
+    /// fence reads closed (a store fence gap) is stopped through a
+    /// suspension instead, and a run marked resumable while no run is
+    /// current (a gap's, or a restart's not resumed yet) has its stop
+    /// recorded: either run never resumes, and its inputs end cancelled once
+    /// the store takes writes again. Refused with `NotReady` when no run is
+    /// current and none is marked.
     pub async fn hard_cancel_current_run(
         &self,
         session_id: &SessionId,
@@ -264,6 +271,17 @@ impl MeerkatMachine {
     ///
     /// A run with no runtime-loop contributors (a direct service turn) is
     /// interrupted and reported as `Stopped` with no contributors.
+    ///
+    /// A run a store fence gap suspended (or one a restart marked resumable
+    /// that has not resumed yet), and a run whose session store's fence
+    /// reads closed while it runs, are stopped without waiting: the stop is
+    /// recorded at once and the call returns `Stopped` with no contributors.
+    /// Such a run never resumes, and its inputs end `Abandoned` with reason
+    /// `Cancelled` once the store takes writes again: read their outcome
+    /// later. A process that ends first, or another writer that takes the
+    /// session over, runs them instead. A stop that races the gap's own
+    /// suspension of the run may fail with an internal error naming a
+    /// contributor whose wait was answered `RequeuedAcrossStop`.
     pub async fn stop_run(
         &self,
         session_id: &SessionId,

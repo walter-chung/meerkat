@@ -5483,6 +5483,14 @@ impl RuntimeLoopAuthorityBinding {
         self.store_self_fence().is_some_and(|fence| fence.lost())
     }
 
+    /// Whether the session store's fence reads closed with no other writer
+    /// proven (a store fence gap, or the start of one): its writes wait for
+    /// the writer's re-acquire.
+    fn store_fence_gap(&self) -> bool {
+        self.store_self_fence()
+            .is_some_and(|fence| !fence.lost() && !fence.window().is_open())
+    }
+
     /// Whether the session's store holds a provisional tail of `run_id` (a
     /// round commit of the run), as
     /// [`crate::meerkat_machine::MeerkatMachine::run_holds_provisional_tail`]
@@ -7462,10 +7470,10 @@ async fn admit_resumed_run(
     run_id: RunId,
 ) -> ResumedRunAdmissionLap {
     // A run whose stop was asked (a cancel it accepted before a store fence
-    // gap suspended it, or a stop or an interrupt of it while it was
-    // suspended) never resumes: it is settled, its inputs abandoned as
-    // cancelled. The loop gets here only once the session's store takes
-    // writes again.
+    // gap suspended it, a stop or an interrupt of it at the fence, or one of
+    // it while it was suspended or marked resumable) never resumes: it is
+    // settled, its inputs abandoned as cancelled. The loop gets here only
+    // once the session's store takes writes again.
     if driver.lock().await.resumable_run_stop_requested() {
         return settle_unresumed_run(
             driver,
@@ -7618,6 +7626,12 @@ async fn settle_unresumed_run(
     run_id: &RunId,
     why: UnresumedRun,
 ) -> ResumedRunAdmissionLap {
+    // The settlement writes, so it needs the session store's fence: when
+    // the fence closed again since the lap read it open, the lap waits for
+    // it again and then settles, instead of meeting the gap here.
+    if authority_binding.store_fence_gap() {
+        return ResumedRunAdmissionLap::Again;
+    }
     match &why {
         UnresumedRun::Refused { detail } => tracing::warn!(
             session_id = %authority_binding.session_id,
@@ -7639,6 +7653,22 @@ async fn settle_unresumed_run(
         Ok(guard) => guard,
         Err(_) => return ResumedRunAdmissionLap::Exit(true),
     };
+    // A stop of the run is staged under the session mutation gate this
+    // guard holds: one recorded since the admission read the run is read
+    // here, and the run is settled as stopped, never as a refused resume
+    // (the machine refuses that settlement of a stopped run).
+    let stopped_since = matches!(why, UnresumedRun::Refused { .. })
+        && driver.lock().await.resumable_run_stop_requested();
+    let why = if stopped_since {
+        tracing::info!(
+            session_id = %authority_binding.session_id,
+            %run_id,
+            "the run was stopped before its refused resume was settled; it is settled as stopped"
+        );
+        UnresumedRun::Stopped
+    } else {
+        why
+    };
     // The kept inputs get the runtime-termination carrier in the same
     // commit; the drain below publishes a directed caller's terminal, and
     // the run's own terminal is published once the queue authority is
@@ -7651,8 +7681,19 @@ async fn settle_unresumed_run(
     let (abandoned, settled_terminal) = match settled {
         Ok(settled) => (settled.abandoned, settled.terminal),
         Err(error) => {
-            tracing::error!(%run_id, %error, "failed to settle a run marked resumable");
             drop(queue_authority_guard);
+            // A settlement that met a new store fence gap is settled again
+            // once the fence is back: the lap waits for it, as for any gap.
+            if authority_binding.store_fence_gap() {
+                tracing::warn!(
+                    %run_id,
+                    %error,
+                    "the settlement of a run marked resumable met a store fence gap; it is \
+                     settled once the fence is back"
+                );
+                return ResumedRunAdmissionLap::Again;
+            }
+            tracing::error!(%run_id, %error, "failed to settle a run marked resumable");
             return ResumedRunAdmissionLap::Exit(true);
         }
     };
@@ -7732,11 +7773,13 @@ enum SuspendedRunRealization {
 ///   resumes the run from its last committed round;
 /// - a store fence gap (the session store's writer stayed stopped through the
 ///   run's whole dispatch wait, or a round commit's, and no other writer was
-///   found, outside any unregister): the machine marks the run resumable and
-///   returns its turn to `Ready`, its inputs keep their run and their stage
-///   attempts, and this loop resumes the run once the store's fence is
-///   restored, or settles it then, when its stop was asked (a cancel it
-///   accepted before the gap stands as that stop).
+///   found, outside any unregister, or a stop asked of the run while its
+///   writer was stopped): the machine marks the run resumable and returns
+///   its turn to `Ready`, its inputs keep their run and their stage attempts,
+///   their waiters are answered `RequeuedAcrossStop`, and this loop resumes
+///   the run once the store's fence is restored, or settles it then, when
+///   its stop was asked (a cancel it accepted before the gap stands as that
+///   stop).
 ///
 /// Nothing else is realized: no terminal, no input change, and the
 /// provisional tail stays.
@@ -9764,18 +9807,21 @@ async fn process_queue(
                                         cause:
                                             crate::meerkat_machine::dsl::RunSuspensionCause::FenceGap,
                                     } => {
-                                        // The run's inputs stay bound to it and
-                                        // run when it resumes, once the fence is
-                                        // back or at the next start. Their
-                                        // waiters are told so now, within the
-                                        // run's one dispatch wait, instead of
-                                        // waiting out the gap. A run whose stop
-                                        // was asked never resumes: its waiters
-                                        // get its settlement's answer once the
-                                        // fence is back.
-                                        let stopped =
-                                            driver.lock().await.resumable_run_stop_requested();
-                                        if !stopped && let Some(completions) = completions {
+                                        // The run's inputs stay bound to it.
+                                        // Their waiters are told now, within the
+                                        // run's one dispatch wait, that their
+                                        // inputs stay queued, instead of waiting
+                                        // out the gap, whatever its length. A
+                                        // run whose stop was asked (a cancel it
+                                        // accepted before the gap, or a stop or
+                                        // interrupt at the fence) is answered
+                                        // the same way: it never resumes, and
+                                        // its inputs end cancelled once the
+                                        // fence is back; until then the store
+                                        // keeps them, so a process that ends
+                                        // first, or another writer that takes
+                                        // the session over, runs them instead.
+                                        if let Some(completions) = completions {
                                             completions.lock().await.fail_inputs(
                                                 input_ids.iter().cloned(),
                                                 crate::completion::CompletionWaitError::RequeuedAcrossStop {
