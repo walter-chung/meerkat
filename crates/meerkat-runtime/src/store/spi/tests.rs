@@ -1455,8 +1455,12 @@ fn the_dispatch_wait_bound_covers_the_reacquire_at_every_advised_timing() {
             "{interval}/{renew_timeout}/{margin}/{lease}"
         );
         let bounded_steps = secs(renew_timeout) * 2 + renew;
+        // A bound below the bounded steps leaves no window at all: the
+        // checked difference is `None`, and the assertion fails.
         assert!(
-            bound - bounded_steps >= window,
+            bound
+                .checked_sub(bounded_steps)
+                .is_some_and(|left| left >= window),
             "{interval}/{renew_timeout}/{margin}/{lease}: a whole window is left for the \
              drain and the listing"
         );

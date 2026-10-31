@@ -510,6 +510,8 @@ ConversationTurnStart == StartConversationRunRunning(AuditRun, "ConversationTurn
 AuditGapStartTurn ==
     /\ audit_stage = "P1"
     /\ ~audit_p1_stop
+    /\ PhaseOf(AuditA) = "Staged"
+    /\ terminal_outcome # Some("Cancelled")
     /\ audit_disposition = "None"
     /\ audit_attempts = 0
     /\ ~audit_suspended

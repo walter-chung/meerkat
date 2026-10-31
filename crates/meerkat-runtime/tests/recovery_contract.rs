@@ -434,6 +434,12 @@ fn make_runtime_id(label: &str) -> LogicalRuntimeId {
 }
 
 fn make_prompt(text: &str) -> Input {
+    make_prompt_admitted_at(text, Utc::now())
+}
+
+/// [`make_prompt`] admitted at `admitted_at`: a graceful stop's max age
+/// counts from the payload's timestamp.
+fn make_prompt_admitted_at(text: &str, admitted_at: chrono::DateTime<Utc>) -> Input {
     Input::Prompt(PromptInput {
         injected_context: Vec::new(),
         header: InputHeader {
@@ -441,7 +447,7 @@ fn make_prompt(text: &str) -> Input {
             retained_resume: None,
             authority_association: None,
             id: InputId::new(),
-            timestamp: Utc::now(),
+            timestamp: admitted_at,
             source: InputOrigin::Operator,
             durability: InputDurability::Durable,
             visibility: InputVisibility::default(),
@@ -6477,9 +6483,11 @@ async fn a_kept_directed_run_past_its_stops_max_age_fails_its_interaction_once()
 /// registered it (the resumable branch of a stop needs no executor) settles
 /// as stopped, as every settlement of a stopped run does: its input ends
 /// `Abandoned { Cancelled }` and the run ends once on the session's stream
-/// as cancelled, not as expired. Nothing runs. RED while the expiry
-/// settlement ignored the stop: the input ended `RequeueExpired`. Unrun:
-/// written while Cargo is not run.
+/// as cancelled, not as expired. Nothing runs. The prompt was admitted an
+/// hour ago, as the sibling directed row's message was: the max age counts
+/// from admission, so the attachment takes the expiry branch. RED while the
+/// expiry settlement ignored the stop: the input ended `RequeueExpired`.
+/// Unrun: written while Cargo is not run.
 #[tokio::test]
 async fn a_kept_run_past_its_stops_max_age_whose_stop_was_asked_settles_as_stopped() {
     let store = Arc::new(InMemoryRuntimeStore::new());
@@ -6487,7 +6495,7 @@ async fn a_kept_run_past_its_stops_max_age_whose_stop_was_asked_settles_as_stopp
     let (session_id, run_id, input) = a_kept_run_of(
         &store,
         InputLifecycleState::AppliedPendingConsumption,
-        make_prompt("the run's prompt"),
+        make_prompt_admitted_at("the run's prompt", an_hour_ago),
         Some(meerkat_runtime::input_state::StopRequeueMark {
             stopped_at: an_hour_ago,
             max_age_ms: 1_000,
