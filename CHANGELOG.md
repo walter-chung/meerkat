@@ -195,8 +195,10 @@ them.
   `NotCurrent` for it). This supersedes the 0.9.4 note that the discard
   waits for an attached loop's handoff.
 
-- Behaviour-only (not measured by the gate): `meerkat-schedule`: a
-  schedule's superseded acknowledgements (the `superseded_ack_ids` field of
+- Behaviour-only (not measured by the gate): `meerkat-schedule`,
+  `meerkat-machine-schema` (the generated `ScheduleLifecycleMachine`
+  authority in `catalog::dsl::schedule_lifecycle`): a schedule's
+  superseded acknowledgements (the `superseded_ack_ids` field of
   `Schedule` and of the `Schedule` wire projection, `superseded_ack_ids` in
   the Python SDK and `supersededAckIds` in the TypeScript SDK) list only
   the occurrences the latest revise or delete superseded. Each revise or
