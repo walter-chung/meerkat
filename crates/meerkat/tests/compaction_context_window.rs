@@ -424,6 +424,14 @@ mod tests {
         })
     }
 
+    /// The compaction cadence a session's metadata carries.
+    fn compaction_cadence(session: &Session) -> meerkat_core::SessionCompactionCadence {
+        serde_json::from_value(
+            session.metadata()[meerkat_core::SESSION_COMPACTION_CADENCE_KEY].clone(),
+        )
+        .expect("the session carries a compaction cadence")
+    }
+
     fn carries_listing(session: &Session) -> bool {
         session.messages().iter().any(|message| {
             matches!(
@@ -767,6 +775,85 @@ mod tests {
             carries_refused_prompt,
         )
         .await;
+    }
+
+    /// A host transcript edit leaves a transcript the stored context
+    /// refusal and input anchor were not recorded on. After a refused first
+    /// request the host rewrites the oversize prompt out of the session: the
+    /// rewrite drops both facts from the stored cadence, the live agent the
+    /// rewrite converges adopts that cadence, and the next run sends its
+    /// request without a compaction. Its answer anchors the projection
+    /// again, on the rewritten transcript.
+    #[tokio::test]
+    async fn a_host_rewrite_drops_the_refusal_and_the_next_answer_anchors_again() {
+        use meerkat_core::SessionServiceTranscriptEditExt as _;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let model = WindowedModel::new(WINDOW);
+        let tool = ListingTool::new();
+        let (service, adapter) = build_service(temp.path(), &model);
+        let session_id = refuse_a_first_request(&service, &adapter, &model, &tool).await;
+
+        let refused = committed(&service, &session_id).await;
+        assert!(
+            compaction_cadence(&refused)
+                .last_context_refusal_boundary_index
+                .is_some(),
+            "test setup: the refusal is stored"
+        );
+        let prompt_at = refused
+            .messages()
+            .iter()
+            .position(|message| {
+                matches!(message, Message::User(user) if user.text_content().starts_with("cccc"))
+            })
+            .expect("test setup: the refused prompt is stored");
+        service
+            .rewrite_session_transcript(
+                &session_id,
+                meerkat_core::SessionTranscriptRewriteRequest {
+                    selection: meerkat_core::TranscriptRewriteSelection::MessageRange {
+                        start: prompt_at,
+                        end: prompt_at + 1,
+                    },
+                    replacement: vec![Message::User(meerkat_core::types::UserMessage::text(
+                        "a short request".to_string(),
+                    ))],
+                    reason: meerkat_core::TranscriptRewriteReason::new("drop the oversize prompt"),
+                    actor: Some("host".to_string()),
+                    expected_parent_revision: None,
+                    running_behavior: meerkat_core::TranscriptEditRunningBehavior::default(),
+                },
+            )
+            .await
+            .expect("the host rewrite commits");
+        let rewritten = compaction_cadence(&committed(&service, &session_id).await);
+        assert_eq!(
+            rewritten.last_context_refusal_boundary_index, None,
+            "the rewrite drops the refusal"
+        );
+        assert_eq!(
+            rewritten.last_answered_request, None,
+            "the rewrite drops the anchor"
+        );
+
+        let before = model.seen().len();
+        let next = run_prompt(&adapter, &session_id, "continue").await;
+        let seen = model.seen_since(before);
+        assert!(completed(&next), "{next:?}; requests: {seen:?}");
+        assert!(
+            !seen.iter().any(|seen| seen.summary || seen.refused),
+            "no compaction and no refusal after the rewrite: {seen:?}"
+        );
+        let session = committed(&service, &session_id).await;
+        let anchor = compaction_cadence(&session)
+            .last_answered_request
+            .expect("the answer anchors the projection again");
+        assert_eq!(
+            anchor.transcript_rows,
+            u64::try_from(session.messages().len() - 1).expect("row count"),
+            "on the rewritten transcript, before its answer"
+        );
     }
 
     /// A restored agent projects its first request from the anchor its

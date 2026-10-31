@@ -3712,6 +3712,90 @@ mod tests {
         Ok(())
     }
 
+    /// Every field a summary keeps is bounded, also when the schedule's own
+    /// values are not: a kept target id is cut to its first 200 characters,
+    /// and a trigger over 1,024 serialized bytes (a calendar that lists
+    /// thousands of values, for one) is named by its type and timezone with
+    /// its full length. `meerkat_schedule_get` returns both whole.
+    #[tokio::test]
+    async fn summaries_bound_oversized_target_ids_and_triggers() -> Result<(), String> {
+        let service = ScheduleService::new(Arc::new(MemoryScheduleStore::default()));
+        let mut schedule = service
+            .create(bounded_read_request(interval_trigger(60), 1))
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut occurrence = Occurrence::planned_write_from_schedule(
+            &schedule,
+            OccurrenceOrdinal(1),
+            Utc::now() + Duration::minutes(5),
+        )
+        .map_err(|error| error.to_string())?
+        .occurrence()
+        .clone();
+        let member_id = "m".repeat(5_000);
+        let target = TargetBinding::Mob(Box::new(MobTargetBinding::Member {
+            mob_id: "ops".into(),
+            member_id: member_id.clone(),
+            action: ScheduledMobAction::Send {
+                content: ContentInput::from("ping"),
+                render_metadata: None,
+            },
+        }));
+        let trigger = TriggerSpec::Calendar(crate::CalendarTriggerSpec {
+            timezone: "Europe/Stockholm".into(),
+            minute: crate::CalendarFieldSpec::Values((0..10_000).map(|value| value % 60).collect()),
+            hour: crate::CalendarFieldSpec::Any,
+            day_of_month: crate::CalendarFieldSpec::Any,
+            month: crate::CalendarFieldSpec::Any,
+            day_of_week: crate::CalendarFieldSpec::Any,
+            year: None,
+        });
+        schedule.target = target.clone();
+        schedule.trigger = trigger.clone();
+        occurrence.target_snapshot = target;
+        occurrence.trigger_snapshot = trigger;
+
+        let row = schedule_summary(&schedule).map_err(|error| error.message)?;
+        let text = row.to_string();
+        assert!(
+            !text.contains(&member_id),
+            "the member id is cut in a schedule summary"
+        );
+        assert!(
+            text.len() < 2_048,
+            "a schedule summary is bounded: {} bytes",
+            text.len()
+        );
+        let kept = row["target"]["member_id"].as_str().ok_or("member_id")?;
+        assert!(
+            kept.starts_with("mmm") && kept.chars().count() <= 203,
+            "{kept}"
+        );
+        assert_eq!(row["target"]["mob_id"], "ops", "{row}");
+        assert_eq!(row["trigger"]["type"], "calendar", "{row}");
+        assert_eq!(row["trigger"]["timezone"], "Europe/Stockholm", "{row}");
+        assert!(row["trigger"].get("minute").is_none(), "{row}");
+        assert!(
+            row["trigger"]["trigger_chars"]
+                .as_u64()
+                .is_some_and(|chars| chars > 1_024),
+            "{row}"
+        );
+
+        let row = occurrence_summary(&occurrence).map_err(|error| error.message)?;
+        let text = row.to_string();
+        assert!(
+            !text.contains(&member_id),
+            "the member id is cut in an occurrence summary"
+        );
+        assert!(
+            text.len() < 2_048,
+            "an occurrence summary is bounded: {} bytes",
+            text.len()
+        );
+        Ok(())
+    }
+
     /// A limit over the maximum is not refused: both tools return a page of
     /// 200 rows, and the page reports that more follow.
     #[tokio::test]
