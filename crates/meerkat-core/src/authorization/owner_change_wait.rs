@@ -193,6 +193,26 @@ impl OwnerChangeChurn {
     /// observation answered. Any other answer (current, a denial, a genuine
     /// `Unavailable`) is final and never waits.
     ///
+    /// One `Unavailable` is contention, not genuine, and is retryable at the
+    /// host level: a governed helper admission fence
+    /// (`GovernedHelperAdmissionFence` in the `meerkat` facade) refuses as
+    /// `Unavailable`, with nothing run or committed, while another writer
+    /// holds the publication its check excludes owner changes on (a
+    /// reservation of the writer that has not published) or an owner change
+    /// is in progress there. The fence runs inside the store call and never
+    /// waits. Wait here instead, after that call returned, outside every lock
+    /// and store transaction, then make the same idempotent create again with
+    /// a new fence (a fence serves one attempt). The refused attempt ran no
+    /// effect and the admission key keeps the create idempotent, so this is
+    /// no wait around an effect.
+    /// `GovernedHelperAdmissionFence::create_idempotent_after_owner_change`
+    /// does exactly that, and waits only when the fence named such a change
+    /// or hold as it refused; any other `Unavailable` (a refusal to rebuild
+    /// with no change in progress, clock or custody unavailable, a poisoned
+    /// publication) it answers at once. An `Unavailable` an owner answers for
+    /// itself is genuine: an owner never answers its own transient lock
+    /// contention that way.
+    ///
     /// The first wait of this churn arms its one deadline,
     /// [`OWNER_CHANGE_WAIT_BOUND`] from then, clamped to `budget_remaining`
     /// (in a tool body, `ToolDispatchContext::remaining_tool_time`). Later
