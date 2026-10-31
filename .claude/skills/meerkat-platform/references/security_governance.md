@@ -175,8 +175,11 @@ denial. Since 0.9.4:
   the same idempotent create through a new fence for each attempt and waits
   between attempts outside every lock (`OwnerChangeChurn::wait_after_stale_read`:
   2 s and three free rebuilds, clamped to the budget passed; site
-  `helper_admission`). It answers success, `Denied` and every other
-  `Unavailable` (a refusal to rebuild with no change in progress, clock or
+  `helper_admission`). On a dispatch or entered fence it retries every
+  refusal to rebuild, as the waiting dispatch steps do, and a fence built
+  from a dispatch reports its waits to the host's refusal observer as the
+  call's. It answers success, `Denied` and every other `Unavailable` (a
+  refusal to rebuild inside the prepared path's own exclusion, clock or
   custody unavailable, a poisoned publication) at once, and the last
   `Unavailable` once the bounds are spent. An installed owner's own
   `Unavailable` is final instead (at a controller's model request it ends the

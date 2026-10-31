@@ -274,22 +274,34 @@ them.
   an owner change is in progress there, it refuses as `Unavailable` with
   nothing run or committed. The new form makes the keyed create through a
   new fence for each attempt (a fence serves one attempt), always the same
-  idempotent `create_idempotent_with_fence`. Only after an attempt whose
-  fence named such a change or hold as it refused does it wait, with one
-  `OwnerChangeChurn` per call (`wait_after_stale_read`: 2 s and three free
-  rebuilds, clamped to the `budget_remaining` passed), outside every lock
-  and store transaction, and try again. It answers success, `Denied` and
-  every other `Unavailable` (a refusal to rebuild with no change in
-  progress, clock or custody unavailable, a poisoned publication) at once,
+  idempotent `create_idempotent_with_fence`. It waits, outside every lock
+  and store transaction, and tries again after an attempt that refused for
+  one of these: on the prepared path, an exclusion refused while the
+  publication named such a change or hold; on the dispatch and entered
+  paths, a refusal to rebuild (`ReprepareRequired`), which, as Core's
+  waiting step forms do, it waits out for a change or hold in progress, or
+  with none named after a 1 ms pause. Every wait is `wait_after_stale_read`
+  of one `OwnerChangeChurn` per call (2 s and three free rebuilds, clamped
+  to the `budget_remaining` passed). A fence built with `from_dispatch`
+  waits with that dispatch context's own churn
+  (`ToolDispatchContext::owner_change_churn`), so its waits also report to
+  the host's operation refusal observer as the call's; prepared and entered
+  fences trace their waits only. It answers success, `Denied` and every
+  other `Unavailable` (a refusal to rebuild inside the prepared path's own
+  exclusion, clock or custody unavailable, a poisoned publication) at once,
   and returns the last `Unavailable` once a wait is not settled. `refusal()`
   on the fence it was called on reads the answered attempt's reason, and
-  that fence serves this one admission. It covers prepared, dispatch and
-  entered fences; each wait is traced at site `helper_admission`, and
-  dropping the future commits nothing an attempt did not commit itself.
-  `meerkat-core`: `EnteredDispatchOperation::work_authorization`, the
-  entered operation's governed work context (the dispatch's own, as
-  `GovernedDispatchOperation::work_authorization` returns it), whose
-  `owner_change_in_progress` such a wait reads.
+  that fence serves this one admission. Each wait is traced at site
+  `helper_admission`, and dropping the future commits nothing an attempt
+  did not commit itself.
+
+- `meerkat-core`: `EnteredDispatchOperation::work_authorization`, the
+  entered operation's governed work context: the dispatch's own, as
+  `GovernedDispatchOperation::work_authorization` returns it. Its
+  `owner_change_in_progress` names an owner change in progress on the
+  work's publication, or another actor's hold of the work owners'
+  exclusion, which a step refused to rebuild waits for; the waiting helper
+  admission reads it for entered fences.
 
 ### Fixed
 

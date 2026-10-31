@@ -308,11 +308,13 @@ that never wait answer at once, as before, and a poisoned publication is
 writer's hold of the publication, or an owner change in progress there) is
 retryable at the host level:
 `GovernedHelperAdmissionFence::create_idempotent_after_owner_change` makes the
-same idempotent create through a new fence for each attempt and, only after an
-attempt whose fence named such a change or hold as it refused, waits with the
-bounds above outside the store call (site `helper_admission`); it answers
-every other refusal at once. This is shell synchronization: no
-machine input or owner fact changes.
+same idempotent create through a new fence for each attempt and waits with the
+bounds above outside the store call (site `helper_admission`): on the prepared
+path only after an attempt whose fence named such a change or hold as it
+refused, and on the dispatch and entered paths after every refusal to rebuild,
+as the waiting forms above do. A fence built with `from_dispatch` reports those
+waits as the call's. It answers every other refusal at once. This is shell
+synchronization: no machine input or owner fact changes.
 
 A custom `WorkAuthorization` reports a change in progress through
 `owner_change_in_progress` (provided; default `None`), a waiting hint that is

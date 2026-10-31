@@ -206,9 +206,12 @@ impl OwnerChangeChurn {
     /// effect and the admission key keeps the create idempotent, so this is
     /// no wait around an effect.
     /// `GovernedHelperAdmissionFence::create_idempotent_after_owner_change`
-    /// does exactly that, and waits only when the fence named such a change
-    /// or hold as it refused; any other `Unavailable` (a refusal to rebuild
-    /// with no change in progress, clock or custody unavailable, a poisoned
+    /// does exactly that. On the prepared path it waits only when the fence
+    /// named such a change or hold as it refused; on the dispatch paths it
+    /// waits after every refusal to rebuild, as the waiting step forms do
+    /// (`GovernedDispatchOperation::run_if_current_within_after_owner_change`).
+    /// Any other `Unavailable` (a refusal to rebuild inside the prepared
+    /// path's own exclusion, clock or custody unavailable, a poisoned
     /// publication) it answers at once. An `Unavailable` an owner answers for
     /// itself is genuine: an owner never answers its own transient lock
     /// contention that way.

@@ -897,20 +897,26 @@ bounds.
   `GovernedHelperAdmissionFence::create_idempotent_after_owner_change`, given
   the WorkGraph service, the key, the request and a budget, makes the keyed
   create through a new fence for each attempt (a fence serves one attempt),
-  always the same idempotent `create_idempotent_with_fence`. Only after an
-  attempt whose fence named such a change or hold as it refused does it wait,
-  with one `OwnerChangeChurn` per call (`wait_after_stale_read`: 2 s and three
-  free rebuilds, clamped to the budget, in a tool body
-  `ToolDispatchContext::remaining_tool_time`), outside every lock and store
-  transaction, then try again. It answers success, `Denied` and every other
-  `Unavailable` (a refusal to rebuild with no change in progress, clock or
-  custody unavailable, a poisoned publication) at once, and the last
-  `Unavailable` once a wait is not settled; `refusal()` on the fence it was
-  called on then reads the answered attempt's reason. That fence serves this
-  one admission. Dropping the future commits nothing an attempt did not commit
-  itself. It works on the prepared, dispatch and entered paths alike;
-  `EnteredDispatchOperation::work_authorization` names the entered
-  operation's work, whose `owner_change_in_progress` it waits on.
+  always the same idempotent `create_idempotent_with_fence`. It waits, outside
+  every lock and store transaction, and tries again after an attempt that
+  refused for one of these: on the prepared path, an exclusion refused while
+  the publication named such a change or hold; on the dispatch and entered
+  paths, a refusal to rebuild (`ReprepareRequired`), which it waits out as the
+  waiting step forms above do (for a change or hold in progress, or after a
+  1 ms pause when none is named). Every wait is `wait_after_stale_read` of one
+  `OwnerChangeChurn` per call (2 s and three free rebuilds, clamped to the
+  budget, in a tool body `ToolDispatchContext::remaining_tool_time`). A fence
+  built with `from_dispatch` waits with that dispatch context's own churn
+  (`ToolDispatchContext::owner_change_churn`), so its waits also report to the
+  host's operation refusal observer as the call's; prepared and entered fences
+  trace their waits only. It answers success, `Denied` and every other
+  `Unavailable` (a refusal to rebuild inside the prepared path's own
+  exclusion, clock or custody unavailable, a poisoned publication) at once, and
+  the last `Unavailable` once a wait is not settled; `refusal()` on the fence
+  it was called on then reads the answered attempt's reason. That fence serves
+  this one admission. Dropping the future commits nothing an attempt did not
+  commit itself. `EnteredDispatchOperation::work_authorization` names the
+  entered operation's work, whose `owner_change_in_progress` it waits on.
 - `OwnerChangeWait::trace` records each wait as one `debug` event of target
   `meerkat::authz::owner_change_wait` with `site` (`model_request`,
   `compaction_summary`, `tool_dispatch`, `tool_entry`, `tool_policy_entry`,
