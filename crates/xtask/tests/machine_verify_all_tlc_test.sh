@@ -234,7 +234,8 @@ fi
 # settlement and an abandon that keep it, a hold that ignores the input's
 # phase, a release that clears every hold, a resume that ignores the
 # destination and a resume that keeps the previous staged run and context.
-# 14 steps reach every witness. It runs alone in shard audits-h.
+# 14 steps reach every witness. It runs in shard audits-h, with the
+# superseded-ack retention audit below.
 input_controller_hold_audit="${workspace_root}/specs/machines/meerkat_machine/input_controller_hold_audit.sh"
 if [[ ! -x "${input_controller_hold_audit}" ]]; then
   echo "error: input controller hold audit runner is missing from workspace runfiles: ${input_controller_hold_audit}" >&2
@@ -243,6 +244,32 @@ fi
 if run_part audits-h; then
   echo "running bounded input controller hold TLC audit"
   TLC_WORKERS="${tlc_workers}" "${input_controller_hold_audit}" "${INPUT_CONTROLLER_HOLD_AUDIT_MAX_STEPS:-14}" --mutants
+fi
+
+# The bounded retention of the ScheduleLifecycleMachine's superseded_ack_ids
+# (the set holds only the acknowledgements of the latest supersession) is
+# model-checked by a hand-written audit over the generated schedule model:
+# one schedule through revises and deletes from Active and Paused, the
+# repeated delete, pause and resume, and acknowledgements of two occurrence
+# ids for every revision the bound reaches and one past it, in every phase,
+# under every generated invariant plus two history invariants (every recorded
+# id was acknowledged at the current revision; every acknowledgement of the
+# current revision is recorded). It requires three witnesses reached (a
+# revise and a delete that drop an earlier acknowledgement while recording
+# their own, a late acknowledgement of a dropped id accepted without effect)
+# and refuses eight seeded defects (--mutants): each revise and delete arm
+# keeping the old ids, the Active and Paused acknowledgement arms recording
+# late acknowledgements, and the Paused and Deleted ones dropping current
+# acknowledgements. 6 steps reach every witness and mutant with room to
+# spare. It runs in shard audits-h.
+superseded_ack_retention_audit="${workspace_root}/specs/machines/schedule_lifecycle/superseded_ack_retention_audit.sh"
+if [[ ! -x "${superseded_ack_retention_audit}" ]]; then
+  echo "error: superseded-ack retention audit runner is missing from workspace runfiles: ${superseded_ack_retention_audit}" >&2
+  exit 1
+fi
+if run_part audits-h; then
+  echo "running bounded superseded-ack retention TLC audit"
+  TLC_WORKERS="${tlc_workers}" "${superseded_ack_retention_audit}" "${SUPERSEDED_ACK_RETENTION_AUDIT_MAX_STEPS:-6}" --mutants
 fi
 
 # The run-start hold (#1500: a mob Stop holds member run starts so an input
@@ -777,10 +804,13 @@ run_machine_verify() {
 # eight whole-space runs took 165 s and its first 23 of 32 witness runs 173 s
 # before the job timeout cut it off, about 430 s in all, and about 525 s on
 # the pull request's runner, 1.22x slower on the rest of its shard;
-# audits-h = input controller hold with --mutants, alone: its safety run
+# audits-h = input controller hold with --mutants: its safety run
 # (1617 distinct states at 14 steps), nine witness runs and nine
-# single-worker mutant runs took 100 s on a 4-worker local run, not yet
-# measured on a hosted runner.
+# single-worker mutant runs took 100 s on a 4-worker local run; and the
+# superseded-ack retention audit with --mutants: its safety run (1382
+# distinct states at 6 steps), three witness runs and eight mutant runs took
+# about 5 s on a 4-worker local run. Neither is yet measured on a hosted
+# runner.
 # Each job adds about 20 s of checkout and TLC setup: 6-10 minutes a shard,
 # inside the 1080 s execution budget even on a runner 1.6x slower than the
 # faster ones here. As three shards these audits ran 13-18 minutes (audits-a),

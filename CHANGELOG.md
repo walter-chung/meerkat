@@ -257,6 +257,21 @@ them.
   parameter; `None` measures as before. A custom `Compactor` may read the
   two new context fields or ignore them; no existing field changes meaning.
 
+- Behaviour-only (not measured by the gate): `meerkat-schedule`,
+  `meerkat-machine-schema` (the generated `ScheduleLifecycleMachine`
+  authority in `catalog::dsl::schedule_lifecycle`): a schedule's
+  superseded acknowledgements (the `superseded_ack_ids` field of
+  `Schedule` and of the `Schedule` wire projection, `superseded_ack_ids` in
+  the Python SDK and `supersededAckIds` in the TypeScript SDK) list only
+  the occurrences the latest revise or delete superseded. Each revise or
+  delete drops the ids recorded before it, so after a second one the field
+  no longer lists the occurrences an earlier one superseded. An
+  acknowledgement given to `Schedule::apply`
+  (`ScheduleLifecycleInput::ConfirmOccurrencesSuperseded`) or
+  `apply_supersession_feedback` that does not answer the schedule's
+  current revision is still accepted with no effect, and is no longer
+  recorded. No shape, answer or error changes (see Fixed).
+
 ### Added
 
 - `meerkat-runtime`: `PromptInput::detached_job_completed_with_handling`
@@ -623,6 +638,22 @@ them.
   take once it is unset. The host binaries' own workers and main future keep
   the 8 MiB budget. The added size is virtual address space; pages are
   committed only when touched.
+
+- `meerkat-schedule`, `meerkat-machine-schema`: a schedule's
+  `superseded_ack_ids` no longer grows without bound.
+  `ScheduleLifecycleMachine` recorded the id of every occurrence each
+  revise or delete superseded and never removed one, so a schedule edited
+  often carried an ever larger set in its machine state, in its stored row
+  and on the wire. The machine now keeps only the acknowledgements of the
+  latest supersession: each revise or delete drops the ids recorded so far
+  before its own supersession's acknowledgements arrive, and an
+  acknowledgement that does not answer the current revision (a late one of
+  an earlier supersession, or one of a revision the schedule never
+  reached) is accepted as before and changes nothing. A schedule stored
+  with a large set loads unchanged, and its next revise or delete drops
+  it, with no migration step. A schedule deleted before this release keeps
+  the set it was deleted with: a deleted schedule is never revised, and a
+  repeated delete changes nothing.
 
 ### Upgrade notes
 

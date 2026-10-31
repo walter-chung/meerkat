@@ -417,6 +417,15 @@ Occurrence phase is more detailed:
 - `superseded`
 - `delivery_failed`
 
+An update that changes the trigger, the target or a policy is a revise: the
+schedule's `revision` goes up, and every outstanding occurrence of an older
+revision, claimed and in-flight ones included, becomes `superseded`. A delete
+does the same at its own revision. Each superseded occurrence is acknowledged
+back to the schedule, and the schedule's `superseded_ack_ids` lists the
+occurrences the latest revise or delete superseded; the next revise or delete
+replaces the list. A delivery that finishes after its occurrence was
+superseded is recorded on that occurrence and leaves the schedule as it is.
+
 Use `schedule/occurrences` or `GET /schedules/{id}/occurrences` to inspect what actually fired and why.
 
 ## Executor Lease And Crash Recovery
