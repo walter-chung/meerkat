@@ -3191,31 +3191,45 @@ mod tests {
         })
     }
 
+    /// With only `schedule_id` the reply is one page of 50 full occurrences
+    /// in due order, each carrying its target once: no machine state (which
+    /// repeated the target as an escaped key) and no claim token. The rest
+    /// of the history follows the page's cursor.
     #[tokio::test]
-    async fn occurrences_without_bounded_options_keep_the_full_unpaged_reply() -> Result<(), String>
-    {
+    async fn occurrences_default_is_a_bounded_page_without_machine_state() -> Result<(), String> {
         let service = ScheduleService::new(Arc::new(MemoryScheduleStore::default()));
-        let schedule_id = create_for_bounded_reads(&service, 4).await?;
+        let schedule_id = create_for_bounded_reads(&service, 60).await?;
 
         let reply = read_occurrences(&service, json!({ "schedule_id": schedule_id }))
             .await
             .map_err(|error| format!("{error:?}"))?;
 
-        let object = reply.as_object().ok_or("reply should be an object")?;
-        assert_eq!(
-            object.len(),
-            1,
-            "no page or receipts keys by default: {reply}"
-        );
         let rows = rows_of(&reply)?;
-        assert_eq!(rows.len(), 4);
-        assert!(
-            rows.iter()
-                .all(|row| row.get("machine_state").is_some()
-                    && row.get("target_snapshot").is_some()),
-            "the default view stays the full occurrence object"
-        );
-        // Explicit nulls and view=full alone take the same unpaged path.
+        assert_eq!(rows.len(), 50, "the default page");
+        assert_eq!(reply["page"]["returned"].as_u64(), Some(50), "{reply}");
+        assert_eq!(reply["page"]["has_more"].as_bool(), Some(true), "{reply}");
+        let cursor = reply["page"]["next_cursor"]
+            .as_str()
+            .ok_or("the default page continues")?
+            .to_string();
+        for row in &rows {
+            for dropped in ["machine_state", "claim_token"] {
+                assert!(
+                    row.get(dropped).is_none(),
+                    "the reply keeps {dropped}: {row}"
+                );
+            }
+            assert!(
+                row.get("target_snapshot").is_some() && row.get("trigger_snapshot").is_some(),
+                "the default view is the full occurrence: {row}"
+            );
+            assert_eq!(
+                row.to_string().matches("tool surface").count(),
+                1,
+                "the prompt is in the row once: {row}"
+            );
+        }
+        // Explicit nulls and view=full alone take the same default.
         for args in [
             json!({ "schedule_id": schedule_id, "view": null, "limit": null, "cursor": null }),
             json!({ "schedule_id": schedule_id, "view": "full" }),
@@ -3225,6 +3239,15 @@ mod tests {
                 .map_err(|error| format!("{error:?}"))?;
             assert_eq!(same, reply, "an all-default call must not change the reply");
         }
+        let rest = read_occurrences(
+            &service,
+            json!({ "schedule_id": schedule_id, "cursor": cursor }),
+        )
+        .await
+        .map_err(|error| format!("{error:?}"))?;
+        assert_eq!(rows_of(&rest)?.len(), 10);
+        assert_eq!(rest["page"]["has_more"].as_bool(), Some(false), "{rest}");
+        assert!(rest["page"]["next_cursor"].is_null(), "{rest}");
         Ok(())
     }
 
@@ -3240,7 +3263,7 @@ mod tests {
         .await
         .map_err(|error| format!("{error:?}"))?;
 
-        // Any bounded option pages the reply, 100 rows by default.
+        // Every list reply is paged, 50 rows by default.
         assert_eq!(reply["page"]["returned"].as_u64(), Some(2), "{reply}");
         assert_eq!(reply["page"]["has_more"].as_bool(), Some(false), "{reply}");
         assert!(reply["page"]["next_cursor"].is_null(), "{reply}");
@@ -3762,12 +3785,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn page_sizes_default_to_100_cap_at_500_and_end_exactly() -> Result<(), String> {
+    async fn page_sizes_default_to_50_cap_at_200_and_end_exactly() -> Result<(), String> {
         let service = ScheduleService::new(Arc::new(MemoryScheduleStore::default()));
         let schedule_id = create_for_bounded_reads(&service, 120).await?;
         for (mut args, returned, has_more) in [
-            (json!({ "view": "summary" }), 100, true),
-            (json!({ "limit": 500 }), 120, false),
+            (json!({}), 50, true),
+            (json!({ "view": "summary" }), 50, true),
+            (json!({ "limit": 200 }), 120, false),
             (json!({ "limit": 120 }), 120, false),
             (json!({ "limit": 119 }), 119, true),
         ] {
@@ -3874,7 +3898,7 @@ mod tests {
         let schedule_id = create_for_bounded_reads(&service, 2).await?;
         let cases = [
             json!({ "limit": 0 }),
-            json!({ "limit": MAX_OCCURRENCE_PAGE + 1 }),
+            json!({ "limit": 201 }),
             json!({ "cursor": "c1zz" }),
             json!({ "limit": 2, "cursor": "not-a-cursor" }),
             json!({ "due_after_utc": "yesterday" }),
@@ -3926,6 +3950,385 @@ mod tests {
             .collect();
         assert!(ids.contains(&kept.as_str()));
         assert!(!ids.contains(&deleted.as_str()));
+        Ok(())
+    }
+
+    // --- bounded schedule replies --------------------------------------------
+
+    fn prompt_target(prompt: &str) -> TargetBinding {
+        TargetBinding::session(SessionTargetBinding::ExactSession {
+            session_id: SessionId::new(),
+            action: ScheduledSessionAction::Prompt {
+                prompt: ContentInput::from(prompt),
+                system_prompt: None,
+                render_metadata: None,
+                skill_refs: Vec::new(),
+                additional_instructions: Vec::new(),
+            },
+        })
+    }
+
+    /// `schedule_request()` with a session prompt target of `prompt`.
+    fn prompt_schedule_request(prompt: &str) -> CreateScheduleRequest {
+        CreateScheduleRequest {
+            target: prompt_target(prompt),
+            ..schedule_request()
+        }
+    }
+
+    async fn call_tool(
+        service: &ScheduleService,
+        name: &str,
+        arguments: Value,
+    ) -> Result<Value, String> {
+        handle_schedule_tools_call(service, name, &arguments)
+            .await
+            .map_err(|error| format!("{name}: {error:?}"))
+    }
+
+    /// The schedule ids of one `meerkat_schedule_list` page, in order.
+    fn listed_ids(reply: &Value) -> Result<Vec<String>, String> {
+        reply["schedules"]
+            .as_array()
+            .ok_or_else(|| format!("reply has no schedules array: {reply}"))?
+            .iter()
+            .map(|row| {
+                row["schedule_id"]
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("row has no schedule_id: {row}"))
+            })
+            .collect()
+    }
+
+    /// A listed schedule is a bounded summary: what it is, when it fires,
+    /// what it targets and the head of its action text. The persistence
+    /// shape the list used to return carried the prompt twice (the target,
+    /// and the machine state's escaped target key) and the superseded acks
+    /// of every revision twice; for this 4,000-character prompt revised
+    /// twice that row was over 8 KB.
+    #[tokio::test]
+    async fn schedule_list_rows_are_bounded_summaries() -> Result<(), String> {
+        let service = ScheduleService::new(Arc::new(MemoryScheduleStore::default()));
+        let prompt = "p".repeat(4_000);
+        let schedule = service
+            .create(prompt_schedule_request(&prompt))
+            .await
+            .map_err(|error| error.to_string())?;
+        for revision in 1..=2 {
+            service
+                .update(
+                    &schedule.schedule_id,
+                    UpdateScheduleRequest {
+                        target: Some(prompt_target(&format!("{prompt}{revision}"))),
+                        ..UpdateScheduleRequest::default()
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        let revised = service
+            .get(&schedule.schedule_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(
+            !revised.superseded_ack_ids.is_empty(),
+            "the revisions superseded planned occurrences"
+        );
+
+        let listed = call_tool(&service, "meerkat_schedule_list", json!({})).await?;
+        let rows = listed["schedules"].as_array().ok_or("schedules array")?;
+        assert_eq!(rows.len(), 1, "{listed}");
+        let row = &rows[0];
+        for dropped in [
+            "machine_state",
+            "superseded_ack_ids",
+            "next_occurrence_ordinal",
+            "planning_cursor_utc",
+            "misfire_policy",
+        ] {
+            assert!(
+                row.get(dropped).is_none(),
+                "a summary keeps {dropped}: {row}"
+            );
+        }
+        assert!(
+            row["target"].get("action").is_none(),
+            "the action stays out of a summary: {row}"
+        );
+        assert_eq!(row["target"]["target_kind"], "session");
+        assert_eq!(row["target"]["type"], "exact_session");
+        assert!(row["target"]["session_id"].is_string(), "{row}");
+        assert_eq!(row["schedule_id"], json!(schedule.schedule_id));
+        assert_eq!(row["name"], "heartbeat");
+        assert_eq!(row["phase"], "active");
+        assert_eq!(row["revision"], 3);
+        assert_eq!(row["trigger"]["type"], "interval");
+        let head = row["action_head"].as_str().ok_or("action_head")?;
+        assert!(head.starts_with("ppp"), "{head}");
+        assert!(head.chars().count() < 200, "the head is bounded: {head}");
+        assert_eq!(row["action_chars"], 4_001);
+        let row_bytes = row.to_string().len();
+        assert!(
+            row_bytes < 1_024,
+            "a summary row is bounded: {row_bytes} bytes"
+        );
+        Ok(())
+    }
+
+    /// Sixty schedules list as a page of 50 and a page of 10 in creation
+    /// order (creation time, then schedule id), each schedule once; the
+    /// second page continues from the first page's opaque cursor.
+    #[tokio::test]
+    async fn schedule_list_pages_in_creation_order_with_an_opaque_cursor() -> Result<(), String> {
+        let service = ScheduleService::new(Arc::new(MemoryScheduleStore::default()));
+        let mut created = Vec::new();
+        for _ in 0..60 {
+            let schedule = service
+                .create(bounded_read_request(interval_trigger(60), 1))
+                .await
+                .map_err(|error| error.to_string())?;
+            created.push((schedule.config.created_at_utc, schedule.schedule_id));
+        }
+        created.sort();
+        let expected: Vec<String> = created.iter().map(|(_, id)| id.to_string()).collect();
+
+        let first = call_tool(&service, "meerkat_schedule_list", json!({})).await?;
+        let first_ids = listed_ids(&first)?;
+        assert_eq!(first_ids.len(), 50, "the default page");
+        assert_eq!(first["page"]["returned"].as_u64(), Some(50), "{first}");
+        assert_eq!(first["page"]["has_more"].as_bool(), Some(true), "{first}");
+        let cursor = first["page"]["next_cursor"]
+            .as_str()
+            .ok_or("the first page continues")?
+            .to_string();
+        assert!(
+            first_ids.iter().all(|id| !cursor.contains(id.as_str())),
+            "the cursor is opaque: {cursor}"
+        );
+
+        let second = call_tool(
+            &service,
+            "meerkat_schedule_list",
+            json!({ "cursor": cursor }),
+        )
+        .await?;
+        let second_ids = listed_ids(&second)?;
+        assert_eq!(second_ids.len(), 10);
+        assert_eq!(second["page"]["returned"].as_u64(), Some(10), "{second}");
+        assert_eq!(
+            second["page"]["has_more"].as_bool(),
+            Some(false),
+            "{second}"
+        );
+        assert!(second["page"]["next_cursor"].is_null(), "{second}");
+
+        let mut paged = first_ids;
+        paged.extend(second_ids);
+        assert_eq!(paged, expected, "every schedule once, in creation order");
+
+        let small = call_tool(&service, "meerkat_schedule_list", json!({ "limit": 7 })).await?;
+        assert_eq!(listed_ids(&small)?, expected[..7].to_vec());
+        assert_eq!(small["page"]["has_more"].as_bool(), Some(true), "{small}");
+        Ok(())
+    }
+
+    /// Page options a schedule listing cannot honor are refused as invalid
+    /// arguments, never ignored.
+    #[tokio::test]
+    async fn schedule_list_refuses_malformed_page_options() -> Result<(), String> {
+        let service = ScheduleService::new(Arc::new(MemoryScheduleStore::default()));
+        let schedule_id = create_for_bounded_reads(&service, 2).await?;
+        // A valid occurrences cursor names an occurrence, not a schedule.
+        let occurrences =
+            read_occurrences(&service, json!({ "schedule_id": schedule_id, "limit": 1 }))
+                .await
+                .map_err(|error| format!("{error:?}"))?;
+        let occurrence_cursor = occurrences["page"]["next_cursor"]
+            .as_str()
+            .ok_or("the occurrences page continues")?
+            .to_string();
+        for case in [
+            json!({ "limit": 0 }),
+            json!({ "limit": 201 }),
+            json!({ "limit": -1 }),
+            json!({ "limit": "ten" }),
+            json!({ "cursor": "x" }),
+            json!({ "cursor": 7 }),
+            json!({ "cursor": occurrence_cursor }),
+        ] {
+            match handle_schedule_tools_call(&service, "meerkat_schedule_list", &case).await {
+                Err(error) => assert_eq!(error.code, INVALID_ARGUMENTS, "{case}: {error:?}"),
+                Ok(reply) => return Err(format!("{case} was accepted: {reply}")),
+            }
+        }
+        Ok(())
+    }
+
+    /// Every schedule tool that returns one schedule returns it in the
+    /// public shape of `schedule/get`: the full target with its prompt once,
+    /// and no machine state, which repeated the target and the trigger as
+    /// escaped keys.
+    #[tokio::test]
+    async fn schedule_get_and_mutations_return_detail_without_machine_state() -> Result<(), String>
+    {
+        let service = ScheduleService::new(Arc::new(MemoryScheduleStore::default()));
+        let first_prompt = "first detail prompt ".repeat(30);
+        let second_prompt = "second detail prompt ".repeat(30);
+        let request = serde_json::to_value(prompt_schedule_request(&first_prompt))
+            .map_err(|error| error.to_string())?;
+        let created = call_tool(&service, "meerkat_schedule_create", request).await?;
+        let schedule_id = created["schedule_id"]
+            .as_str()
+            .ok_or("create returns schedule_id")?
+            .to_string();
+        let by_id = json!({ "schedule_id": schedule_id });
+        let mut update = serde_json::to_value(UpdateScheduleRequest {
+            target: Some(prompt_target(&second_prompt)),
+            ..UpdateScheduleRequest::default()
+        })
+        .map_err(|error| error.to_string())?;
+        update["schedule_id"] = json!(schedule_id);
+
+        let replies = [
+            ("create", first_prompt.as_str(), created),
+            (
+                "get",
+                first_prompt.as_str(),
+                call_tool(&service, "meerkat_schedule_get", by_id.clone()).await?,
+            ),
+            (
+                "update",
+                second_prompt.as_str(),
+                call_tool(&service, "meerkat_schedule_update", update).await?,
+            ),
+            (
+                "pause",
+                second_prompt.as_str(),
+                call_tool(&service, "meerkat_schedule_pause", by_id.clone()).await?,
+            ),
+            (
+                "resume",
+                second_prompt.as_str(),
+                call_tool(&service, "meerkat_schedule_resume", by_id.clone()).await?,
+            ),
+            (
+                "delete",
+                second_prompt.as_str(),
+                call_tool(&service, "meerkat_schedule_delete", by_id).await?,
+            ),
+        ];
+        for (tool, prompt, reply) in &replies {
+            assert!(
+                reply.get("machine_state").is_none(),
+                "the {tool} reply carries machine state: {reply}"
+            );
+            assert_eq!(reply["schedule_id"], json!(schedule_id), "{tool}");
+            assert_eq!(
+                reply["target"]["action"]["prompt"],
+                json!(prompt),
+                "{tool}: the full target"
+            );
+            assert_eq!(
+                reply.to_string().matches(prompt).count(),
+                1,
+                "{tool}: the prompt once"
+            );
+            assert!(reply["next_occurrence_ordinal"].is_u64(), "{tool}: {reply}");
+            assert!(
+                reply["planning_horizon_days"].is_u64(),
+                "{tool}: the flattened configuration: {reply}"
+            );
+        }
+        assert_eq!(replies[3].2["phase"], "paused");
+        assert_eq!(replies[4].2["phase"], "active");
+        assert_eq!(replies[5].2["phase"], "deleted");
+        Ok(())
+    }
+
+    /// A summary heads each target kind's action text: a session prompt (cut
+    /// at 160 characters), a helper's prompt and an event's type. A host
+    /// runnable carries params and has no action text; neither its params
+    /// nor a helper's options reach the summary.
+    #[tokio::test]
+    async fn schedule_list_heads_each_target_kinds_action_text() -> Result<(), String> {
+        let service = ScheduleService::new(Arc::new(MemoryScheduleStore::default()));
+        service
+            .create(CreateScheduleRequest {
+                name: Some("long-prompt".into()),
+                ..prompt_schedule_request(&"h".repeat(300))
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        service
+            .create(CreateScheduleRequest {
+                name: Some("event".into()),
+                target: TargetBinding::session(SessionTargetBinding::ExactSession {
+                    session_id: SessionId::new(),
+                    action: ScheduledSessionAction::Event {
+                        event_type: "nightly.check".into(),
+                        payload: json!({ "window": "24h" }),
+                        render_metadata: None,
+                    },
+                }),
+                ..schedule_request()
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        call_tool(
+            &service,
+            "meerkat_schedule_create",
+            spawn_helper_create_args(None),
+        )
+        .await?;
+        let mut host =
+            serde_json::to_value(schedule_request()).map_err(|error| error.to_string())?;
+        host["name"] = json!("host");
+        host["target"] = json!({
+            "target_kind": "host_runnable",
+            "runnable": "nightly-report",
+            "params": { "window": "24h" },
+        });
+        call_tool(&service, "meerkat_schedule_create", host).await?;
+
+        let listed = call_tool(&service, "meerkat_schedule_list", json!({})).await?;
+        let rows = listed["schedules"].as_array().ok_or("schedules array")?;
+        let row = |name: &str| {
+            rows.iter()
+                .find(|row| row["name"] == name)
+                .ok_or_else(|| format!("no {name} row: {listed}"))
+        };
+        let long = row("long-prompt")?;
+        assert_eq!(
+            long["action_head"],
+            json!(format!("{}...", "h".repeat(160)))
+        );
+        assert_eq!(long["action_chars"], 300);
+        let event = row("event")?;
+        assert_eq!(event["action_head"], "nightly.check");
+        assert_eq!(event["action_chars"], 13);
+        assert!(event["target"].get("action").is_none(), "{event}");
+        let helper = row("gated-helper")?;
+        assert_eq!(helper["action_head"], "do scheduled work");
+        assert_eq!(helper["action_chars"], 17);
+        assert_eq!(
+            helper["target"],
+            json!({
+                "target_kind": "mob",
+                "type": "spawn_helper",
+                "mob_id": "ops",
+                "member_id": "helper-1",
+            })
+        );
+        let host = row("host")?;
+        assert!(
+            host.get("action_head").is_none() && host.get("action_chars").is_none(),
+            "{host}"
+        );
+        assert_eq!(
+            host["target"],
+            json!({ "target_kind": "host_runnable", "runnable": "nightly-report" })
+        );
         Ok(())
     }
 }
