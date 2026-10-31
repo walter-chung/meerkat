@@ -92,14 +92,15 @@ suppress an ordinary provider high-water mark, but it cannot veto recovery
 when request bytes cross a capacity threshold, when live history does and
 the last rewrite got the history under the threshold, or when the projection
 crosses the threshold through what was appended since the last answered
-request (an anchor already at or over the threshold waits for the cadence,
-like the provider's count). Since 0.9.4, when the
+request and the last rewrite got the history under the threshold (an anchor
+already at or over the threshold waits for the cadence, like the provider's
+count). Since 0.9.4, when the
 last rewrite left the history at or above the threshold (for example because
 the System rows alone exceed an explicit `auto_compact_threshold`), a history
-crossing waits for the cadence instead of paying for a summary that recovers
-nothing, and a warning names the remedies. Under byte pressure, the compactor
-may retain fewer recent turns than the configured maximum so the rebuilt
-request actually fits.
+or projection crossing waits for the cadence instead of paying for a summary
+that recovers nothing, and a warning names the remedies. Under byte pressure,
+the compactor may retain fewer recent turns than the configured maximum so the
+rebuilt request actually fits.
 
 A request the provider refuses for not fitting the model's context still fails
 its run, and it reports no usage, so no measure moves. The agent records the

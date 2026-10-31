@@ -478,8 +478,8 @@ When `session-compaction` is enabled:
   history-token or exact provider-byte capacity crossing bypasses that cost
   guard so an already-oversized request can recover immediately, and so do a
   projection crossing made by the growth since the last answered request and a
-  context refusal (one compaction per refusal). A
-  history-token crossing bypasses it only while the last rewrite got the
+  context refusal (one compaction per refusal). A history-token or
+  projection crossing bypasses it only while the last rewrite got the
   history under the threshold, or when the request no longer fits the model
   window and the history added since that rewrite covers the overage: when
   the rows a rewrite keeps cross the threshold on their own, compacting again

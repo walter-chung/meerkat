@@ -134,7 +134,8 @@ The decision flow:
       exactly those rows and the estimates below under-read dense content such
       as JSON, so the projection keeps the exact count and estimates only the
       growth. It bypasses the cadence when the growth made the crossing (the
-      last answered request was under the threshold). Its anchor is persisted
+      last answered request was under the threshold) and the last rewrite, if
+      any, got the history under the threshold. Its anchor is persisted
       with the session, so an agent rebuilt from its store projects its first
       request too; a committed rewrite drops it until the next answer, OR
     - `estimated_history_tokens >= auto_compact_threshold` (a conservative

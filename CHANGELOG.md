@@ -340,13 +340,15 @@ them.
   provider's count for the last answered request plus the estimate of only
   the rows appended since (`CompactionContext::projected_input_tokens`).
   `DefaultCompactor` compacts when the projection reaches the threshold; the
-  cadence cannot veto a crossing the growth since the answered request made,
-  and a projection whose answered request alone was over the threshold waits
-  for the cadence as the provider's count does. The anchor is set by every
-  answered request, dropped by a committed rewrite (and restored when the
-  rewrite rolls back) and when the active provider or model is not the one
-  that counted it, and persisted in the session's compaction cadence, so an
-  agent rebuilt from its store projects its first request too.
+  cadence cannot veto a crossing the growth since the answered request made
+  (while the last rewrite left the history under the threshold, as for a
+  history crossing), and a projection whose answered request alone was over
+  the threshold waits for the cadence as the provider's count does. The
+  anchor is set by every answered request, dropped by a committed rewrite
+  (and restored when the rewrite rolls back) and when the active provider or
+  model is not the one that counted it, and persisted in the session's
+  compaction cadence, so an agent rebuilt from its store projects its first
+  request too.
 
 - `meerkat-core` and `meerkat-session`: a session whose request the provider
   refused for not fitting the model's context no longer stays wedged. The

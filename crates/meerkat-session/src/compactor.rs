@@ -651,7 +651,10 @@ impl Compactor for DefaultCompactor {
         // projection is a provider-reported high-water mark like
         // `last_input_tokens`, and waits for the cadence. A committed rewrite
         // drops the anchor, so the next answer re-anchors with what the
-        // rewrite left.
+        // rewrite left. The floor rule of a history crossing holds too: when
+        // the last rewrite left the history at or above the threshold, a
+        // growth crossing waits for the cadence unless that growth covers the
+        // window overage.
         //
         // A context refusal is recovery by definition: the refused request
         // did not fit, so it bypasses the threshold and the cadence. The
@@ -688,12 +691,13 @@ impl Compactor for DefaultCompactor {
                  derives from the model window, or shrink the System rows"
             );
         }
-        let projection_crossed_by_growth = projection_trigger
+        let projection_recovers = projection_trigger
             && projection.is_some_and(|projection| {
                 projection.anchor_tokens < self.config.auto_compact_threshold
-            });
+            })
+            && (!history_floor_crosses || removable_growth_covers_overage);
         let requires_capacity_recovery =
-            history_recovers || byte_trigger || projection_crossed_by_growth || context_refused;
+            history_recovers || byte_trigger || projection_recovers || context_refused;
         if !requires_capacity_recovery
             && let Some(last) = ctx.last_compaction_boundary_index
             && ctx.session_boundary_index.saturating_sub(last)
