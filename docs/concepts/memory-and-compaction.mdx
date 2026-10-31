@@ -128,24 +128,28 @@ again. A host transcript edit and a fork at a point drop it with the anchor.
 Because a compaction inside a run keeps the run's request and newest round, a
 round whose own tool results are larger than the provider or the model takes
 cannot be folded while the run lasts. After the compaction check, when the
-request is still over the provider's request-body cap, or its composed input
-still projects over the model's input budget (the context window less the
-output reserve, or the input ceiling), the request carries each of the run's
-own results over its share shortened, for that request only: the head of its
-text, media as placeholders, and a marker naming the call. Each result's
+request is still over the provider's request-body cap, or the forecast of its
+composed input is still over the model's input budget (the context window less
+the output reserve, or the input ceiling), the request carries each of the
+run's own results over its share shortened, for that request only: the head of
+its text, media as placeholders, and a marker naming the call. Each result's
 share is what the rest of the request leaves the run's results; on the token
 axis it is sized from the overage at two bytes a token, so a head of dense
 text still fits. The stored transcript keeps every result whole. The agent
 publishes `tool_results_bounded_for_request` (the run, each call with the
-bytes its head kept and the whole result's size, and the limit), the answer
-to that request anchors no projection, and the bound records the same fact a
-context refusal does, so the next run's first check compacts the whole
-transcript once instead of sending the whole result again. The bounded
-request's own answer keeps the fact; an answer to a request sent whole clears
-it, as for a refusal. The compaction check itself measures the request as
-composed, before the bound. A request whose projection reads under the window
-(the estimate counts four bytes a token) can still be refused, and then heals
-as above.
+bytes its head kept and the whole result's size, and the limit), the answer to
+that request anchors no projection, and the bound records the same fact a
+context refusal does, so, with the default compactor, the next run's first
+check compacts the whole transcript once instead of sending the whole result
+again. With compaction off the request is still bounded, and nothing is
+recorded. The bounded request's own answer keeps the fact; an answer to a
+request sent whole clears it, as for a refusal. The compaction check itself
+measures the request as composed, before the bound. A request whose forecast
+reads under the window (its estimate counts four bytes a token) can still be
+refused, and then heals as above. The forecast also counts media high (1,600
+tokens an image, inline video at a token per four bytes of its base64), so a
+run's own images or inline video can be bounded to placeholders although the
+provider would take them whole.
 
 ## Summary authority
 

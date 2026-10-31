@@ -411,27 +411,32 @@ them.
 
 - `meerkat-core`: a run whose own tool result is larger than what the
   model's context window leaves no longer fails with a context refusal when
-  its request projects over the window. A compaction inside a run keeps the
-  run's request and newest round, so the round carrying the result was sent
-  whole and refused. The request-only bound that already shortened the
+  its request's forecast is over the window. A compaction inside a run keeps
+  the run's request and newest round, so the round carrying the result was
+  sent whole and refused. The request-only bound that already shortened the
   run's own results past the provider's request-body cap now also acts on
-  the token axis: when the composed request, after the compaction check,
-  still projects over the model's input budget (the context window less the
-  output reserve, or the input ceiling), each of the run's results over its
-  share keeps the head of its text and a marker naming the call, for that
-  request only, the share sized from the token overage at two bytes a
-  token. The stored transcript keeps every result whole. On either axis the
-  bound is now announced (`tool_results_bounded_for_request`, see Breaking),
-  the answer to a bounded request no longer anchors the input projection
-  (its count understates the transcript, so the anchor stays on the request
-  before it), and the bound records the fact a context refusal records, so
-  the next run's first check compacts the whole transcript once instead of
-  sending the whole result again. The bounded request's own answer keeps
-  the fact; an answer to a request sent whole clears it, as for a refusal.
-  The compaction check measures the request as composed, before the bound,
-  in tokens as in bytes. After a model fallback the bound cuts from the
-  whole results again, so the marker and the event state each result's
-  whole size.
+  the token axis: when the forecast of the composed request, after the
+  compaction check, is still over the model's input budget (the context
+  window less the output reserve, or the input ceiling), each of the run's
+  results over its share keeps the head of its text and a marker naming the
+  call, for that request only, the share sized from the token overage at two
+  bytes a token. The stored transcript keeps every result whole. On either
+  axis the bound is now announced (`tool_results_bounded_for_request`, see
+  Breaking), the answer to a bounded request no longer anchors the input
+  projection (its count understates the transcript, so the anchor stays on
+  the request before it), and the bound records the fact a context refusal
+  records, so with the default compactor the next run's first check compacts
+  the whole transcript once instead of sending the whole result again; with
+  compaction off the request is still bounded and nothing is recorded. The
+  bounded request's own answer keeps the fact; an answer to a request sent
+  whole clears it, as for a refusal. A provider cache breakpoint past the
+  first result a bounded request carried shortened is dropped unreported: it
+  anchors a prefix the transcript never held, and it was published as a
+  discarded, moved prefix (`provider_cache_breakpoints_discarded`), a
+  degradation that did not happen. The compaction check measures the request
+  as composed, before the bound, in tokens as in bytes. After a model
+  fallback the bound cuts from the whole results again, so the marker and
+  the event state each result's whole size.
 
 - `meerkat-core`: a pending or approved human consent (R3) is now kept
   across unrelated authorization changes and past the end of its decision's
@@ -715,11 +720,19 @@ them.
 
 - `meerkat-core`: a run whose own newest round is larger than what the
   context window leaves once the rows before the run are folded still fails
-  with a context refusal when its request's projection reads under the
-  window: a compaction inside a run keeps the run's request and newest round
-  verbatim, and the request-only bound acts on the projection, whose
-  transcript estimate counts four bytes a token and so under-reads dense
-  content. The next run compacts first and continues (see Fixed).
+  with a context refusal when its request's forecast reads under the window:
+  a compaction inside a run keeps the run's request and newest round
+  verbatim, and the request-only bound acts on the composed request's
+  forecast, whose transcript estimate counts four bytes a token and so
+  under-reads dense content. The next run compacts first and continues (see
+  Fixed).
+
+- `meerkat-core`: the same forecast counts media high: each image as 1,600
+  tokens and inline video at a token per four bytes of its base64 data. A run
+  whose own tool results carry inline video, or many images, can be bounded
+  on the context window although the provider would take the request whole,
+  and that request then carries the media as placeholders. The stored
+  transcript keeps the media whole.
 
 - `meerkat-core`: a context refusal whose run's closing save or boundary
   build fails is not persisted; the next refusal records it again.

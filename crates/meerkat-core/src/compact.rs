@@ -151,7 +151,10 @@ pub struct CompactionContext {
     /// under-triggers by exactly the omitted components. This fact is the same
     /// measurement the pre-dispatch preflight performs, over the fully
     /// hydrated request messages, the exact visible tool set, and the effective
-    /// output reserve.
+    /// output reserve. When the open run's own tool results are bounded for
+    /// the request, it measures the request as composed, before the bound:
+    /// the pressure a compaction could relieve. The preflight then measures
+    /// the bounded request.
     ///
     /// `None` is truthful rather than tolerant: custom and self-hosted models
     /// may declare no context window, and no substitute ceiling may be invented
@@ -160,7 +163,9 @@ pub struct CompactionContext {
     /// Exact provider-lowered request-body pressure, when the active client can
     /// prove it. This is measured after ordered System-message projection,
     /// blob hydration, tool selection, provider-parameter resolution, replay
-    /// projection, and provider-native JSON lowering.
+    /// projection, and provider-native JSON lowering. Like
+    /// `request_context_budget`, it measures the request as composed, before
+    /// any bound of the open run's own tool results.
     ///
     /// Custom clients default to `None`: an unavailable witness is truthful,
     /// while relabeling the transcript estimate as exact would make the

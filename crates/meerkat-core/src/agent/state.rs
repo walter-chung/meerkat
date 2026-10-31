@@ -3360,9 +3360,12 @@ where
         // Once per call: after a model fallback, the open run's oversized
         // tool results give way against the fallback's cap and input budget
         // as they do against the primary's at the boundary, cut from the whole
-        // results. The unbounded measurements are kept for the compaction
-        // check, and the bound is announced before the request is sent, as at
-        // the boundary.
+        // results. The measurements of the request this bound was given (as
+        // composed, or as the boundary already bounded it) are kept for the
+        // compaction check, and the bound is announced before the request is
+        // sent, as at the boundary. A fallback whose limits take the request
+        // as carried keeps the boundary's cut: the request is not measured
+        // again with its results whole.
         let mut fallback_unbounded_request: Option<Box<UnboundedRequest>> = None;
         let mut fallback_bound_notice: Option<Box<AgentEvent>> = None;
         let mut next_request_attempt = Some(prepared_attempt);
@@ -8776,8 +8779,8 @@ where
 
     /// The request `messages` with the open run's own tool results bounded
     /// for it only, when the request is over the effective request byte cap
-    /// (`pressure`) or projects over the model's input budget (`budget`) and
-    /// the run's results can give way
+    /// (`pressure`) or its forecast is over the model's input budget
+    /// (`budget`) and the run's results can give way
     /// ([`crate::agent::compact::bound_open_run_tool_results_for_request`]).
     /// `whole` pairs results the request already carries shortened with the
     /// whole results they were cut from.
@@ -9071,6 +9074,9 @@ where
         // limit an earlier measured turn already crossed.
         if let Some(turn_usage) = turn_usage.as_ref() {
             self.budget.record_turn_usage(turn_usage);
+            // A bounded request's count is kept too, although it reads low:
+            // the history estimate, the anchored projection and the fact the
+            // bound recorded all see the whole results.
             self.last_input_tokens = turn_usage.presented_tokens();
             self.record_answered_request(
                 turn_usage.presented_tokens(),
@@ -16865,7 +16871,7 @@ mod tests {
     /// The open run's own 400 KB result is past the model's 50k-token context
     /// window by itself, at the transcript estimator's four bytes a token as
     /// at the provider's two. The compaction at the round boundary folds the
-    /// earlier run, as before, and the request still projects over the
+    /// earlier run, as before, and the request's forecast is still over the
     /// window's input budget, so the result is bounded for that request only,
     /// sized from the token overage, and the run completes. The request
     /// carries the result's head and a marker naming the call; the stored

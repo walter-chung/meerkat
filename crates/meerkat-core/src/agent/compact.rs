@@ -1129,10 +1129,10 @@ pub(crate) struct RequestOverage {
     /// The provider-lowered body's encoded bytes and the effective request
     /// byte cap; over only when the first is the larger.
     pub(crate) request_bytes: Option<(u64, u64)>,
-    /// Tokens the composed request's input projects over the model's input
-    /// budget, the context window less the output reserve or the input
-    /// ceiling ([`crate::ContextBudgetFact::overage_tokens`]); over only when
-    /// above zero.
+    /// Tokens the forecast of the composed request's input is over the
+    /// model's input budget, the context window less the output reserve or
+    /// the input ceiling ([`crate::ContextBudgetFact::overage_tokens`]); over
+    /// only when above zero.
     pub(crate) context_tokens: Option<u64>,
 }
 

@@ -3159,15 +3159,17 @@ pub enum AgentEvent {
     },
     /// One model request of a run carried some of the run's own tool results
     /// shortened, for that request only: with them whole the request was over
-    /// the provider's request-body cap or projected over the model's context
-    /// window, and no compaction made room (a compaction inside a run keeps
-    /// the run's request and newest round).
+    /// the provider's request-body cap, or its forecast was over the model's
+    /// context window, and no compaction made room (a compaction inside a run
+    /// keeps the run's request and newest round).
     ///
     /// Each named result kept the head of its text, media as placeholders,
     /// with a marker naming the call that the model reads. The stored
-    /// transcript keeps every result whole, so the next run's first check
-    /// compacts the whole transcript once. Published before the request is
-    /// sent, once for each request that carries a bound.
+    /// transcript keeps every result whole. With the default compactor the
+    /// next run's first check then compacts the whole transcript once; with
+    /// compaction off the request is still bounded and nothing is recorded.
+    /// Published before the request is sent, once for each request that
+    /// carries a bound.
     ToolResultsBoundedForRequest {
         /// The run whose request carried the results shortened.
         run_id: crate::lifecycle::RunId,
