@@ -15953,12 +15953,17 @@ mod tests {
     /// after the other (ids `tc_1`, `tc_2`, ...) and answers "done". It
     /// writes the compaction summary when asked, and records every other
     /// request it serves. With `cap`, it measures each request as its JSON
-    /// size against that provider cap.
+    /// size against that provider cap. With `window`, it refuses every other
+    /// request over that context window, as a provider does.
     struct RoundsClient {
         rounds: usize,
         first_answer_bytes: usize,
         cap: Option<u64>,
+        window: Option<u64>,
+        provider: crate::provider::Provider,
+        model: &'static str,
         requests: Mutex<Vec<Vec<Message>>>,
+        refused: Mutex<usize>,
         summary_requests: Mutex<Vec<Vec<Message>>>,
         tool_calls: Mutex<usize>,
     }
@@ -15969,7 +15974,11 @@ mod tests {
                 rounds,
                 first_answer_bytes: 12,
                 cap: None,
+                window: None,
+                provider: crate::provider::Provider::Other,
+                model: "mock-model",
                 requests: Mutex::new(Vec::new()),
+                refused: Mutex::new(0),
                 summary_requests: Mutex::new(Vec::new()),
                 tool_calls: Mutex::new(0),
             }
@@ -15985,8 +15994,25 @@ mod tests {
             self
         }
 
+        /// Refuse with a context-length error every request other than a
+        /// compaction summary whose tokens (two request bytes a token, twice
+        /// as dense as the transcript estimator's four, as JSON listings
+        /// are) and output reserve exceed `window`, and answer as the model
+        /// `primary` that [`summary_window_test_registry`] declares with that
+        /// window.
+        fn with_window(mut self, window: u64) -> Self {
+            self.window = Some(window);
+            self.provider = crate::provider::Provider::OpenAI;
+            self.model = "primary";
+            self
+        }
+
         fn requests(&self) -> Vec<Vec<Message>> {
             self.requests.lock().unwrap().clone()
+        }
+
+        fn refused(&self) -> usize {
+            *self.refused.lock().unwrap()
         }
 
         fn summary_requests(&self) -> usize {
@@ -16017,7 +16043,7 @@ mod tests {
             &self,
             messages: &[Message],
             _tools: &[Arc<ToolDef>],
-            _max_tokens: u32,
+            max_tokens: u32,
             _temperature: Option<f32>,
             _provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
         ) -> Result<super::LlmStreamResult, AgentError> {
@@ -16043,6 +16069,22 @@ mod tests {
                     .push(messages.to_vec());
                 return Ok(text("summary".to_string()));
             }
+            if let Some(window) = self.window {
+                let requested = serde_json::to_vec(messages).map_or(u64::MAX, |encoded| {
+                    u64::try_from(encoded.len()).unwrap_or(u64::MAX)
+                }) / 2;
+                if requested.saturating_add(u64::from(max_tokens)) > window {
+                    *self.refused.lock().unwrap() += 1;
+                    return Err(AgentError::Llm {
+                        provider: "mock",
+                        reason: LlmFailureReason::ContextExceeded {
+                            max: u32::try_from(window).unwrap_or(u32::MAX),
+                            requested: u32::try_from(requested).unwrap_or(u32::MAX),
+                        },
+                        message: "context length exceeded".to_string(),
+                    });
+                }
+            }
             self.requests.lock().unwrap().push(messages.to_vec());
             if last_user == "first" {
                 return Ok(text("a".repeat(self.first_answer_bytes)));
@@ -16066,11 +16108,11 @@ mod tests {
         }
 
         fn provider(&self) -> crate::provider::Provider {
-            crate::provider::Provider::Other
+            self.provider
         }
 
         fn model(&self) -> &'static str {
-            "mock-model"
+            self.model
         }
     }
 
@@ -16531,6 +16573,375 @@ mod tests {
             })
             .expect("the run's result is in the request");
         assert_eq!(result.len(), 95_000, "the result is sent whole");
+    }
+
+    /// The `tool_results_bounded_for_request` notices among `events`, in
+    /// their wire form.
+    #[cfg(feature = "workspace-tests")]
+    fn bounded_request_notices(events: &[crate::event::AgentEvent]) -> Vec<serde_json::Value> {
+        events
+            .iter()
+            .filter(|event| {
+                crate::event::agent_event_type(event) == "tool_results_bounded_for_request"
+            })
+            .map(|event| serde_json::to_value(event).unwrap())
+            .collect()
+    }
+
+    /// The text blocks `request` carries for the result of the call
+    /// `call_id`.
+    #[cfg(feature = "workspace-tests")]
+    fn carried_result_texts(request: &[Message], call_id: &str) -> Vec<String> {
+        request
+            .iter()
+            .find_map(|message| match message {
+                Message::ToolResults { results, .. } => {
+                    results.iter().find(|result| result.tool_use_id == call_id)
+                }
+                _ => None,
+            })
+            .expect("the request carries the result")
+            .content
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text { text } => text.clone(),
+                _ => panic!("the listing's result holds text only"),
+            })
+            .collect()
+    }
+
+    /// The run that made the stored tool call `call_id`.
+    #[cfg(feature = "workspace-tests")]
+    fn run_of_call(transcript: &[Message], call_id: &str) -> RunId {
+        transcript
+            .iter()
+            .find_map(|message| match message {
+                Message::BlockAssistant(assistant)
+                    if assistant.tool_calls().any(|call| call.id == call_id) =>
+                {
+                    assistant.identity.run_id.clone()
+                }
+                _ => None,
+            })
+            .expect("the stored call names its run")
+    }
+
+    /// The open run's own 400 KB result is past the model's 50k-token context
+    /// window by itself, at the transcript estimator's four bytes a token as
+    /// at the provider's two. The compaction at the round boundary folds the
+    /// earlier run, as before, and the request still projects over the
+    /// window's input budget, so the result is bounded for that request only,
+    /// sized from the token overage, and the run completes. The request
+    /// carries the result's head and a marker naming the call; the stored
+    /// transcript keeps the result whole; the typed notice names the call,
+    /// both sizes and the context-window axis; the bound records that the
+    /// transcript holds content a request could not carry; and the answer to
+    /// the bounded request anchors no input projection, since its count
+    /// understates the transcript. Sent whole, the request was refused for
+    /// context and the run failed.
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn an_open_run_result_past_the_context_window_is_bounded_for_the_request() {
+        let client = Arc::new(RoundsClient::new(1).with_window(50_000));
+        let dispatcher = Arc::new(LargeListingDispatcher::new(400_000));
+        // Boundary 0 is run "first"; 1 is run "second" before its first
+        // response; 2 follows its tool round.
+        let mut agent = with_test_turn_state_handle_for_session(
+            AgentBuilder::new()
+                .model("primary")
+                .max_tokens_per_turn(1_024)
+                .compactor(Arc::new(FoldingCompactor::at(|boundary| boundary == 2)))
+                .with_effective_model_registry(summary_window_test_registry(&[(
+                    "primary", 50_000,
+                )])),
+            explicit_hot_swap_session("primary"),
+        )
+        .with_tool_visibility_owner(explicit_test_visibility_owner())
+        .build_standalone(client.clone(), dispatcher.clone(), Arc::new(NoopStore))
+        .await;
+
+        agent.run("first".into()).await.unwrap();
+        let (tx, mut rx) = mpsc::channel::<crate::event::AgentEvent>(256);
+        let second = agent.run_with_events("second".into(), tx).await;
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        if let Err(error) = &second {
+            panic!(
+                "the run completes with its result bounded for the request; requests refused \
+                 for context: {}; error: {error:?}",
+                client.refused()
+            );
+        }
+
+        assert_eq!(client.refused(), 0, "no request was refused for context");
+        assert_eq!(client.summary_requests(), 1, "the earlier run folded first");
+        assert_eq!(dispatcher.dispatches(), 1, "the tool ran once");
+        let last_request = client.requests().last().cloned().expect("the last request");
+        assert!(
+            last_request.iter().any(is_summary),
+            "the request follows the fold"
+        );
+        let carried = carried_result_texts(&last_request, "tc_1");
+        let [head, marker] = carried.as_slice() else {
+            panic!(
+                "the request carries the result's head and a marker, not {} blocks",
+                carried.len()
+            );
+        };
+        assert!(
+            head.len() >= 4 * 1024 && head.len() < 400_000,
+            "the head is bounded: {} bytes",
+            head.len()
+        );
+        assert!(
+            head.bytes().all(|byte| byte == b'r'),
+            "the head is the start of the result"
+        );
+        assert!(
+            marker.contains("list_records") && marker.contains("tc_1") && marker.contains("400000"),
+            "the marker names the call and its whole size: {marker}"
+        );
+
+        let transcript = agent.session().messages().to_vec();
+        let stored = rows_where(&transcript, is_tool_results);
+        let [Message::ToolResults { results, .. }] = stored.as_slice() else {
+            panic!("the run's one result row is stored");
+        };
+        assert_eq!(
+            results[0].text_content().len(),
+            400_000,
+            "the stored transcript keeps the result whole"
+        );
+
+        let notices = bounded_request_notices(&events);
+        assert_eq!(notices.len(), 1, "the bounded request is announced once");
+        assert_eq!(
+            notices[0]["run_id"],
+            serde_json::to_value(run_of_call(&transcript, "tc_1")).unwrap()
+        );
+        assert_eq!(notices[0]["axis"], "context_window");
+        assert_eq!(
+            notices[0]["results"].as_array().map(Vec::len),
+            Some(1),
+            "one result was bounded"
+        );
+        let bounded = &notices[0]["results"][0];
+        assert_eq!(bounded["tool_use_id"], "tc_1");
+        assert_eq!(bounded["tool_name"], "list_records");
+        assert_eq!(bounded["kept_bytes"], u64::try_from(head.len()).unwrap());
+        assert_eq!(bounded["total_bytes"], 400_000);
+
+        assert_eq!(
+            agent.compaction_cadence.last_answered_request, None,
+            "the fold dropped the anchor, and the bounded request's answer anchors none"
+        );
+        assert!(
+            agent
+                .compaction_cadence
+                .last_context_refusal_boundary_index
+                .is_some(),
+            "the bound records that the transcript holds content a request could not carry"
+        );
+        assert_eq!(persisted_cadence(agent.session()), agent.compaction_cadence);
+    }
+
+    /// The open run's own 300 KB result is past a 100 KB provider cap and no
+    /// compaction makes room. The request carries the result bounded for
+    /// itself, as before, and the bound is now announced: the typed notice
+    /// names the call, both sizes and the request-byte axis. The answer to
+    /// the bounded request anchors no input projection (the anchor stays on
+    /// the request that made the call), and the bound records that the
+    /// transcript holds content a request could not carry. Before, only the
+    /// marker the model reads said so, and the answer anchored the
+    /// projection on the count of the bounded request.
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn an_open_run_result_past_the_request_cap_is_announced_and_anchors_nothing() {
+        let client = Arc::new(RoundsClient::new(1).with_cap(100_000));
+        let dispatcher = Arc::new(LargeListingDispatcher::new(300_000));
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .compactor(Arc::new(RecordingDiscardingCompactor::new(|_| false)))
+            .build_standalone(client.clone(), dispatcher.clone(), Arc::new(NoopStore))
+            .await;
+
+        agent.run("first".into()).await.unwrap();
+        let (tx, mut rx) = mpsc::channel::<crate::event::AgentEvent>(256);
+        agent
+            .run_with_events("second".into(), tx)
+            .await
+            .expect("the run completes with its result bounded");
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+
+        let last_request = client.requests().last().cloned().expect("the last request");
+        let carried = carried_result_texts(&last_request, "tc_1");
+        let [head, _marker] = carried.as_slice() else {
+            panic!(
+                "the request carries the result's head and a marker, not {} blocks",
+                carried.len()
+            );
+        };
+        let notices = bounded_request_notices(&events);
+        assert_eq!(notices.len(), 1, "the bounded request is announced");
+        assert_eq!(notices[0]["axis"], "request_bytes");
+        let bounded = &notices[0]["results"][0];
+        assert_eq!(bounded["tool_use_id"], "tc_1");
+        assert_eq!(bounded["tool_name"], "list_records");
+        assert_eq!(bounded["kept_bytes"], u64::try_from(head.len()).unwrap());
+        assert_eq!(bounded["total_bytes"], 300_000);
+
+        let transcript = agent.session().messages().to_vec();
+        let call_at = transcript
+            .iter()
+            .position(is_tool_call)
+            .expect("the stored call");
+        let anchor = agent
+            .compaction_cadence
+            .last_answered_request
+            .clone()
+            .expect("the request that made the call anchored the projection");
+        assert_eq!(
+            anchor.transcript_rows,
+            u64::try_from(call_at).unwrap(),
+            "the anchor stays on the request that made the call: the bounded request's answer \
+             anchors none"
+        );
+        assert!(
+            agent
+                .compaction_cadence
+                .last_context_refusal_boundary_index
+                .is_some(),
+            "the bound records that the transcript holds content a request could not carry"
+        );
+        assert_eq!(persisted_cadence(agent.session()), agent.compaction_cadence);
+    }
+
+    /// A run whose two rounds each return a 300 KB result past a 100 KB
+    /// provider cap carries both bounded, and the check after its second
+    /// round does not see the fact the first bound recorded: a compaction
+    /// inside a run keeps the run's request and newest round, so it could not
+    /// fold what did not fit. The next run's first request would carry both
+    /// results whole again, so its first check sees the fact and compacts the
+    /// whole transcript once, and the run after it compacts no more. Before,
+    /// nothing recorded the bounds, and the next run sent its request past
+    /// the cap and failed as too large.
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn the_next_run_compacts_once_after_a_bounded_request() {
+        let client = Arc::new(RoundsClient::new(2).with_cap(100_000));
+        let dispatcher = Arc::new(LargeListingDispatcher::new(300_000));
+        let compactor = Arc::new(RecordingDiscardingCompactor::new(|ctx| {
+            ctx.last_context_refusal_boundary_index.is_some()
+        }));
+        // Boundary 0 is run "first"; 1 is run "second" before its first
+        // response; 2 and 3 follow its two rounds; 4 is run "third".
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .compactor(compactor.clone())
+            .build_standalone(client.clone(), dispatcher.clone(), Arc::new(NoopStore))
+            .await;
+
+        agent.run("first".into()).await.unwrap();
+        agent
+            .run("second".into())
+            .await
+            .expect("both rounds are bounded and the run completes");
+        assert_eq!(dispatcher.dispatches(), 2, "each call ran once");
+        assert_eq!(
+            client.summary_requests(),
+            0,
+            "nothing compacted inside the run"
+        );
+        assert_eq!(
+            compactor.at(3).last_context_refusal_boundary_index,
+            None,
+            "the check inside the run does not see the first bound's fact"
+        );
+        let recorded = agent.compaction_cadence.last_context_refusal_boundary_index;
+        assert_eq!(recorded, Some(3), "the newest bound's boundary is recorded");
+        assert_eq!(persisted_cadence(agent.session()), agent.compaction_cadence);
+
+        agent
+            .run("third".into())
+            .await
+            .expect("the next run compacts first and its request fits");
+        assert_eq!(
+            compactor.at(4).last_context_refusal_boundary_index,
+            recorded,
+            "the next run's first check sees the fact"
+        );
+        assert_eq!(
+            client.summary_requests(),
+            1,
+            "one compaction for the bounds"
+        );
+        assert!(
+            !agent.session().messages().iter().any(is_tool_results),
+            "the bounded results folded into the summary"
+        );
+        assert_eq!(
+            agent.compaction_cadence.last_context_refusal_boundary_index, None,
+            "the compaction of the whole transcript answered the fact"
+        );
+
+        agent.run("fourth".into()).await.unwrap();
+        assert_eq!(
+            client.summary_requests(),
+            1,
+            "no bound since, no compaction"
+        );
+        assert_eq!(persisted_cadence(agent.session()), agent.compaction_cadence);
+    }
+
+    /// The control: a result that fits the window's input budget and the
+    /// provider cap is sent whole. Nothing is announced or recorded, and the
+    /// answer to the request that carried it anchors the input projection on
+    /// the transcript that request was composed from.
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn an_unbounded_request_anchors_and_announces_nothing() {
+        let client = Arc::new(RoundsClient::new(1).with_window(50_000).with_cap(100_000));
+        let dispatcher = Arc::new(LargeListingDispatcher::new(4_000));
+        let mut agent = with_test_turn_state_handle_for_session(
+            AgentBuilder::new()
+                .model("primary")
+                .max_tokens_per_turn(1_024)
+                .compactor(Arc::new(RecordingDiscardingCompactor::new(|_| false)))
+                .with_effective_model_registry(summary_window_test_registry(&[(
+                    "primary", 50_000,
+                )])),
+            explicit_hot_swap_session("primary"),
+        )
+        .with_tool_visibility_owner(explicit_test_visibility_owner())
+        .build_standalone(client.clone(), dispatcher.clone(), Arc::new(NoopStore))
+        .await;
+
+        agent.run("first".into()).await.unwrap();
+        let (tx, mut rx) = mpsc::channel::<crate::event::AgentEvent>(256);
+        agent.run_with_events("second".into(), tx).await.unwrap();
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+
+        assert!(
+            bounded_request_notices(&events).is_empty(),
+            "nothing is announced"
+        );
+        let last_request = client.requests().last().cloned().expect("the last request");
+        assert_eq!(
+            carried_result_texts(&last_request, "tc_1"),
+            vec!["r".repeat(4_000)],
+            "the result is sent whole"
+        );
+        let anchor = agent
+            .compaction_cadence
+            .last_answered_request
+            .clone()
+            .expect("the answer anchors the projection");
+        assert_eq!(
+            anchor.transcript_rows,
+            u64::try_from(agent.session().messages().len() - 1).unwrap(),
+            "on the request the final answer came after"
+        );
+        assert_eq!(
+            agent.compaction_cadence.last_context_refusal_boundary_index, None,
+            "nothing is recorded"
+        );
     }
 
     /// Answers every ordinary request with `presented` input tokens and
