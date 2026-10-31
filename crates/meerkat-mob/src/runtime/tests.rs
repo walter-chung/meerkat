@@ -88543,6 +88543,10 @@ struct MobRuntimeParityInvocationReport {
     outcome_kind: MobRuntimeParityOutcomeKind,
     result_summary: String,
     after: Option<MobRuntimeParitySnapshotSummary>,
+    /// The probed call did not answer within the probe timeout. Its outcome
+    /// is recorded as `Err`, but a hang is never a parity answer: the kernel
+    /// verdict fails the row.
+    timed_out: bool,
 }
 
 impl MobRuntimeParityInvocationReport {
@@ -88685,8 +88689,12 @@ enum MobKernelOutcome {
         transition: String,
         refusal_effect: Option<String>,
     },
-    /// The kernel weighed every candidate transition and none was enabled.
-    NoMatchingTransition,
+    /// No transition is enabled, and the evaluated `input` has no arm
+    /// leaving the pre-state's phase: a structural refusal.
+    NoArm { input: String },
+    /// No transition is enabled, but the evaluated `input` has arms leaving
+    /// the pre-state's phase: the kernel found every one of them blocked.
+    ArmsBlocked { input: String },
     /// A guard, update or effect called a native helper the test oracle does
     /// not implement.
     UnknownNativeHelper { helper: String },
@@ -88790,6 +88798,13 @@ const MOB_PARITY_PROVENANCE_TOOL: &str = "spawn_member";
 const MOB_PARITY_AUDIT_INVOCATION: &str = "mob-runtime-parity";
 const MOB_PARITY_EVENT_CHANNEL_CAPACITY: usize = 32;
 const MOB_PARITY_EVENT_POLL_INTERVAL_MS: u64 = 10;
+const MOB_PARITY_FLOW: &str = "demo";
+
+/// The mob every parity probe runs against; the RunFlow kernel row builds
+/// its run seed from the same definition.
+fn mob_runtime_parity_definition() -> MobDefinition {
+    sample_definition_with_single_step_flow(60_000, 8)
+}
 
 /// The machine input the `AuthorizeSpawnProfile` probe submits, and the
 /// kernel row rebuilds field by field.
@@ -88948,7 +88963,7 @@ impl MobRuntimeParityFixture {
         let run_id = self
             .handle
             .run_flow(
-                FlowId::from("demo"),
+                FlowId::from(MOB_PARITY_FLOW),
                 serde_json::json!({"source":"mob-runtime-parity"}),
             )
             .await
@@ -91428,7 +91443,7 @@ fn mob_modeled_schema_result_summary(
 }
 
 async fn build_mob_runtime_parity_fixture() -> MobRuntimeParityFixture {
-    let definition = sample_definition_with_single_step_flow(60_000, 8);
+    let definition = mob_runtime_parity_definition();
     let (handle, service) = create_test_mob(definition).await;
     let _ = service.enable_runtime_adapter();
     service.set_flow_turn_delay_ms(150);
@@ -91659,7 +91674,7 @@ async fn mob_runtime_parity_execute_probe(
         MobRuntimeParityProbeInput::RunFlow => fixture
             .handle
             .run_flow(
-                FlowId::from("demo"),
+                FlowId::from(MOB_PARITY_FLOW),
                 serde_json::json!({"source":"mob-runtime-parity"}),
             )
             .await
@@ -91950,6 +91965,7 @@ async fn execute_mob_runtime_parity_probe_inner(
     let after = mob_runtime_parity_snapshot_summary(&fixture.handle).await;
     fixture.cleanup().await;
 
+    let timed_out = result.is_err();
     let (outcome_kind, result_summary) = match result {
         Ok(Ok(summary)) => (MobRuntimeParityOutcomeKind::Ok, summary),
         Ok(Err(error)) => (
@@ -91969,6 +91985,7 @@ async fn execute_mob_runtime_parity_probe_inner(
         outcome_kind,
         result_summary,
         after,
+        timed_out,
     })
 }
 
@@ -92361,6 +92378,13 @@ async fn build_mob_runtime_full_pair_report(
             !probe_required || probe.is_some(),
             "required MobMachine full runtime parity probe for {input_variant_name} was missing or failed setup before schema row classification: {note:?}"
         );
+        // A runtime-internal input's probe is optional, but once it exists
+        // its setup must succeed: a failed setup would drop the input's
+        // kernel rows out of the verdict without a trace.
+        assert!(
+            probe.is_some() || mob_runtime_parity_probe_for_input_variant(input_variant).is_none(),
+            "MobMachine full runtime parity probe for {input_variant_name} failed setup, so its kernel rows would drop out of the audit: {note:?}"
+        );
 
         let Some(schema_row) = mob_runtime_parity_schema_row_for_input(
             schema,
@@ -92620,9 +92644,9 @@ async fn mob_runtime_parity_audit_writers_execute_required_probe_inventory() {
 
     // Fail closed on the kernel's answers, not only on probe coverage: every
     // kernel row of both audits must reproduce its runtime row or match an
-    // accepted difference, every accepted difference must still occur, and
-    // every probed input must fire a kernel transition somewhere unless a
-    // liveness gap says why it cannot.
+    // accepted difference, every accepted difference must still occur, every
+    // probed input must fire the runtime's arm somewhere unless a liveness gap
+    // says why it cannot, and no probed input may drop out of the rows.
     let observations = full_report
         .pairs
         .iter()
@@ -92634,7 +92658,7 @@ async fn mob_runtime_parity_audit_writers_execute_required_probe_inventory() {
         !observations.is_empty(),
         "the parity audits must run kernel rows"
     );
-    let failures = mob_parity_audit_failures(&observations);
+    let failures = mob_parity_audit_failures(&schema_mob_machine(), &observations);
     assert!(
         failures.is_empty(),
         "MobMachine kernel parity audit failed:\n{}\n\nkernel rows observed:\n{}",
@@ -93226,6 +93250,31 @@ fn mob_modeled_external_peer(
     ))
 }
 
+/// One payload field of `variant` as the kernel carries it: the serde form
+/// of the runtime's typed value, decoded by the type the schema declares for
+/// `field`.
+fn mob_modeled_input_field(
+    schema: &MachineSchema,
+    variant: SchemaMobMachineInputVariant,
+    field: &str,
+    value: &serde_json::Value,
+) -> Result<meerkat_machine_kernels::test_oracle::KernelValue, String> {
+    let variant_id = InputVariantId::parse(variant.as_str())
+        .map_err(|error| format!("`{}` is not an input id: {error:?}", variant.as_str()))?;
+    let declared = schema
+        .inputs
+        .variant_named(&variant_id)
+        .map_err(|error| error.to_string())?;
+    let ty = &declared
+        .fields
+        .iter()
+        .find(|declared_field| declared_field.name.as_str() == field)
+        .ok_or_else(|| format!("`{}` declares no field `{field}`", variant.as_str()))?
+        .ty;
+    mob_modeled_kernel_value_from_json(schema, ty, value)
+        .map_err(|error| format!("`{}` field `{field}`: {error}", variant.as_str()))
+}
+
 /// The payload fields a probe pins for its kernel row: the arguments the
 /// probe sends, and the member ids the runtime pre-state holds for them.
 /// Every field left out takes the kernel's typed default
@@ -93434,12 +93483,107 @@ fn mob_modeled_probe_arguments(
                 pinned.insert("objective_id", KernelValue::String(objective_id));
             }
         }
-        // The run seed RunFlow submits comes from the flow definition, and the
-        // run and work ids CancelFlow and CancelWork name are minted by the
-        // runtime: the snapshot carries none of them, so they keep their typed
-        // defaults. The other probes send no payload, or have no input.
-        MobRuntimeParityProbeInput::RunFlow
-        | MobRuntimeParityProbeInput::CancelFlow
+        // The run seed the runtime builds for the fixture's flow, the way
+        // the actor's run_flow builds it (`FlowRunConfig::from_definition`,
+        // then `MobRun::run_flow_input`); only the run id is the row's own,
+        // since the runtime mints a fresh one.
+        MobRuntimeParityProbeInput::RunFlow => {
+            let config = crate::run::FlowRunConfig::from_definition(
+                FlowId::from(MOB_PARITY_FLOW),
+                &mob_runtime_parity_definition(),
+            )
+            .map_err(|error| format!("parity flow config: {error}"))?;
+            let crate::machines::mob_machine::MobMachineInput::RunFlow {
+                run_id,
+                step_ids,
+                ordered_steps,
+                step_status,
+                output_recorded,
+                step_condition_results,
+                step_has_conditions,
+                step_dependencies,
+                step_dependency_modes,
+                step_branches,
+                step_collection_policies,
+                step_quorum_thresholds,
+                step_target_counts,
+                step_target_success_counts,
+                step_target_terminal_failure_counts,
+                escalation_threshold,
+                max_step_retries,
+                max_active_nodes,
+                max_active_frames,
+                max_frame_depth,
+            } = MobRun::run_flow_input(&crate::ids::RunId::new(), &config)
+                .map_err(|error| format!("parity run seed: {error}"))?
+            else {
+                return Err("MobRun::run_flow_input no longer builds RunFlow".to_string());
+            };
+            for (field, value) in [
+                ("run_id", serde_json::to_value(run_id)),
+                ("step_ids", serde_json::to_value(step_ids)),
+                ("ordered_steps", serde_json::to_value(ordered_steps)),
+                ("step_status", serde_json::to_value(step_status)),
+                ("output_recorded", serde_json::to_value(output_recorded)),
+                (
+                    "step_condition_results",
+                    serde_json::to_value(step_condition_results),
+                ),
+                (
+                    "step_has_conditions",
+                    serde_json::to_value(step_has_conditions),
+                ),
+                ("step_dependencies", serde_json::to_value(step_dependencies)),
+                (
+                    "step_dependency_modes",
+                    serde_json::to_value(step_dependency_modes),
+                ),
+                ("step_branches", serde_json::to_value(step_branches)),
+                (
+                    "step_collection_policies",
+                    serde_json::to_value(step_collection_policies),
+                ),
+                (
+                    "step_quorum_thresholds",
+                    serde_json::to_value(step_quorum_thresholds),
+                ),
+                (
+                    "step_target_counts",
+                    serde_json::to_value(step_target_counts),
+                ),
+                (
+                    "step_target_success_counts",
+                    serde_json::to_value(step_target_success_counts),
+                ),
+                (
+                    "step_target_terminal_failure_counts",
+                    serde_json::to_value(step_target_terminal_failure_counts),
+                ),
+                (
+                    "escalation_threshold",
+                    serde_json::to_value(escalation_threshold),
+                ),
+                ("max_step_retries", serde_json::to_value(max_step_retries)),
+                ("max_active_nodes", serde_json::to_value(max_active_nodes)),
+                ("max_active_frames", serde_json::to_value(max_active_frames)),
+                ("max_frame_depth", serde_json::to_value(max_frame_depth)),
+            ] {
+                let value = value.map_err(|error| format!("RunFlow `{field}`: {error}"))?;
+                pinned.insert(
+                    field,
+                    mob_modeled_input_field(
+                        schema,
+                        SchemaMobMachineInputVariant::RunFlow,
+                        field,
+                        &value,
+                    )?,
+                );
+            }
+        }
+        // The run and work ids CancelFlow and CancelWork name are minted by
+        // the runtime: the snapshot carries none of them, so they keep their
+        // typed defaults. The other probes send no payload, or have no input.
+        MobRuntimeParityProbeInput::CancelFlow
         | MobRuntimeParityProbeInput::CancelWork
         | MobRuntimeParityProbeInput::RetireAll
         | MobRuntimeParityProbeInput::Stop
@@ -93454,6 +93598,24 @@ fn mob_modeled_probe_arguments(
     Ok(pinned)
 }
 
+/// The MobMachine input a probe's call puts to the machine from the runtime
+/// pre-state. A retire whose target is absent asks `RetireAbsent`, the input
+/// the actor submits for a member missing from its roster
+/// (`handle_retire_inner_absent`); the snapshot projects live runtime ids,
+/// not the roster, and in every parity probe a roster member is live.
+fn mob_modeled_kernel_input_variant(
+    before: &MobRuntimeParitySnapshotSummary,
+    probe: MobRuntimeParityProbeInput,
+) -> Result<SchemaMobMachineInputVariant, String> {
+    if probe == MobRuntimeParityProbeInput::Retire
+        && mob_modeled_live_member(before, MOB_PARITY_WORKER).is_none()
+    {
+        return Ok(SchemaMobMachineInputVariant::RetireAbsent);
+    }
+    mob_runtime_parity_probe_input_variant(probe)
+        .ok_or_else(|| format!("{probe:?} has no MobMachine input variant"))
+}
+
 /// The kernel input of a probe: the probe's pinned arguments, and the
 /// kernel's typed default for every other declared field.
 fn mob_modeled_kernel_input(
@@ -93462,8 +93624,7 @@ fn mob_modeled_kernel_input(
     before: &MobRuntimeParitySnapshotSummary,
     probe: MobRuntimeParityProbeInput,
 ) -> Result<meerkat_machine_kernels::test_oracle::KernelInput, String> {
-    let input_variant = mob_runtime_parity_probe_input_variant(probe)
-        .ok_or_else(|| format!("{probe:?} has no MobMachine input variant"))?;
+    let input_variant = mob_modeled_kernel_input_variant(before, probe)?;
     let variant = InputVariantId::parse(input_variant.as_str())
         .map_err(|error| format!("`{}` is not an input id: {error:?}", input_variant.as_str()))?;
     let declared = schema
@@ -93545,14 +93706,26 @@ const MOB_MACHINE_REFUSAL_EFFECTS: &[&str] = &[
     "RejectAllAgentEventSubscription",
 ];
 
-/// The kernel's answer to a refused transition, as the verdict reads it.
+/// The kernel's answer to a refused transition, as the verdict reads it. A
+/// refusal for want of an enabled transition is split by the schema: no arm
+/// of the input leaves the phase, or arms exist and every one is blocked.
 fn mob_modeled_kernel_refusal(
+    schema: &MachineSchema,
     error: &meerkat_machine_kernels::test_oracle::TransitionRefusal,
 ) -> MobKernelOutcome {
     match error {
         meerkat_machine_kernels::test_oracle::TransitionRefusal::NoMatchingTransition {
+            phase,
+            trigger,
             ..
-        } => MobKernelOutcome::NoMatchingTransition,
+        } => {
+            let input = trigger.as_str().to_owned();
+            if mob_parity_arm_exists(schema, phase.as_str(), &input, None) {
+                MobKernelOutcome::ArmsBlocked { input }
+            } else {
+                MobKernelOutcome::NoArm { input }
+            }
+        }
         meerkat_machine_kernels::test_oracle::TransitionRefusal::EvaluationError {
             reason, ..
         } => match reason
@@ -93570,6 +93743,22 @@ fn mob_modeled_kernel_refusal(
             detail: mob_modeled_transition_refusal_detail(other),
         },
     }
+}
+
+/// Whether the MobMachine schema has an arm of `input` leaving `phase`
+/// (named `arm`, when one is given).
+fn mob_parity_arm_exists(
+    schema: &MachineSchema,
+    phase: &str,
+    input: &str,
+    arm: Option<&str>,
+) -> bool {
+    schema.transitions.iter().any(|transition| {
+        transition.on.kind() == TriggerKind::Input
+            && transition.on.variant_str() == input
+            && transition.from.iter().any(|from| from.as_str() == phase)
+            && arm.is_none_or(|name| transition.name.as_str() == name)
+    })
 }
 
 fn mob_modeled_unevaluated_schema_report(
@@ -93645,7 +93834,7 @@ fn mob_modeled_schema_report(
             after: mob_modeled_summary_from_runtime_snapshot(Some(before)),
             detail: mob_modeled_transition_refusal_detail(&error),
             result_summary: None,
-            kernel: mob_modeled_kernel_refusal(&error),
+            kernel: mob_modeled_kernel_refusal(schema, &error),
         },
     }
 }
@@ -93811,6 +94000,8 @@ struct MobParityObservation {
     phase: MobRuntimeParityPhase,
     input: SchemaMobMachineInputVariant,
     runtime: MobRuntimeParityOutcomeKind,
+    /// The probed call hung past the probe timeout: never a parity answer.
+    runtime_timed_out: bool,
     kernel: MobKernelOutcome,
     differing_keys: Vec<String>,
 }
@@ -93829,16 +94020,21 @@ impl MobParityObservation {
             phase,
             input,
             runtime: runtime.outcome_kind,
+            runtime_timed_out: runtime.timed_out,
             kernel: schema.kernel.clone(),
             differing_keys: mob_modeled_differing_keys(&runtime_report.after, &schema.after),
         }
     }
 
     /// The runtime and the kernel agree: both took the call and leave the
-    /// same projected after-state, or both refused it (no enabled
-    /// transition, or a transition that emits a machine-owned refusal).
+    /// same projected after-state, or both refused it, the kernel because
+    /// the input has no arm in the phase or through a transition that emits
+    /// a machine-owned refusal. Arms the kernel finds blocked are no
+    /// agreement with a runtime refusal: the runtime may refuse for another
+    /// reason. A timed-out probe never agrees.
     fn aligned(&self) -> bool {
-        self.differing_keys.is_empty()
+        !self.runtime_timed_out
+            && self.differing_keys.is_empty()
             && matches!(
                 (self.runtime, &self.kernel),
                 (
@@ -93849,7 +94045,7 @@ impl MobParityObservation {
                     }
                 ) | (
                     MobRuntimeParityOutcomeKind::Err,
-                    MobKernelOutcome::NoMatchingTransition
+                    MobKernelOutcome::NoArm { .. }
                         | MobKernelOutcome::Transition {
                             refusal_effect: Some(_),
                             ..
@@ -93860,11 +94056,16 @@ impl MobParityObservation {
 
     fn describe(&self) -> String {
         format!(
-            "{} row {} {}: runtime {:?}, kernel {:?}, differing keys {:?}",
+            "{} row {} {}: runtime {:?}{}, kernel {:?}, differing keys {:?}",
             self.source,
             self.phase.schema_name(),
             self.input.as_str(),
             self.runtime,
+            if self.runtime_timed_out {
+                " (timed out)"
+            } else {
+                ""
+            },
             self.kernel,
             self.differing_keys
         )
@@ -93872,25 +94073,34 @@ impl MobParityObservation {
 }
 
 /// What the kernel answers on a probed (phase, input) cell whose runtime
-/// outcome it does not reproduce.
+/// outcome it does not reproduce, or reproduces on an arm the runtime does
+/// not take.
 #[derive(Debug, Clone, Copy)]
 enum AcceptedMobKernelOutcome {
-    /// The kernel fires `transition`; its projected after-state differs from
-    /// the runtime's on exactly `differing_keys` (`phase` included).
+    /// The kernel fires `transition`, the arm the runtime takes, and its
+    /// projected after-state differs from the runtime's on exactly
+    /// `differing_keys` (`phase` included), which inputs the row does not
+    /// replay explain. A row it covers credits its input's liveness.
     Transition {
         transition: &'static str,
         differing_keys: &'static [&'static str],
     },
-    /// The kernel fires `transition`, which emits the machine-owned refusal
-    /// `effect`, and differs from the runtime's after-state on exactly
-    /// `differing_keys`.
-    RefusalEffect {
-        transition: &'static str,
-        effect: &'static str,
+    /// The kernel fires `kernel_arm`, emitting the machine-owned
+    /// `refusal_effect` if any, where the runtime takes `runtime_arm`: a
+    /// projection gap enables the wrong arm. Its projected after-state
+    /// differs from the runtime's on exactly `differing_keys`. A row it
+    /// covers never credits liveness, even when the after-states agree.
+    WrongArm {
+        kernel_arm: &'static str,
+        refusal_effect: Option<&'static str>,
+        runtime_arm: &'static str,
         differing_keys: &'static [&'static str],
     },
-    /// No transition is enabled.
-    NoMatchingTransition,
+    /// The kernel row asks the named input, which has no arm in the phase.
+    NoArm(SchemaMobMachineInputVariant),
+    /// The cell's input has arms in the phase, and the kernel finds every
+    /// one of them blocked.
+    ArmsBlocked,
     /// The kernel refuses because the test oracle does not implement this
     /// native helper; it must be listed in `KERNEL_UNIMPLEMENTED_NATIVE_HELPERS`.
     UnknownNativeHelper(&'static str),
@@ -93916,17 +94126,27 @@ impl AcceptedMobKernelOutcome {
                 },
             ) => found == transition && keys_match(differing_keys),
             (
-                Self::RefusalEffect {
-                    transition,
-                    effect,
+                Self::WrongArm {
+                    kernel_arm,
+                    refusal_effect,
                     differing_keys,
+                    ..
                 },
                 MobKernelOutcome::Transition {
                     transition: found,
-                    refusal_effect: Some(found_effect),
+                    refusal_effect: found_effect,
                 },
-            ) => found == transition && found_effect == effect && keys_match(differing_keys),
-            (Self::NoMatchingTransition, MobKernelOutcome::NoMatchingTransition) => true,
+            ) => {
+                found == kernel_arm
+                    && found_effect.as_deref() == refusal_effect
+                    && keys_match(differing_keys)
+            }
+            (Self::NoArm(input), MobKernelOutcome::NoArm { input: found }) => {
+                found == input.as_str()
+            }
+            (Self::ArmsBlocked, MobKernelOutcome::ArmsBlocked { input: found }) => {
+                found == observation.input.as_str()
+            }
             (
                 Self::UnknownNativeHelper(helper),
                 MobKernelOutcome::UnknownNativeHelper { helper: found },
@@ -93934,12 +94154,19 @@ impl AcceptedMobKernelOutcome {
             _ => false,
         }
     }
+
+    /// A row this outcome covers shows the kernel firing the arm the runtime
+    /// takes, so it counts for its input's liveness.
+    fn credits_liveness(self) -> bool {
+        matches!(self, Self::Transition { .. })
+    }
 }
 
 /// A runtime/kernel disagreement the audit accepts on one probed
-/// (phase, input) cell, with the reason it is accepted. A cell whose
-/// observation differs from its entry, or an entry no observation shows,
-/// fails the audit.
+/// (phase, input) cell, with the reason it is accepted. Every reason names
+/// every blocker of every candidate arm: the first one the kernel reaches,
+/// and the ones behind it. A cell whose observation differs from its entry,
+/// or an entry no observation shows, fails the audit.
 struct AcceptedMobParityDifference {
     phase: MobRuntimeParityPhase,
     input: SchemaMobMachineInputVariant,
@@ -93958,35 +94185,125 @@ const MOB_PARITY_SPAWN_LADDER_KEYS: &[&str] = &[
     "runtime_fence_tokens",
 ];
 
-const MOB_PARITY_IDENTITY_PROJECTION_GAP: &str = "projection gap: every arm the runtime takes \
-     binds the member through identity_to_runtime, which the runtime snapshot does not project, \
-     so no arm is enabled from the projected pre-state";
-const MOB_PARITY_ADAPTIVE_NATIVE_GAP: &str = "kernel gap: the arm's adaptive_lifecycle_drained \
+const MOB_PARITY_COMMIT_SPAWN_GAP: &str = "single-input row: every arm opens on spawn_exec_phase \
+     (spawn_exec_opened, or spawn_exec_materialize_pending on the remote arm), which \
+     BeginSpawnExec sets earlier in the spawn-exec ladder; the row does not replay it and the \
+     snapshot does not project it. Behind it, bridge_session_id keeps its typed default (None), \
+     which selects CommitSpawnMembershipFreshPeerOnly where a local spawn with a session takes \
+     CommitSpawnMembershipFresh, and fence_token, runtime_mode and the digests keep their typed \
+     defaults too";
+const MOB_PARITY_SUBMIT_WORK_GAP: &str = "projection gap: every arm needs identity_to_runtime \
+     (identity_binding_matches) and identity_runtime_generations (generation_binding_present); the \
+     session arms also need member_session_bindings (session_binding_present) and the peer-only \
+     arms member_peer_ids (member_peer_registered). None of these is projected. work_id and \
+     content_attribution keep their typed defaults; no guard reads them";
+const MOB_PARITY_CANCEL_FLOW_GAP: &str = "projection gap: the only arm's run_known guard needs the \
+     run in run_status, which the snapshot does not project, and the run_id the runtime minted, \
+     which the row cannot name: it keeps its typed default";
+const MOB_PARITY_RETIRE_GAP: &str = "projection gap: every arm needs identity_to_runtime \
+     (identity_binding_matches) and identity_runtime_generations (generation_matches), neither \
+     projected. Behind them the binding arms need member_session_bindings, not projected either, \
+     and the probe's releasing and session_id, which keep their typed defaults with mob_id: with \
+     identity and generations projected alone, the kernel would take the no-binding arm where the \
+     runtime takes a binding arm";
+const MOB_PARITY_RETIRE_LIVENESS_GAP: &str = "Running and Stopped: every arm needs \
+     identity_to_runtime and identity_runtime_generations, then the binding arms need \
+     member_session_bindings and the defaulted releasing and session_id (see the Retire accepted \
+     differences). Completed: the target is absent, so the row asks RetireAbsent, which has no \
+     Completed arm until the pending MobMachine fix";
+const MOB_PARITY_RETIRE_ABSENT_DEFECT: &str = "defect, machine fix pending: the handle answers the \
+     retire of an absent member outside the machine (handle.rs, `Retirement is idempotent`), and \
+     RetireAbsent, the input the actor submits for an absent member, has no Completed arm. The \
+     fix, a machine-owned RetireAbsent arm from Completed with the handle's absent case routed \
+     through it, is pending in a MobMachine slice; once it lands this row fires that arm and the \
+     entry turns stale";
+const MOB_PARITY_ADAPTIVE_ONLY_GAP: &str = "kernel gap: every arm's adaptive_lifecycle_drained \
      guard calls mob_machine_adaptive_lifecycle_drained, which the test oracle does not implement \
-     (KERNEL_UNIMPLEMENTED_NATIVE_HELPERS)";
-const MOB_PARITY_SESSION_BOUND_NATIVE_GAP: &str = "kernel gap: the session_bound_runtimes_match \
-     guard calls mob_machine_session_bound_live_runtime_ids_match, which the test oracle does not \
-     implement (KERNEL_UNIMPLEMENTED_NATIVE_HELPERS)";
-const MOB_PARITY_EXTERNAL_PEER_NATIVE_GAP: &str = "kernel gap: the external_peer_key_matches_edge \
-     guard calls mob_machine_external_peer_key_matches_edge, which the test oracle does not \
-     implement (KERNEL_UNIMPLEMENTED_NATIVE_HELPERS)";
-const MOB_PARITY_MISSING_MEMBER_GAP: &str = "projection gap: identity_to_runtime is not \
-     projected, so the kernel takes the missing-member arm and refuses the subscription the \
-     runtime grants";
+     (KERNEL_UNIMPLEMENTED_NATIVE_HELPERS); no other guard blocks the projected pre-state";
+const MOB_PARITY_STOP_GAP: &str = "kernel gap: StopRunning's adaptive_lifecycle_drained guard \
+     calls mob_machine_adaptive_lifecycle_drained (KERNEL_UNIMPLEMENTED_NATIVE_HELPERS). Behind \
+     it, placed_completion_quiesce_started, placed_completion_stop_intent and \
+     member_run_starts_held need the BeginPlacedCompletionLifecycleQuiesce input the public stop \
+     submits first, which the single-input row does not replay; none of those fields is projected";
+const MOB_PARITY_COMPLETE_GAP: &str = "kernel gap: CompleteRunning's adaptive_lifecycle_drained \
+     guard calls mob_machine_adaptive_lifecycle_drained (KERNEL_UNIMPLEMENTED_NATIVE_HELPERS). \
+     Behind it, placed_completion_quiesce_started and placed_completion_complete_intent need the \
+     BeginPlacedCompletionLifecycleQuiesce input the public complete submits first, which the \
+     single-input row does not replay; neither field is projected";
+const MOB_PARITY_RESET_GAP: &str = "kernel gap: ResetToRunning's adaptive_lifecycle_drained guard \
+     calls mob_machine_adaptive_lifecycle_drained (KERNEL_UNIMPLEMENTED_NATIVE_HELPERS). Behind \
+     it, placed_completion_reset_intent needs the Reset intent \
+     BeginPlacedCompletionLifecycleQuiesce records first, which the single-input row does not \
+     replay; placed_completion_lifecycle_intent is not projected";
+const MOB_PARITY_DESTROY_GAP: &str = "kernel gap: DestroyFromAny's adaptive_lifecycle_drained \
+     guard calls mob_machine_adaptive_lifecycle_drained (KERNEL_UNIMPLEMENTED_NATIVE_HELPERS). \
+     Behind it, placed_completion_quiesce_started and placed_completion_destroy_intent need the \
+     BeginPlacedCompletionLifecycleQuiesce input the public destroy submits first, which the \
+     single-input row does not replay; neither field is projected";
+const MOB_PARITY_WIRE_MEMBERS_GAP: &str = "kernel gap: the edge_endpoints_seated_or_held guard \
+     calls mob_machine_wiring_edge_a and mob_machine_wiring_edge_b \
+     (KERNEL_UNIMPLEMENTED_NATIVE_HELPERS) and reads identity_to_runtime, which is not projected";
+const MOB_PARITY_WIRE_WITH_TRUST_GAP: &str = "kernel gap: the edge_matches_members guard calls \
+     mob_machine_wiring_edge_matches_members (KERNEL_UNIMPLEMENTED_NATIVE_HELPERS). Behind it, \
+     edge_endpoints_seated_or_held calls mob_machine_wiring_edge_a and mob_machine_wiring_edge_b \
+     (unimplemented) and reads identity_to_runtime, and the peer guards read member_peer_ids and \
+     member_peer_endpoints; none of those fields is projected";
+const MOB_PARITY_WIRE_EXTERNAL_PEER_GAP: &str = "kernel gap: the external_peer_key_matches_edge \
+     guard calls mob_machine_external_peer_key_matches_edge (KERNEL_UNIMPLEMENTED_NATIVE_HELPERS). \
+     Behind it, local_member_peer_registered calls mob_machine_external_peer_edge_local \
+     (unimplemented) and reads member_peer_ids, which is not projected, and the trust effects call \
+     mob_machine_external_peer_edge_peer_id (unimplemented)";
+const MOB_PARITY_UNWIRE_EXTERNAL_PEER_GAP: &str = "kernel gap: the external_peer_key_matches_edge \
+     guard calls mob_machine_external_peer_key_matches_edge (KERNEL_UNIMPLEMENTED_NATIVE_HELPERS). \
+     Behind it, the wired arms call mob_machine_external_peer_edge_local (unimplemented) and read \
+     member_peer_ids, and external_peer_edges_by_key and external_peer_edges are not projected, so \
+     the kernel would take UnwireExternalPeerAlreadyAbsent where the runtime removes the wired \
+     edge";
+const MOB_PARITY_UNWIRE_MEMBERS_GAP: &str = "projection gap: wiring_edges is not projected, so the \
+     kernel takes UnwireMembersAlreadyAbsent where the runtime removes the edge the probe wired \
+     (UnwireMembersRunning); no projected key tells the two arms apart";
+const MOB_PARITY_PEER_REBIND_GAP: &str = "projection gap: the only arm needs identity_to_runtime \
+     (identity_present), member_peer_ids and member_peer_endpoints, none projected; \
+     expected_peer_endpoint keeps its typed default, since the lead's endpoint lives in \
+     member_peer_endpoints, and current_peer_id_matches_expected calls \
+     mob_machine_member_peer_endpoint_peer_id (KERNEL_UNIMPLEMENTED_NATIVE_HELPERS)";
+const MOB_PARITY_PEER_OVERLAY_GAP: &str = "projection gap: the only arm needs identity_to_runtime \
+     (identity_present), member_peer_ids and member_peer_endpoints, none projected; \
+     expected_peer_endpoint keeps its typed default, since the lead's endpoint lives in \
+     member_peer_endpoints. The peer-id and overlay guards call \
+     mob_machine_member_peer_endpoint_peer_id, mob_machine_member_peer_overlay_complete and \
+     mob_machine_member_peer_overlay_peer_ids_unique (KERNEL_UNIMPLEMENTED_NATIVE_HELPERS) and \
+     read wiring_edges, external_peer_edges and member_restore_failures, which are not projected \
+     either";
+const MOB_PARITY_IDENTITY_ONLY_GAP: &str = "projection gap: every arm binds the member through \
+     identity_to_runtime, which the snapshot does not project; no other guard blocks the projected \
+     pre-state";
+const MOB_PARITY_MISSING_MEMBER_GAP: &str = "projection gap: identity_to_runtime is not projected, \
+     so identity_absent holds and the kernel takes the missing-member arm, refusing the \
+     subscription the runtime grants on its local-member arm. Behind identity_present, that arm's \
+     session_bound guard calls mob_machine_identity_has_session_binding \
+     (KERNEL_UNIMPLEMENTED_NATIVE_HELPERS) on member_session_bindings, which is not projected";
+const MOB_PARITY_SESSION_BOUND_GAP: &str = "kernel gap: every arm's session_bound_runtimes_match \
+     guard calls mob_machine_session_bound_live_runtime_ids_match \
+     (KERNEL_UNIMPLEMENTED_NATIVE_HELPERS); behind it, the external-member guards pass on the \
+     probe's empty external_members, and no other guard blocks the projected pre-state";
+const MOB_PARITY_RESUME_GAP: &str = "projection gap: ResumeStopped's placed_completion_stop_intent \
+     guard needs the Stop intent the public stop records in placed_completion_lifecycle_intent, \
+     which the snapshot does not project; no other guard blocks";
 
 /// Every probed (phase, input) cell on which the kernel does not reproduce
-/// the runtime today, and why. Each entry names the exact kernel outcome, so
-/// implementing a native helper or projecting another field turns its entry
-/// stale and fails the audit until the entry goes.
+/// the runtime today, or reproduces it on an arm the runtime does not take,
+/// and why. Each entry names the exact kernel outcome, so implementing a
+/// native helper or projecting another field turns its entry stale and fails
+/// the audit until the entry goes. A cell with an entry must match it even
+/// when its after-states agree.
 const ACCEPTED_MOB_PARITY_DIFFERENCES: &[AcceptedMobParityDifference] = &[
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Running,
         input: SchemaMobMachineInputVariant::CommitSpawnMembership,
         runtime: MobRuntimeParityOutcomeKind::Ok,
-        kernel: AcceptedMobKernelOutcome::NoMatchingTransition,
-        reason: "single-input row: the spawn probe drives the spawn-exec ladder, and every \
-                 CommitSpawnMembership arm needs the spawn_exec_phase that BeginSpawnExec opens; \
-                 spawn_exec_phase is not projected",
+        kernel: AcceptedMobKernelOutcome::ArmsBlocked,
+        reason: MOB_PARITY_COMMIT_SPAWN_GAP,
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Running,
@@ -93996,9 +94313,9 @@ const ACCEPTED_MOB_PARITY_DIFFERENCES: &[AcceptedMobParityDifference] = &[
             transition: "EnsureMemberRunningMissing",
             differing_keys: MOB_PARITY_SPAWN_LADDER_KEYS,
         },
-        reason: "single-input row: EnsureMember records the desired member and requests its \
-                 spawn; the runtime then spawns it through inputs the row does not replay. To \
-                 confirm at validation: the differing keys, read from the 2026-10-30 reports",
+        reason: "single-input row: EnsureMember records the desired member and requests its spawn; \
+                 the runtime then spawns it through inputs the row does not replay. To confirm at \
+                 validation: the differing keys, read from the 2026-10-30 reports",
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Running,
@@ -94009,46 +94326,43 @@ const ACCEPTED_MOB_PARITY_DIFFERENCES: &[AcceptedMobParityDifference] = &[
             differing_keys: MOB_PARITY_SPAWN_LADDER_KEYS,
         },
         reason: "single-input row: Reconcile computes the members to spawn; the runtime then \
-                 spawns the missing member through inputs the row does not replay. To confirm \
-                 at validation: the differing keys, read from the 2026-10-30 reports",
+                 spawns the missing member through inputs the row does not replay. To confirm at \
+                 validation: the differing keys, read from the 2026-10-30 reports",
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Running,
         input: SchemaMobMachineInputVariant::SubmitWork,
         runtime: MobRuntimeParityOutcomeKind::Ok,
-        kernel: AcceptedMobKernelOutcome::NoMatchingTransition,
-        reason: MOB_PARITY_IDENTITY_PROJECTION_GAP,
+        kernel: AcceptedMobKernelOutcome::ArmsBlocked,
+        reason: MOB_PARITY_SUBMIT_WORK_GAP,
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Running,
         input: SchemaMobMachineInputVariant::CancelFlow,
         runtime: MobRuntimeParityOutcomeKind::Ok,
-        kernel: AcceptedMobKernelOutcome::NoMatchingTransition,
-        reason: "projection gap: CancelFlowRunning needs the run in run_status, which the \
-                 runtime snapshot does not project",
+        kernel: AcceptedMobKernelOutcome::ArmsBlocked,
+        reason: MOB_PARITY_CANCEL_FLOW_GAP,
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Running,
         input: SchemaMobMachineInputVariant::Retire,
         runtime: MobRuntimeParityOutcomeKind::Ok,
-        kernel: AcceptedMobKernelOutcome::NoMatchingTransition,
-        reason: MOB_PARITY_IDENTITY_PROJECTION_GAP,
+        kernel: AcceptedMobKernelOutcome::ArmsBlocked,
+        reason: MOB_PARITY_RETIRE_GAP,
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Stopped,
         input: SchemaMobMachineInputVariant::Retire,
         runtime: MobRuntimeParityOutcomeKind::Ok,
-        kernel: AcceptedMobKernelOutcome::NoMatchingTransition,
-        reason: MOB_PARITY_IDENTITY_PROJECTION_GAP,
+        kernel: AcceptedMobKernelOutcome::ArmsBlocked,
+        reason: MOB_PARITY_RETIRE_GAP,
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Completed,
         input: SchemaMobMachineInputVariant::Retire,
         runtime: MobRuntimeParityOutcomeKind::Ok,
-        kernel: AcceptedMobKernelOutcome::NoMatchingTransition,
-        reason: "intended: MobMachine has no Retire arm from Completed, and the handle answers \
-                 the retire of an absent incarnation Ok without submitting a machine input \
-                 (`Retirement is idempotent` in handle.rs)",
+        kernel: AcceptedMobKernelOutcome::NoArm(SchemaMobMachineInputVariant::RetireAbsent),
+        reason: MOB_PARITY_RETIRE_ABSENT_DEFECT,
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Running,
@@ -94058,10 +94372,10 @@ const ACCEPTED_MOB_PARITY_DIFFERENCES: &[AcceptedMobParityDifference] = &[
             transition: "RespawnRunning",
             differing_keys: MOB_PARITY_SPAWN_LADDER_KEYS,
         },
-        reason: "single-input row: RespawnRunning only exposes the pending spawn; the runtime \
-                 then retires the member and spawns its next generation through inputs the row \
-                 does not replay. To confirm at validation: the differing keys, read from the \
-                 2026-10-30 reports",
+        reason: "single-input row: RespawnRunning only exposes the pending spawn; the runtime then \
+                 retires the member and spawns its next generation through inputs the row does not \
+                 replay. To confirm at validation: the differing keys, read from the 2026-10-30 \
+                 reports",
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Running,
@@ -94070,7 +94384,7 @@ const ACCEPTED_MOB_PARITY_DIFFERENCES: &[AcceptedMobParityDifference] = &[
         kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
             "mob_machine_adaptive_lifecycle_drained",
         ),
-        reason: MOB_PARITY_ADAPTIVE_NATIVE_GAP,
+        reason: MOB_PARITY_ADAPTIVE_ONLY_GAP,
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Stopped,
@@ -94079,7 +94393,7 @@ const ACCEPTED_MOB_PARITY_DIFFERENCES: &[AcceptedMobParityDifference] = &[
         kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
             "mob_machine_adaptive_lifecycle_drained",
         ),
-        reason: MOB_PARITY_ADAPTIVE_NATIVE_GAP,
+        reason: MOB_PARITY_ADAPTIVE_ONLY_GAP,
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Completed,
@@ -94088,16 +94402,14 @@ const ACCEPTED_MOB_PARITY_DIFFERENCES: &[AcceptedMobParityDifference] = &[
         kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
             "mob_machine_adaptive_lifecycle_drained",
         ),
-        reason: MOB_PARITY_ADAPTIVE_NATIVE_GAP,
+        reason: MOB_PARITY_ADAPTIVE_ONLY_GAP,
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Running,
         input: SchemaMobMachineInputVariant::WireMembers,
         runtime: MobRuntimeParityOutcomeKind::Ok,
         kernel: AcceptedMobKernelOutcome::UnknownNativeHelper("mob_machine_wiring_edge_a"),
-        reason: "kernel gap: the edge_endpoints_seated_or_held guard calls \
-                 mob_machine_wiring_edge_a, which the test oracle does not implement \
-                 (KERNEL_UNIMPLEMENTED_NATIVE_HELPERS)",
+        reason: MOB_PARITY_WIRE_MEMBERS_GAP,
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Running,
@@ -94106,9 +94418,7 @@ const ACCEPTED_MOB_PARITY_DIFFERENCES: &[AcceptedMobParityDifference] = &[
         kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
             "mob_machine_wiring_edge_matches_members",
         ),
-        reason: "kernel gap: the edge_matches_members guard calls \
-                 mob_machine_wiring_edge_matches_members, which the test oracle does not \
-                 implement (KERNEL_UNIMPLEMENTED_NATIVE_HELPERS)",
+        reason: MOB_PARITY_WIRE_WITH_TRUST_GAP,
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Running,
@@ -94117,7 +94427,7 @@ const ACCEPTED_MOB_PARITY_DIFFERENCES: &[AcceptedMobParityDifference] = &[
         kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
             "mob_machine_external_peer_key_matches_edge",
         ),
-        reason: MOB_PARITY_EXTERNAL_PEER_NATIVE_GAP,
+        reason: MOB_PARITY_WIRE_EXTERNAL_PEER_GAP,
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Running,
@@ -94126,28 +94436,40 @@ const ACCEPTED_MOB_PARITY_DIFFERENCES: &[AcceptedMobParityDifference] = &[
         kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
             "mob_machine_external_peer_key_matches_edge",
         ),
-        reason: MOB_PARITY_EXTERNAL_PEER_NATIVE_GAP,
+        reason: MOB_PARITY_UNWIRE_EXTERNAL_PEER_GAP,
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Running,
+        input: SchemaMobMachineInputVariant::UnwireMembers,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::WrongArm {
+            kernel_arm: "UnwireMembersAlreadyAbsent",
+            refusal_effect: None,
+            runtime_arm: "UnwireMembersRunning",
+            differing_keys: &[],
+        },
+        reason: MOB_PARITY_UNWIRE_MEMBERS_GAP,
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Running,
         input: SchemaMobMachineInputVariant::AuthorizeMemberPeerRebind,
         runtime: MobRuntimeParityOutcomeKind::Ok,
-        kernel: AcceptedMobKernelOutcome::NoMatchingTransition,
-        reason: MOB_PARITY_IDENTITY_PROJECTION_GAP,
+        kernel: AcceptedMobKernelOutcome::ArmsBlocked,
+        reason: MOB_PARITY_PEER_REBIND_GAP,
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Running,
         input: SchemaMobMachineInputVariant::AuthorizeMemberPeerOverlay,
         runtime: MobRuntimeParityOutcomeKind::Ok,
-        kernel: AcceptedMobKernelOutcome::NoMatchingTransition,
-        reason: MOB_PARITY_IDENTITY_PROJECTION_GAP,
+        kernel: AcceptedMobKernelOutcome::ArmsBlocked,
+        reason: MOB_PARITY_PEER_OVERLAY_GAP,
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Running,
         input: SchemaMobMachineInputVariant::CancelAllWork,
         runtime: MobRuntimeParityOutcomeKind::Ok,
-        kernel: AcceptedMobKernelOutcome::NoMatchingTransition,
-        reason: MOB_PARITY_IDENTITY_PROJECTION_GAP,
+        kernel: AcceptedMobKernelOutcome::ArmsBlocked,
+        reason: MOB_PARITY_IDENTITY_ONLY_GAP,
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Running,
@@ -94156,10 +94478,7 @@ const ACCEPTED_MOB_PARITY_DIFFERENCES: &[AcceptedMobParityDifference] = &[
         kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
             "mob_machine_adaptive_lifecycle_drained",
         ),
-        reason: "kernel gap: StopRunning's adaptive_lifecycle_drained guard calls \
-                 mob_machine_adaptive_lifecycle_drained (KERNEL_UNIMPLEMENTED_NATIVE_HELPERS); \
-                 once it is implemented the single-input row still lacks the \
-                 BeginPlacedCompletionLifecycleQuiesce step the public stop submits first",
+        reason: MOB_PARITY_STOP_GAP,
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Running,
@@ -94168,10 +94487,7 @@ const ACCEPTED_MOB_PARITY_DIFFERENCES: &[AcceptedMobParityDifference] = &[
         kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
             "mob_machine_adaptive_lifecycle_drained",
         ),
-        reason: "kernel gap: CompleteRunning's adaptive_lifecycle_drained guard calls \
-                 mob_machine_adaptive_lifecycle_drained (KERNEL_UNIMPLEMENTED_NATIVE_HELPERS); \
-                 once it is implemented the single-input row still lacks the \
-                 BeginPlacedCompletionLifecycleQuiesce step the public complete submits first",
+        reason: MOB_PARITY_COMPLETE_GAP,
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Running,
@@ -94180,7 +94496,7 @@ const ACCEPTED_MOB_PARITY_DIFFERENCES: &[AcceptedMobParityDifference] = &[
         kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
             "mob_machine_adaptive_lifecycle_drained",
         ),
-        reason: MOB_PARITY_ADAPTIVE_NATIVE_GAP,
+        reason: MOB_PARITY_RESET_GAP,
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Stopped,
@@ -94189,7 +94505,7 @@ const ACCEPTED_MOB_PARITY_DIFFERENCES: &[AcceptedMobParityDifference] = &[
         kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
             "mob_machine_adaptive_lifecycle_drained",
         ),
-        reason: MOB_PARITY_ADAPTIVE_NATIVE_GAP,
+        reason: MOB_PARITY_RESET_GAP,
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Completed,
@@ -94198,7 +94514,7 @@ const ACCEPTED_MOB_PARITY_DIFFERENCES: &[AcceptedMobParityDifference] = &[
         kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
             "mob_machine_adaptive_lifecycle_drained",
         ),
-        reason: MOB_PARITY_ADAPTIVE_NATIVE_GAP,
+        reason: MOB_PARITY_RESET_GAP,
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Running,
@@ -94207,7 +94523,7 @@ const ACCEPTED_MOB_PARITY_DIFFERENCES: &[AcceptedMobParityDifference] = &[
         kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
             "mob_machine_adaptive_lifecycle_drained",
         ),
-        reason: MOB_PARITY_ADAPTIVE_NATIVE_GAP,
+        reason: MOB_PARITY_DESTROY_GAP,
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Stopped,
@@ -94216,7 +94532,7 @@ const ACCEPTED_MOB_PARITY_DIFFERENCES: &[AcceptedMobParityDifference] = &[
         kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
             "mob_machine_adaptive_lifecycle_drained",
         ),
-        reason: MOB_PARITY_ADAPTIVE_NATIVE_GAP,
+        reason: MOB_PARITY_DESTROY_GAP,
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Completed,
@@ -94225,15 +94541,16 @@ const ACCEPTED_MOB_PARITY_DIFFERENCES: &[AcceptedMobParityDifference] = &[
         kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
             "mob_machine_adaptive_lifecycle_drained",
         ),
-        reason: MOB_PARITY_ADAPTIVE_NATIVE_GAP,
+        reason: MOB_PARITY_DESTROY_GAP,
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Running,
         input: SchemaMobMachineInputVariant::SubscribeAgentEvents,
         runtime: MobRuntimeParityOutcomeKind::Ok,
-        kernel: AcceptedMobKernelOutcome::RefusalEffect {
-            transition: "SubscribeAgentEventsMissingMemberRunning",
-            effect: "RejectAgentEventSubscription",
+        kernel: AcceptedMobKernelOutcome::WrongArm {
+            kernel_arm: "SubscribeAgentEventsMissingMemberRunning",
+            refusal_effect: Some("RejectAgentEventSubscription"),
+            runtime_arm: "SubscribeAgentEventsRunning",
             differing_keys: &[],
         },
         reason: MOB_PARITY_MISSING_MEMBER_GAP,
@@ -94242,9 +94559,10 @@ const ACCEPTED_MOB_PARITY_DIFFERENCES: &[AcceptedMobParityDifference] = &[
         phase: MobRuntimeParityPhase::Stopped,
         input: SchemaMobMachineInputVariant::SubscribeAgentEvents,
         runtime: MobRuntimeParityOutcomeKind::Ok,
-        kernel: AcceptedMobKernelOutcome::RefusalEffect {
-            transition: "SubscribeAgentEventsMissingMemberStopped",
-            effect: "RejectAgentEventSubscription",
+        kernel: AcceptedMobKernelOutcome::WrongArm {
+            kernel_arm: "SubscribeAgentEventsMissingMemberStopped",
+            refusal_effect: Some("RejectAgentEventSubscription"),
+            runtime_arm: "SubscribeAgentEventsStopped",
             differing_keys: &[],
         },
         reason: MOB_PARITY_MISSING_MEMBER_GAP,
@@ -94256,7 +94574,7 @@ const ACCEPTED_MOB_PARITY_DIFFERENCES: &[AcceptedMobParityDifference] = &[
         kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
             "mob_machine_session_bound_live_runtime_ids_match",
         ),
-        reason: MOB_PARITY_SESSION_BOUND_NATIVE_GAP,
+        reason: MOB_PARITY_SESSION_BOUND_GAP,
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Stopped,
@@ -94265,7 +94583,7 @@ const ACCEPTED_MOB_PARITY_DIFFERENCES: &[AcceptedMobParityDifference] = &[
         kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
             "mob_machine_session_bound_live_runtime_ids_match",
         ),
-        reason: MOB_PARITY_SESSION_BOUND_NATIVE_GAP,
+        reason: MOB_PARITY_SESSION_BOUND_GAP,
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Completed,
@@ -94274,7 +94592,7 @@ const ACCEPTED_MOB_PARITY_DIFFERENCES: &[AcceptedMobParityDifference] = &[
         kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
             "mob_machine_session_bound_live_runtime_ids_match",
         ),
-        reason: MOB_PARITY_SESSION_BOUND_NATIVE_GAP,
+        reason: MOB_PARITY_SESSION_BOUND_GAP,
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Running,
@@ -94283,7 +94601,7 @@ const ACCEPTED_MOB_PARITY_DIFFERENCES: &[AcceptedMobParityDifference] = &[
         kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
             "mob_machine_session_bound_live_runtime_ids_match",
         ),
-        reason: MOB_PARITY_SESSION_BOUND_NATIVE_GAP,
+        reason: MOB_PARITY_SESSION_BOUND_GAP,
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Stopped,
@@ -94292,7 +94610,7 @@ const ACCEPTED_MOB_PARITY_DIFFERENCES: &[AcceptedMobParityDifference] = &[
         kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
             "mob_machine_session_bound_live_runtime_ids_match",
         ),
-        reason: MOB_PARITY_SESSION_BOUND_NATIVE_GAP,
+        reason: MOB_PARITY_SESSION_BOUND_GAP,
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Completed,
@@ -94301,7 +94619,7 @@ const ACCEPTED_MOB_PARITY_DIFFERENCES: &[AcceptedMobParityDifference] = &[
         kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
             "mob_machine_session_bound_live_runtime_ids_match",
         ),
-        reason: MOB_PARITY_SESSION_BOUND_NATIVE_GAP,
+        reason: MOB_PARITY_SESSION_BOUND_GAP,
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Running,
@@ -94310,7 +94628,7 @@ const ACCEPTED_MOB_PARITY_DIFFERENCES: &[AcceptedMobParityDifference] = &[
         kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
             "mob_machine_adaptive_lifecycle_drained",
         ),
-        reason: MOB_PARITY_ADAPTIVE_NATIVE_GAP,
+        reason: MOB_PARITY_ADAPTIVE_ONLY_GAP,
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Stopped,
@@ -94319,7 +94637,7 @@ const ACCEPTED_MOB_PARITY_DIFFERENCES: &[AcceptedMobParityDifference] = &[
         kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
             "mob_machine_adaptive_lifecycle_drained",
         ),
-        reason: MOB_PARITY_ADAPTIVE_NATIVE_GAP,
+        reason: MOB_PARITY_ADAPTIVE_ONLY_GAP,
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Completed,
@@ -94328,125 +94646,119 @@ const ACCEPTED_MOB_PARITY_DIFFERENCES: &[AcceptedMobParityDifference] = &[
         kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
             "mob_machine_adaptive_lifecycle_drained",
         ),
-        reason: MOB_PARITY_ADAPTIVE_NATIVE_GAP,
+        reason: MOB_PARITY_ADAPTIVE_ONLY_GAP,
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Running,
         input: SchemaMobMachineInputVariant::ForceCancel,
         runtime: MobRuntimeParityOutcomeKind::Ok,
-        kernel: AcceptedMobKernelOutcome::NoMatchingTransition,
-        reason: MOB_PARITY_IDENTITY_PROJECTION_GAP,
+        kernel: AcceptedMobKernelOutcome::ArmsBlocked,
+        reason: MOB_PARITY_IDENTITY_ONLY_GAP,
     },
     AcceptedMobParityDifference {
         phase: MobRuntimeParityPhase::Stopped,
         input: SchemaMobMachineInputVariant::Resume,
         runtime: MobRuntimeParityOutcomeKind::Ok,
-        kernel: AcceptedMobKernelOutcome::NoMatchingTransition,
-        reason: "projection gap: ResumeStopped needs the Stop intent the public stop records in \
-                 placed_completion_lifecycle_intent, which the runtime snapshot does not project",
+        kernel: AcceptedMobKernelOutcome::ArmsBlocked,
+        reason: MOB_PARITY_RESUME_GAP,
     },
 ];
 
-/// Probed inputs for which no kernel row fires a transition today, and why.
-/// Every other probed input must have at least one kernel row that fires a
-/// transition (one emitting a machine-owned refusal counts: the kernel
-/// answered), so an oracle that refuses or matches nothing cannot pass. An
-/// entry whose input does fire a transition is stale.
+/// Probed inputs for which no kernel row fires a transition on a real
+/// alignment today, and why. Every other probed input needs a kernel row that
+/// fires the runtime's arm: an aligned row with no accepted difference (a
+/// refusal-effect arm counts where the runtime refuses too), or a row a
+/// `Transition` accepted difference covers. A wrong-arm row never counts. An
+/// entry whose input does fire such a row is stale.
 const MOB_PARITY_KERNEL_LIVENESS_GAPS: &[(SchemaMobMachineInputVariant, &str)] = &[
     (
         SchemaMobMachineInputVariant::CommitSpawnMembership,
-        "only Running has arms, and they need the spawn_exec_phase BeginSpawnExec opens, which \
-         the single-input row does not replay",
+        MOB_PARITY_COMMIT_SPAWN_GAP,
     ),
     (
         SchemaMobMachineInputVariant::SubmitWork,
-        MOB_PARITY_IDENTITY_PROJECTION_GAP,
+        MOB_PARITY_SUBMIT_WORK_GAP,
     ),
     (
         SchemaMobMachineInputVariant::CancelFlow,
-        "only Running has an arm, and it needs run_status, which the snapshot does not project",
+        MOB_PARITY_CANCEL_FLOW_GAP,
     ),
     (
         SchemaMobMachineInputVariant::Retire,
-        MOB_PARITY_IDENTITY_PROJECTION_GAP,
+        MOB_PARITY_RETIRE_LIVENESS_GAP,
     ),
     (
         SchemaMobMachineInputVariant::RetireAll,
-        MOB_PARITY_ADAPTIVE_NATIVE_GAP,
+        MOB_PARITY_ADAPTIVE_ONLY_GAP,
     ),
     (
         SchemaMobMachineInputVariant::WireMembers,
-        "only Running has arms, and they call mob_machine_wiring_edge_a, which the test oracle \
-         does not implement",
+        MOB_PARITY_WIRE_MEMBERS_GAP,
     ),
     (
         SchemaMobMachineInputVariant::WireMembersWithTrust,
-        "only Running has arms, and they call mob_machine_wiring_edge_matches_members, which the \
-         test oracle does not implement",
+        MOB_PARITY_WIRE_WITH_TRUST_GAP,
     ),
     (
         SchemaMobMachineInputVariant::WireExternalPeer,
-        MOB_PARITY_EXTERNAL_PEER_NATIVE_GAP,
+        MOB_PARITY_WIRE_EXTERNAL_PEER_GAP,
     ),
     (
         SchemaMobMachineInputVariant::UnwireExternalPeer,
-        MOB_PARITY_EXTERNAL_PEER_NATIVE_GAP,
+        MOB_PARITY_UNWIRE_EXTERNAL_PEER_GAP,
+    ),
+    (
+        SchemaMobMachineInputVariant::UnwireMembers,
+        MOB_PARITY_UNWIRE_MEMBERS_GAP,
     ),
     (
         SchemaMobMachineInputVariant::AuthorizeMemberPeerRebind,
-        MOB_PARITY_IDENTITY_PROJECTION_GAP,
+        MOB_PARITY_PEER_REBIND_GAP,
     ),
     (
         SchemaMobMachineInputVariant::AuthorizeMemberPeerOverlay,
-        MOB_PARITY_IDENTITY_PROJECTION_GAP,
+        MOB_PARITY_PEER_OVERLAY_GAP,
     ),
     (
         SchemaMobMachineInputVariant::CancelAllWork,
-        MOB_PARITY_IDENTITY_PROJECTION_GAP,
+        MOB_PARITY_IDENTITY_ONLY_GAP,
     ),
-    (
-        SchemaMobMachineInputVariant::Stop,
-        MOB_PARITY_ADAPTIVE_NATIVE_GAP,
-    ),
-    (
-        SchemaMobMachineInputVariant::Resume,
-        "only Stopped has an arm, and it needs the Stop intent in \
-         placed_completion_lifecycle_intent, which the snapshot does not project",
-    ),
+    (SchemaMobMachineInputVariant::Stop, MOB_PARITY_STOP_GAP),
+    (SchemaMobMachineInputVariant::Resume, MOB_PARITY_RESUME_GAP),
     (
         SchemaMobMachineInputVariant::Complete,
-        MOB_PARITY_ADAPTIVE_NATIVE_GAP,
+        MOB_PARITY_COMPLETE_GAP,
     ),
-    (
-        SchemaMobMachineInputVariant::Reset,
-        MOB_PARITY_ADAPTIVE_NATIVE_GAP,
-    ),
+    (SchemaMobMachineInputVariant::Reset, MOB_PARITY_RESET_GAP),
     (
         SchemaMobMachineInputVariant::Destroy,
-        MOB_PARITY_ADAPTIVE_NATIVE_GAP,
+        MOB_PARITY_DESTROY_GAP,
     ),
     (
         SchemaMobMachineInputVariant::SubscribeAllAgentEvents,
-        MOB_PARITY_SESSION_BOUND_NATIVE_GAP,
+        MOB_PARITY_SESSION_BOUND_GAP,
     ),
     (
         SchemaMobMachineInputVariant::SubscribeMobEvents,
-        MOB_PARITY_SESSION_BOUND_NATIVE_GAP,
+        MOB_PARITY_SESSION_BOUND_GAP,
     ),
     (
         SchemaMobMachineInputVariant::Shutdown,
-        MOB_PARITY_ADAPTIVE_NATIVE_GAP,
+        MOB_PARITY_ADAPTIVE_ONLY_GAP,
     ),
     (
         SchemaMobMachineInputVariant::ForceCancel,
-        MOB_PARITY_IDENTITY_PROJECTION_GAP,
+        MOB_PARITY_IDENTITY_ONLY_GAP,
     ),
 ];
 
 /// The fail-closed verdict over every kernel row of both audits. Returns
 /// one line per failure; empty means the kernel answered every probed row
-/// the way the runtime did or the way an accepted difference says it does.
-fn mob_parity_audit_failures(observations: &[MobParityObservation]) -> Vec<String> {
+/// the way the runtime did, or the way an accepted difference says it does.
+fn mob_parity_audit_failures(
+    schema: &MachineSchema,
+    observations: &[MobParityObservation],
+) -> Vec<String> {
     let mut failures = Vec::new();
 
     for (index, accepted) in ACCEPTED_MOB_PARITY_DIFFERENCES.iter().enumerate() {
@@ -94460,20 +94772,58 @@ fn mob_parity_audit_failures(observations: &[MobParityObservation]) -> Vec<Strin
         {
             failures.push(format!("accepted difference {cell} is listed twice"));
         }
-        if let AcceptedMobKernelOutcome::UnknownNativeHelper(helper) = accepted.kernel
-            && !meerkat_machine_kernels::test_oracle::KERNEL_UNIMPLEMENTED_NATIVE_HELPERS
-                .iter()
-                .any(|(gap, _)| *gap == helper)
-        {
-            failures.push(format!(
-                "accepted difference {cell} blames `{helper}`, which \
-                 KERNEL_UNIMPLEMENTED_NATIVE_HELPERS does not list"
-            ));
+        match accepted.kernel {
+            AcceptedMobKernelOutcome::UnknownNativeHelper(helper)
+                if !meerkat_machine_kernels::test_oracle::KERNEL_UNIMPLEMENTED_NATIVE_HELPERS
+                    .iter()
+                    .any(|(gap, _)| *gap == helper) =>
+            {
+                failures.push(format!(
+                    "accepted difference {cell} blames `{helper}`, which \
+                     KERNEL_UNIMPLEMENTED_NATIVE_HELPERS does not list"
+                ));
+            }
+            // No row shows the runtime's arm: hold it to the schema.
+            AcceptedMobKernelOutcome::WrongArm {
+                kernel_arm,
+                runtime_arm,
+                ..
+            } => {
+                if !mob_parity_arm_exists(
+                    schema,
+                    accepted.phase.schema_name(),
+                    accepted.input.as_str(),
+                    Some(runtime_arm),
+                ) {
+                    failures.push(format!(
+                        "accepted difference {cell} names `{runtime_arm}` as the runtime's arm, \
+                         which is not a {} arm from {}",
+                        accepted.input.as_str(),
+                        accepted.phase.schema_name()
+                    ));
+                }
+                if kernel_arm == runtime_arm {
+                    failures.push(format!(
+                        "accepted difference {cell} is a wrong-arm entry that names one arm twice"
+                    ));
+                }
+            }
+            _ => {}
         }
     }
 
     let mut used = vec![false; ACCEPTED_MOB_PARITY_DIFFERENCES.len()];
+    let mut observed = BTreeSet::new();
+    let mut fired = BTreeSet::new();
     for observation in observations {
+        observed.insert(observation.input);
+        if observation.runtime_timed_out {
+            failures.push(format!(
+                "{}: the runtime probe timed out; a hang is never a parity answer",
+                observation.describe()
+            ));
+            continue;
+        }
         if let MobKernelOutcome::Refused { detail } | MobKernelOutcome::NotEvaluated { detail } =
             &observation.kernel
         {
@@ -94483,9 +94833,9 @@ fn mob_parity_audit_failures(observations: &[MobParityObservation]) -> Vec<Strin
             ));
             continue;
         }
-        if observation.aligned() {
-            continue;
-        }
+        // A cell with an accepted difference must show exactly that
+        // difference, even when the after-states agree: agreement on the
+        // wrong arm is no alignment.
         let accepted = ACCEPTED_MOB_PARITY_DIFFERENCES.iter().position(|accepted| {
             accepted.phase == observation.phase && accepted.input == observation.input
         });
@@ -94497,6 +94847,12 @@ fn mob_parity_audit_failures(observations: &[MobParityObservation]) -> Vec<Strin
                         .matches(observation) =>
             {
                 used[index] = true;
+                if ACCEPTED_MOB_PARITY_DIFFERENCES[index]
+                    .kernel
+                    .credits_liveness()
+                {
+                    fired.insert(observation.input);
+                }
             }
             Some(index) => failures.push(format!(
                 "{}: differs from its accepted difference (runtime {:?}, kernel {:?})",
@@ -94504,6 +94860,11 @@ fn mob_parity_audit_failures(observations: &[MobParityObservation]) -> Vec<Strin
                 ACCEPTED_MOB_PARITY_DIFFERENCES[index].runtime,
                 ACCEPTED_MOB_PARITY_DIFFERENCES[index].kernel
             )),
+            None if observation.aligned() => {
+                if matches!(observation.kernel, MobKernelOutcome::Transition { .. }) {
+                    fired.insert(observation.input);
+                }
+            }
             None => failures.push(format!(
                 "{}: the runtime and the kernel disagree and no accepted difference covers it",
                 observation.describe()
@@ -94526,14 +94887,6 @@ fn mob_parity_audit_failures(observations: &[MobParityObservation]) -> Vec<Strin
         }
     }
 
-    let mut observed = BTreeSet::new();
-    let mut fired = BTreeSet::new();
-    for observation in observations {
-        observed.insert(observation.input);
-        if matches!(observation.kernel, MobKernelOutcome::Transition { .. }) {
-            fired.insert(observation.input);
-        }
-    }
     for input in &observed {
         let gap = MOB_PARITY_KERNEL_LIVENESS_GAPS
             .iter()
@@ -94561,6 +94914,29 @@ fn mob_parity_audit_failures(observations: &[MobParityObservation]) -> Vec<Strin
         if !observed.contains(input) {
             failures.push(format!(
                 "stale liveness gap {}: no kernel row probes it",
+                input.as_str()
+            ));
+        }
+    }
+
+    // Every input with a probe and an arm in an audited phase must reach the
+    // verdict: rows that drop out (a skipped full-audit row, say) would
+    // otherwise leave it silently.
+    for input in SchemaMobMachineInput::variant_manifest().iter().copied() {
+        let has_audited_arm = [
+            MobRuntimeParityPhase::Running,
+            MobRuntimeParityPhase::Stopped,
+            MobRuntimeParityPhase::Completed,
+        ]
+        .into_iter()
+        .any(|phase| mob_parity_arm_exists(schema, phase.schema_name(), input.as_str(), None));
+        if has_audited_arm
+            && mob_runtime_parity_probe_for_input_variant(input).is_some()
+            && !observed.contains(&input)
+        {
+            failures.push(format!(
+                "{} has a probe and a MobMachine arm in an audited phase but no kernel row: its \
+                 rows dropped out of the audit",
                 input.as_str()
             ));
         }
