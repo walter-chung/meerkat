@@ -3491,12 +3491,15 @@ mod tests {
         })
     }
 
-    /// With only `schedule_id` the reply is one page of 50 full occurrences
-    /// in due order, each carrying its target once: no machine state (which
-    /// repeated the target as an escaped key) and no claim token. The rest
-    /// of the history follows the page's cursor.
+    /// With only `schedule_id` the reply is one page of 50 occurrence
+    /// summaries in due order: identity, timing, delivery state and the
+    /// target's kind and ids, without the trigger, the target's action or any
+    /// machine state. Whole occurrences are opt-in: `view: "full"` pages
+    /// them, each with its trigger and target once and without machine state
+    /// or claim token, and an `occurrence_id` read returns one whole, with
+    /// its receipts. The rest of the history follows the page's cursor.
     #[tokio::test]
-    async fn occurrences_default_is_a_bounded_page_without_machine_state() -> Result<(), String> {
+    async fn occurrence_pages_default_to_summaries_and_full_is_opt_in() -> Result<(), String> {
         let service = ScheduleService::new(Arc::new(MemoryScheduleStore::default()));
         let schedule_id = create_for_bounded_reads(&service, 60).await?;
 
@@ -3513,32 +3516,81 @@ mod tests {
             .ok_or("the default page continues")?
             .to_string();
         for row in &rows {
-            for dropped in ["machine_state", "claim_token"] {
+            for dropped in [
+                "machine_state",
+                "claim_token",
+                "trigger_snapshot",
+                "target_snapshot",
+            ] {
                 assert!(
                     row.get(dropped).is_none(),
-                    "the reply keeps {dropped}: {row}"
+                    "a default row keeps {dropped}: {row}"
                 );
             }
+            assert_eq!(row["target"]["target_kind"], "session", "{row}");
             assert!(
-                row.get("target_snapshot").is_some() && row.get("trigger_snapshot").is_some(),
-                "the default view is the full occurrence: {row}"
-            );
-            assert_eq!(
-                row.to_string().matches("tool surface").count(),
-                1,
-                "the prompt is in the row once: {row}"
+                !row.to_string().contains("tool surface"),
+                "a default row carries no prompt: {row}"
             );
         }
-        // Explicit nulls and view=full alone take the same default.
+        // Explicit nulls and view=summary take the same default.
         for args in [
             json!({ "schedule_id": schedule_id, "view": null, "limit": null, "cursor": null }),
-            json!({ "schedule_id": schedule_id, "view": "full" }),
+            json!({ "schedule_id": schedule_id, "view": "summary" }),
         ] {
             let same = read_occurrences(&service, args)
                 .await
                 .map_err(|error| format!("{error:?}"))?;
             assert_eq!(same, reply, "an all-default call must not change the reply");
         }
+
+        let full = read_occurrences(
+            &service,
+            json!({ "schedule_id": schedule_id, "view": "full" }),
+        )
+        .await
+        .map_err(|error| format!("{error:?}"))?;
+        let full_rows = rows_of(&full)?;
+        assert_eq!(full_rows.len(), 50, "view=full pages the same way");
+        for row in &full_rows {
+            for dropped in ["machine_state", "claim_token"] {
+                assert!(
+                    row.get(dropped).is_none(),
+                    "a full row keeps {dropped}: {row}"
+                );
+            }
+            assert!(
+                row.get("target_snapshot").is_some() && row.get("trigger_snapshot").is_some(),
+                "view=full is the whole occurrence: {row}"
+            );
+            assert_eq!(
+                row.to_string().matches("tool surface").count(),
+                1,
+                "the prompt is in a full row once: {row}"
+            );
+        }
+
+        let first_id = rows
+            .first()
+            .and_then(|row| row["occurrence_id"].as_str())
+            .ok_or("the first row's occurrence_id")?;
+        let exact = read_occurrences(
+            &service,
+            json!({ "schedule_id": schedule_id, "occurrence_id": first_id }),
+        )
+        .await
+        .map_err(|error| format!("{error:?}"))?;
+        let exact_rows = rows_of(&exact)?;
+        assert_eq!(ids_of(&exact_rows), vec![first_id.to_string()]);
+        assert!(
+            exact_rows
+                .iter()
+                .all(|row| row.get("target_snapshot").is_some()
+                    && row.get("machine_state").is_none()),
+            "an occurrence_id read returns the whole occurrence: {exact}"
+        );
+        assert!(exact["receipts"].is_array(), "{exact}");
+
         let rest = read_occurrences(
             &service,
             json!({ "schedule_id": schedule_id, "cursor": cursor }),
@@ -3548,6 +3600,132 @@ mod tests {
         assert_eq!(rows_of(&rest)?.len(), 10);
         assert_eq!(rest["page"]["has_more"].as_bool(), Some(false), "{rest}");
         assert!(rest["page"]["next_cursor"].is_null(), "{rest}");
+        Ok(())
+    }
+
+    /// A summary row carries no field without a bound: the failure detail and
+    /// the runtime outcome's detail or callback payload are cut to bounded
+    /// heads, as a schedule summary cuts its action text.
+    #[tokio::test]
+    async fn occurrence_summaries_carry_bounded_heads_only() -> Result<(), String> {
+        let service = ScheduleService::new(Arc::new(MemoryScheduleStore::default()));
+        let schedule = service
+            .create(bounded_read_request(interval_trigger(60), 1))
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut occurrence = Occurrence::planned_write_from_schedule(
+            &schedule,
+            OccurrenceOrdinal(1),
+            Utc::now() + Duration::minutes(5),
+        )
+        .map_err(|error| error.to_string())?
+        .occurrence()
+        .clone();
+        let failure = "f".repeat(5_000);
+        let payload = "p".repeat(5_000);
+        occurrence.failure_detail = Some(failure.clone());
+        occurrence.runtime_outcome = Some(RuntimeDeliveryOutcome::CompletionCallbackPending {
+            tool_name: "approve".to_string(),
+            payload: json!({ "blob": payload }),
+        });
+
+        let row = occurrence_summary(&occurrence).map_err(|error| error.message)?;
+        let text = row.to_string();
+        assert!(row.get("failure_detail").is_none(), "{row}");
+        let head = row["failure_detail_head"]
+            .as_str()
+            .ok_or("failure_detail_head")?;
+        assert!(
+            head.starts_with("fff") && head.chars().count() <= 163,
+            "the failure detail is a bounded head: {head}"
+        );
+        assert_eq!(
+            row["runtime_outcome"]["kind"], "completion_callback_pending",
+            "{row}"
+        );
+        let outcome_head = row["runtime_outcome"]["detail_head"]
+            .as_str()
+            .ok_or("runtime_outcome.detail_head")?;
+        assert!(
+            outcome_head.chars().count() <= 163,
+            "the runtime outcome is a bounded head: {outcome_head}"
+        );
+        assert!(
+            !text.contains(&failure) && !text.contains(&payload),
+            "no unbounded text in a summary row"
+        );
+        assert!(
+            text.len() < 2_048,
+            "a summary row is bounded: {} bytes",
+            text.len()
+        );
+
+        occurrence.failure_detail = None;
+        occurrence.runtime_outcome = Some(RuntimeDeliveryOutcome::AdmissionAccepted);
+        let row = occurrence_summary(&occurrence).map_err(|error| error.message)?;
+        assert_eq!(
+            row["runtime_outcome"],
+            json!({ "kind": "admission_accepted" }),
+            "{row}"
+        );
+        assert!(row.get("failure_detail_head").is_none(), "{row}");
+        Ok(())
+    }
+
+    /// A limit over the maximum is not refused: both tools return a page of
+    /// 200 rows, and the page reports that more follow.
+    #[tokio::test]
+    async fn a_limit_over_the_maximum_returns_a_page_of_200() -> Result<(), String> {
+        let service = ScheduleService::new(Arc::new(MemoryScheduleStore::default()));
+        let schedule_id = create_for_bounded_reads(&service, 210).await?;
+        for limit in [201_u64, 5_000] {
+            let reply = read_occurrences(
+                &service,
+                json!({ "schedule_id": schedule_id, "limit": limit }),
+            )
+            .await
+            .map_err(|error| format!("limit {limit}: {error:?}"))?;
+            assert_eq!(rows_of(&reply)?.len(), 200, "limit {limit}");
+            assert_eq!(reply["page"]["returned"].as_u64(), Some(200), "{reply}");
+            assert_eq!(reply["page"]["has_more"].as_bool(), Some(true), "{reply}");
+            let cursor = reply["page"]["next_cursor"]
+                .as_str()
+                .ok_or("more occurrences follow")?;
+            let rest = read_occurrences(
+                &service,
+                json!({ "schedule_id": schedule_id, "limit": limit, "cursor": cursor }),
+            )
+            .await
+            .map_err(|error| format!("limit {limit}: {error:?}"))?;
+            assert_eq!(rows_of(&rest)?.len(), 10, "limit {limit}");
+            assert_eq!(rest["page"]["has_more"].as_bool(), Some(false), "{rest}");
+        }
+
+        // 200 more schedules beside the one above: 201 in all.
+        for _ in 0..200 {
+            service
+                .create(bounded_read_request(interval_trigger(60), 1))
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        for limit in [201_u64, 5_000] {
+            let listed =
+                call_tool(&service, "meerkat_schedule_list", json!({ "limit": limit })).await?;
+            assert_eq!(listed_ids(&listed)?.len(), 200, "limit {limit}");
+            assert_eq!(listed["page"]["returned"].as_u64(), Some(200), "{limit}");
+            assert_eq!(listed["page"]["has_more"].as_bool(), Some(true), "{limit}");
+            let cursor = listed["page"]["next_cursor"]
+                .as_str()
+                .ok_or("more schedules follow")?;
+            let rest = call_tool(
+                &service,
+                "meerkat_schedule_list",
+                json!({ "limit": limit, "cursor": cursor }),
+            )
+            .await?;
+            assert_eq!(listed_ids(&rest)?.len(), 1, "limit {limit}");
+            assert_eq!(rest["page"]["has_more"].as_bool(), Some(false), "{rest}");
+        }
         Ok(())
     }
 
@@ -4192,15 +4370,30 @@ mod tests {
         }
     }
 
+    /// Only malformed options are refused: a zero, negative or non-integer
+    /// limit, a cursor no occurrence page wrote (a schedule listing's cursor
+    /// included), bad due bounds, an occurrence id that is not one, and an
+    /// unknown view. A limit over the maximum returns 200 rows instead
+    /// (`a_limit_over_the_maximum_returns_a_page_of_200`).
     #[tokio::test]
     async fn malformed_bounded_options_are_refused() -> Result<(), String> {
         let service = ScheduleService::new(Arc::new(MemoryScheduleStore::default()));
         let schedule_id = create_for_bounded_reads(&service, 2).await?;
+        // A schedule listing's cursor names a schedule, not an occurrence.
+        create_for_bounded_reads(&service, 1).await?;
+        let listed = call_tool(&service, "meerkat_schedule_list", json!({ "limit": 1 })).await?;
+        let schedule_cursor = listed["page"]["next_cursor"]
+            .as_str()
+            .ok_or("the schedule listing continues")?
+            .to_string();
         let cases = [
             json!({ "limit": 0 }),
-            json!({ "limit": 201 }),
+            json!({ "limit": -1 }),
+            json!({ "limit": 2.5 }),
+            json!({ "limit": "ten" }),
             json!({ "cursor": "c1zz" }),
             json!({ "limit": 2, "cursor": "not-a-cursor" }),
+            json!({ "cursor": schedule_cursor }),
             json!({ "due_after_utc": "yesterday" }),
             json!({
                 "due_after_utc": "2026-10-26T00:00:00Z",
@@ -4433,8 +4626,10 @@ mod tests {
         Ok(())
     }
 
-    /// Page options a schedule listing cannot honor are refused as invalid
-    /// arguments, never ignored.
+    /// Malformed page options are refused as invalid arguments, never
+    /// ignored: a zero, negative or non-integer limit, and a cursor this
+    /// listing did not write. A limit over the maximum returns 200 rows
+    /// instead (`a_limit_over_the_maximum_returns_a_page_of_200`).
     #[tokio::test]
     async fn schedule_list_refuses_malformed_page_options() -> Result<(), String> {
         let service = ScheduleService::new(Arc::new(MemoryScheduleStore::default()));
@@ -4450,8 +4645,8 @@ mod tests {
             .to_string();
         for case in [
             json!({ "limit": 0 }),
-            json!({ "limit": 201 }),
             json!({ "limit": -1 }),
+            json!({ "limit": 2.5 }),
             json!({ "limit": "ten" }),
             json!({ "cursor": "x" }),
             json!({ "cursor": 7 }),
