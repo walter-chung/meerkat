@@ -23,7 +23,8 @@
 //! retains further originals must supply them all as
 //! `complete_contributors`.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use meerkat_authorization::clock::LocalAuthorizationClock;
 use meerkat_authorization::grant_policy::GrantBackedWorkPolicy;
@@ -38,7 +39,10 @@ use meerkat_runtime::meerkat_machine::{
     AuthenticatedOriginalSource, SourceOriginalBasis, original_operation_grant,
     require_active_original,
 };
-use meerkat_workgraph::{WorkAdmission, WorkGraphAdmissionFence, WorkGraphError, WorkNamespace};
+use meerkat_workgraph::{
+    CreateWorkItemRequest, WorkAdmission, WorkAdmissionKey, WorkAdmissionOutcome,
+    WorkGraphAdmissionFence, WorkGraphError, WorkGraphService, WorkNamespace,
+};
 
 /// Why a governed helper admission was refused. WorkGraph reports every
 /// refusal as `Conflict`; this keeps the native distinction for the call.
@@ -122,12 +126,17 @@ pub(crate) fn named_originals(
 /// reused fence refuses without running the store operation, so
 /// [`Self::refusal`] always describes this fence's own attempt.
 pub struct GovernedHelperAdmissionFence {
-    check: FenceCheck,
+    /// Shared by every fence of one waiting admission.
+    check: Arc<FenceCheck>,
     realm_id: String,
     namespace: WorkNamespace,
     admission: WorkAdmission,
-    attempted: std::sync::atomic::AtomicBool,
-    refusal: std::sync::OnceLock<HelperAdmissionRefusal>,
+    attempted: AtomicBool,
+    refusal: OnceLock<HelperAdmissionRefusal>,
+    /// Test seam: the fences a waiting admission through this fence made, in
+    /// order.
+    #[cfg(test)]
+    attempts: std::sync::Mutex<Vec<Arc<Self>>>,
 }
 
 /// How a fence checks its setup operation under one exclusion held through
@@ -287,19 +296,92 @@ impl GovernedHelperAdmissionFence {
         namespace: WorkNamespace,
         admission: WorkAdmission,
     ) -> Arc<Self> {
+        Self::unattempted(Arc::new(check), realm_id, namespace, admission)
+    }
+
+    /// A fence that has not served its attempt yet.
+    fn unattempted(
+        check: Arc<FenceCheck>,
+        realm_id: String,
+        namespace: WorkNamespace,
+        admission: WorkAdmission,
+    ) -> Arc<Self> {
         Arc::new(Self {
             check,
             realm_id,
             namespace,
             admission,
-            attempted: std::sync::atomic::AtomicBool::new(false),
-            refusal: std::sync::OnceLock::new(),
+            attempted: AtomicBool::new(false),
+            refusal: OnceLock::new(),
+            #[cfg(test)]
+            attempts: std::sync::Mutex::new(Vec::new()),
         })
+    }
+
+    /// A new fence for one more attempt of this fence's admission: the same
+    /// check, scope and admission, not yet attempted.
+    fn renewed(&self) -> Arc<Self> {
+        Self::unattempted(
+            Arc::clone(&self.check),
+            self.realm_id.clone(),
+            self.namespace.clone(),
+            self.admission.clone(),
+        )
     }
 
     /// The typed reason this fence's one attempt refused, if it did.
     pub fn refusal(&self) -> Option<HelperAdmissionRefusal> {
         self.refusal.get().copied()
+    }
+
+    /// The keyed create this fence admits, made through a new fence with
+    /// this fence's check, scope and admission. This fence serves this one
+    /// admission: a fence already used refuses as a reused fence does.
+    ///
+    /// # Errors
+    /// The attempt's own error, typed by [`Self::refusal`].
+    pub async fn create_idempotent_after_owner_change(
+        &self,
+        service: &WorkGraphService,
+        admission_key: WorkAdmissionKey,
+        request: CreateWorkItemRequest,
+        _budget_remaining: Option<std::time::Duration>,
+    ) -> Result<WorkAdmissionOutcome, WorkGraphError> {
+        if self.attempted.swap(true, Ordering::AcqRel) {
+            return Err(serves_one_attempt());
+        }
+        let attempt = self.renewed();
+        #[cfg(test)]
+        self.record_attempt(&attempt);
+        let answer = service
+            .create_idempotent_with_fence(admission_key, request, attempt.clone())
+            .await;
+        if let Some(refusal) = attempt.refusal() {
+            let _ = self.refusal.set(refusal);
+        }
+        answer
+    }
+
+    /// Test seam: record `attempt` as one of this waiting admission's fences.
+    #[cfg(test)]
+    fn record_attempt(&self, attempt: &Arc<Self>) {
+        self.attempts
+            .lock()
+            .expect("the attempt record")
+            .push(Arc::clone(attempt));
+    }
+
+    /// Test seam: the fences a waiting admission through this fence made, in
+    /// order.
+    #[cfg(test)]
+    pub(crate) fn attempts(&self) -> Vec<Arc<Self>> {
+        self.attempts.lock().expect("the attempt record").clone()
+    }
+
+    /// Test seam: whether this fence served its one attempt.
+    #[cfg(test)]
+    pub(crate) fn was_attempted(&self) -> bool {
+        self.attempted.load(Ordering::Acquire)
     }
 
     /// Run the store `operation` at most once inside `run` (a governed
@@ -385,6 +467,12 @@ fn check_prepared(
         .map_err(refusal_of)
 }
 
+/// The answer of a fence asked to serve another attempt than its one: it
+/// runs nothing, and its recorded outcome stays its own.
+fn serves_one_attempt() -> WorkGraphError {
+    WorkGraphError::Conflict("a governed helper admission fence serves one attempt".into())
+}
+
 fn refusal_of(error: OperationAuthorizationError) -> HelperAdmissionRefusal {
     match error {
         OperationAuthorizationError::Refused(refusal) if super::effect_leaf_denies(refusal) => {
@@ -438,14 +526,9 @@ impl WorkGraphAdmissionFence for GovernedHelperAdmissionFence {
         admission: &WorkAdmission,
         operation: Box<dyn FnOnce() -> Result<(), WorkGraphError> + '_>,
     ) -> Result<(), WorkGraphError> {
-        if self
-            .attempted
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
+        if self.attempted.swap(true, Ordering::AcqRel) {
             // Not this fence's attempt: its recorded outcome stays its own.
-            return Err(WorkGraphError::Conflict(
-                "a governed helper admission fence serves one attempt".into(),
-            ));
+            return Err(serves_one_attempt());
         }
         if realm_id != self.realm_id || namespace != &self.namespace || admission != &self.admission
         {
@@ -454,7 +537,7 @@ impl WorkGraphAdmissionFence for GovernedHelperAdmissionFence {
         // One reservation through the store callback: owner changes stay
         // excluded through the commit or the replay disclosure, and the
         // operation's own result is returned unchanged.
-        match &self.check {
+        match self.check.as_ref() {
             FenceCheck::Prepared {
                 grants,
                 originals,
