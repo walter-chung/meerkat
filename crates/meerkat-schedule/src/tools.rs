@@ -121,6 +121,13 @@ const SUMMARY_NAME_CHARS: usize = 200;
 /// Characters of a failure or runtime outcome detail an occurrence summary
 /// carries.
 const DETAIL_HEAD_CHARS: usize = 160;
+/// Characters of a target id (a session, identity, mob, member, flow or host
+/// runnable name) a summary keeps.
+const SUMMARY_ID_CHARS: usize = 200;
+/// Serialized bytes of a trigger a schedule summary keeps whole. A larger
+/// trigger (a calendar that lists thousands of values, for one) is named by
+/// its type and timezone, with its serialized length.
+const SUMMARY_TRIGGER_BYTES: usize = 1_024;
 /// The target fields a summary keeps: what kind of target it is and which
 /// session, identity, mob, member, flow or host runnable it names. Everything
 /// else (the action, prompt, helper options, materialization spec, flow and
@@ -183,7 +190,8 @@ pub fn schedule_tools_list() -> Vec<Value> {
                 "schedules in creation order; deleted schedules are not listed (their occurrence ",
                 "history stays readable with meerkat_schedule_occurrences). Use this to discover ",
                 "existing schedules before creating duplicates. Each row is a summary: schedule_id, ",
-                "name, phase, revision, trigger, the target's kind and ids, the first 160 characters ",
+                "name, phase, revision, trigger (only its type and timezone when it is very large), ",
+                "the target's kind and ids (each cut to 200 characters), the first 160 characters ",
                 "of the action text (action_head; action_chars is the text's full length) and the ",
                 "created and updated times. Read a schedule's full action, policies and options with ",
                 "meerkat_schedule_get. limit sets the page size (default 50, at most 200: a larger limit ",
@@ -1099,11 +1107,12 @@ impl SchedulePageKey {
 /// and params are `meerkat_schedule_get`'s.
 fn schedule_summary(schedule: &Schedule) -> Result<Value, ScheduleToolError> {
     let target = summary_target(&encode("meerkat_schedule_list", &schedule.target)?);
+    let trigger = summary_trigger(encode("meerkat_schedule_list", &schedule.trigger)?);
     let mut row = json!({
         "schedule_id": schedule.schedule_id,
         "phase": schedule.phase,
         "revision": schedule.revision,
-        "trigger": schedule.trigger,
+        "trigger": trigger,
         "target": target,
         "created_at_utc": schedule.config.created_at_utc,
         "updated_at_utc": schedule.config.updated_at_utc,
@@ -1448,20 +1457,48 @@ fn receipt_summary(receipt: &DeliveryReceipt) -> Value {
 }
 
 /// The identifying fields of a serialized target (`SUMMARY_TARGET_KEYS`),
-/// without its action, prompt or other payload.
+/// without its action, prompt or other payload, each cut to its first
+/// `SUMMARY_ID_CHARS` characters: the domain does not bound an id's length.
 fn summary_target(target: &Value) -> Map<String, Value> {
     target
         .as_object()
         .map(|object| {
             object
                 .iter()
-                .filter(|(key, value)| {
-                    value.is_string() && SUMMARY_TARGET_KEYS.contains(&key.as_str())
+                .filter(|(key, _)| SUMMARY_TARGET_KEYS.contains(&key.as_str()))
+                .filter_map(|(key, value)| {
+                    value.as_str().map(|id| {
+                        (
+                            key.clone(),
+                            Value::String(bounded_head(id, SUMMARY_ID_CHARS)),
+                        )
+                    })
                 })
-                .map(|(key, value)| (key.clone(), value.clone()))
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The trigger a schedule summary carries: whole up to
+/// `SUMMARY_TRIGGER_BYTES` serialized bytes, else its `type` and `timezone`
+/// with `trigger_chars`, the length of its serialized form (a calendar's
+/// value lists are not bounded). `meerkat_schedule_get` returns it whole.
+fn summary_trigger(trigger: Value) -> Value {
+    let serialized = trigger.to_string();
+    if serialized.len() <= SUMMARY_TRIGGER_BYTES {
+        return trigger;
+    }
+    let mut named = Map::new();
+    for key in ["type", "timezone"] {
+        if let Some(value) = trigger.get(key) {
+            named.insert(key.to_string(), value.clone());
+        }
+    }
+    named.insert(
+        "trigger_chars".to_string(),
+        json!(serialized.chars().count()),
+    );
+    Value::Object(named)
 }
 
 /// The wall-clock time a calendar trigger meant for `due_at_utc`, in the

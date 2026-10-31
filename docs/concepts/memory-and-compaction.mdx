@@ -84,8 +84,10 @@ exact count for everything it counted and estimates only the growth. Its
 anchor (the last answered request's count, the transcript rows it covered and
 the provider and model that counted them) rides the session's compaction
 cadence, so an agent rebuilt from its store projects its first request too.
-A committed rewrite drops the anchor until the next answer, and an anchor
-another provider or model counted is not used.
+A committed rewrite drops the anchor until the next answer (the agent's own
+compaction, or a host's transcript edit, revision restore or system prompt
+update), as does a fork at a point; an anchor another provider or model
+counted is not used.
 
 The minimum-boundary cadence is a cost guard, not capacity authority. It may
 suppress an ordinary provider high-water mark, but it cannot veto recovery
@@ -111,7 +113,11 @@ clears the refusal whether it commits or not, so a refusal costs one
 compaction and cannot loop; an answered request clears it too. The refused
 run's failed boundary commits the refusal with the session, also when the
 refused request was the run's first, so an agent rebuilt from the store
-(after a restart, or for a session not kept alive) compacts first too.
+(after a restart, or for a session not kept alive) compacts first too. That
+boundary also commits the refused prompt, as a failed run's boundary always
+commits its input, and the next compaction folds it. A closing save or a
+boundary build that fails loses the refusal, and the next refusal records it
+again. A host transcript edit and a fork at a point drop it with the anchor.
 
 ## Summary authority
 

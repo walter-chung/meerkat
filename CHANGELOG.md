@@ -207,8 +207,10 @@ them.
     `limit` asks for another size, at most 200 (a larger `limit` returns 200
     with `page.has_more`), and `cursor` takes `page.next_cursor` to
     continue. A summary carries `schedule_id`, `name`
-    (its first 200 characters), `phase`, `revision`, `trigger`, the target's
-    kind and ids (`target`), `action_head` (the first 160 characters of the
+    (its first 200 characters), `phase`, `revision`, `trigger` (only its
+    `type` and `timezone`, with `trigger_chars`, when its serialized form is
+    over 1,024 bytes), the target's kind and ids (`target`, each id cut to
+    its first 200 characters), `action_head` (the first 160 characters of the
     action text: a prompt, the content a member is sent, a helper's prompt
     or an event's type) with `action_chars` (that text's full length),
     `created_at_utc` and `updated_at_utc`. It returned every live schedule,
@@ -229,7 +231,8 @@ them.
     returned every occurrence unpaged). A page's rows are summaries by
     default (`view: "summary"`; whole occurrences were the default before):
     ids, phase, due time, attempts, the last receipt summarized, the
-    target's kind and ids, the runtime outcome's `kind` with a
+    target's kind and ids (each cut to 200 characters), the runtime
+    outcome's `kind` with a
     `detail_head`, and a `failure_detail_head`, each head the first 160
     characters of its text (the summary view carried the whole outcome,
     callback payload included, and the whole `failure_detail` before). Whole
@@ -334,6 +337,10 @@ them.
   presented tokens and the rows appended since, as `build_compaction_context`
   measures them).
 
+- `meerkat-core`: `Agent::reload_compaction_cadence` adopts the compaction
+  cadence the agent's session carries; a host that swaps in a durable
+  snapshot of the session calls it after the swap.
+
 ### Fixed
 
 - `meerkat-core` and `meerkat-session`: one tool result no longer carries a
@@ -353,10 +360,12 @@ them.
   history crossing), and a projection whose answered request alone was over
   the threshold waits for the cadence as the provider's count does. The
   anchor is set by every answered request, dropped by a committed rewrite
-  (and restored when the rewrite rolls back) and when the active provider or
-  model is not the one that counted it, and persisted in the session's
-  compaction cadence, so an agent rebuilt from its store projects its first
-  request too.
+  (and restored when the rewrite rolls back), by a host transcript edit (a
+  rewrite, a revision restore or a system prompt update) and by a fork at a
+  point, and not used when the active provider or model is not the one that
+  counted it. It is persisted in the session's compaction cadence, so an
+  agent rebuilt from its store projects its first request too, and a live
+  session synced from the store adopts the stored cadence.
 
 - `meerkat-core` and `meerkat-session`: a session whose request the provider
   refused for not fitting the model's context no longer stays wedged. The
@@ -373,8 +382,10 @@ them.
   run's first request, the failed run's applied boundary), so a new agent
   built from the store (after a restart, for a session not kept alive, for
   a command-line resume) compacts first too, as does a session wedged by an
-  earlier release after its next refused run. A custom `Compactor` receives
-  the fact as `CompactionContext::last_context_refusal_boundary_index`.
+  earlier release after its next refused run. A host transcript edit and a
+  fork at a point drop the fact with the anchor. A custom `Compactor`
+  receives the fact as
+  `CompactionContext::last_context_refusal_boundary_index`.
 
 - `meerkat-core`: a pending or approved human consent (R3) is now kept
   across unrelated authorization changes and past the end of its decision's
@@ -653,6 +664,9 @@ them.
   with a context refusal: a compaction inside a run keeps the run's request
   and newest round verbatim. The next run compacts first and continues (see
   Fixed).
+
+- `meerkat-core`: a context refusal whose run's closing save or boundary
+  build fails is not persisted; the next refusal records it again.
 
 - `meerkat-schedule`: a schedule's superseded acks still grow with every
   revision. `meerkat_schedule_list` summaries leave them out;

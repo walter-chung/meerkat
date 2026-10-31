@@ -137,7 +137,8 @@ The decision flow:
       last answered request was under the threshold) and the last rewrite, if
       any, got the history under the threshold. Its anchor is persisted
       with the session, so an agent rebuilt from its store projects its first
-      request too; a committed rewrite drops it until the next answer, OR
+      request too; a committed rewrite (a compaction or a host's transcript
+      edit) and a fork at a point drop it until the next answer, OR
     - `estimated_history_tokens >= auto_compact_threshold` (a conservative
       current-history estimate: text and serialized structure use a bytes/4
       heuristic, while images and video use media-aware estimates), OR

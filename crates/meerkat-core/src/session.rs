@@ -7370,6 +7370,30 @@ impl Session {
         metadata
     }
 
+    /// The compaction cadence `metadata` holds, without its two facts about
+    /// one exact transcript: the last answered request's input count (the
+    /// projection anchor) and a context refusal. A fork at a point and a
+    /// host transcript edit leave a transcript neither was recorded on; the
+    /// next answered request anchors again. `None` when the cadence holds
+    /// neither fact or does not decode (the agent refuses a corrupt cadence
+    /// when it loads it).
+    fn compaction_cadence_without_transcript_facts(
+        metadata: &serde_json::Map<String, serde_json::Value>,
+    ) -> Option<serde_json::Value> {
+        let value = metadata.get(crate::compact::SESSION_COMPACTION_CADENCE_KEY)?;
+        let mut cadence =
+            serde_json::from_value::<crate::compact::SessionCompactionCadence>(value.clone())
+                .ok()?;
+        if cadence.last_answered_request.is_none()
+            && cadence.last_context_refusal_boundary_index.is_none()
+        {
+            return None;
+        }
+        cadence.last_answered_request = None;
+        cadence.last_context_refusal_boundary_index = None;
+        serde_json::to_value(cadence).ok()
+    }
+
     fn remove_metadata_unchecked(&mut self, key: &str) {
         let removed = self.metadata.remove(key).is_some();
         let mut changed = removed;
@@ -8959,6 +8983,12 @@ impl Session {
         Ok(())
     }
 
+    /// Commit a host transcript edit: a generic rewrite, a revision restore
+    /// or a keyed system-prompt update. The edited transcript is not the one
+    /// the compaction cadence's input count counted or its context refusal
+    /// was recorded on, so the commit drops both; a compaction commits
+    /// through [`Self::commit_transcript_rewrite_bound`] and its agent
+    /// handles them.
     fn commit_transcript_rewrite_authorized(
         &mut self,
         selection: TranscriptRewriteSelection,
@@ -8967,14 +8997,18 @@ impl Session {
         actor: Option<String>,
         expected_parent_revision: Option<String>,
     ) -> Result<TranscriptRewriteCommit, TranscriptEditError> {
-        self.commit_transcript_rewrite_bound(
+        let commit = self.commit_transcript_rewrite_bound(
             selection,
             replacement,
             reason,
             actor,
             expected_parent_revision,
             None,
-        )
+        )?;
+        if let Some(cadence) = Self::compaction_cadence_without_transcript_facts(&self.metadata) {
+            self.set_metadata_unchecked(crate::compact::SESSION_COMPACTION_CADENCE_KEY, cadence);
+        }
+        Ok(commit)
     }
 
     /// [`Self::commit_transcript_rewrite_authorized`] with an additional
@@ -9358,6 +9392,13 @@ impl Session {
         let now = SystemTime::now();
         let truncated = self.messages[..index.min(self.messages.len())].to_vec();
         let id = SessionId::new();
+        let mut metadata = self.fork_metadata_projection();
+        if let Some(cadence) = Self::compaction_cadence_without_transcript_facts(&metadata) {
+            metadata.insert(
+                crate::compact::SESSION_COMPACTION_CADENCE_KEY.to_string(),
+                cadence,
+            );
+        }
         Self {
             version: session_version(),
             realtime_transcript: Box::new(SessionRealtimeTranscriptProjection::empty(&id)),
@@ -9365,7 +9406,7 @@ impl Session {
             messages: TranscriptMessages::from_fresh_branch(truncated),
             created_at: now,
             updated_at: now,
-            metadata: self.fork_metadata_projection(),
+            metadata,
             history_caches: Box::default(),
             transcript_history_metadata_validation: TranscriptHistoryMetadataValidation::Validated,
             // Usage is this session's own spend. A fork's prefix was paid for
