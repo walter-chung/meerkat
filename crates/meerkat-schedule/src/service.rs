@@ -44,6 +44,10 @@ pub struct ScheduleService {
 struct ExpectedScheduleTransition {
     effects: Vec<ScheduleLifecycleEffect>,
     revision_bumped: bool,
+    /// The acknowledgement set after the generated transition and before the
+    /// store feeds the supersession's acknowledgements back. A revise or
+    /// delete has already dropped the earlier supersessions' ids here, so the
+    /// commit may only add to this set.
     pre_feedback_ack_ids: BTreeSet<crate::OccurrenceId>,
 }
 

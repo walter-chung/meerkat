@@ -24,6 +24,17 @@ machine! {
             // The schedule side observes the completion of the
             // SupersedePendingOccurrences route by counting acks rather
             // than assuming every in-flight Supersede landed.
+            //
+            // Bounded retention: the set holds only the acknowledgements of
+            // the latest supersession, the one at `revision`. Revise* and
+            // Delete* (the only arms that bump `revision` and emit
+            // SupersedePendingOccurrences) drop every recorded id before the
+            // new supersession's acknowledgements arrive, since each of them
+            // answers an earlier revision; ConfirmOccurrencesSuperseded*
+            // record an acknowledgement only when its `superseding_revision`
+            // is `revision`. A set stored before this bound (any size, ids of
+            // any earlier revision) recovers unchanged, since no invariant
+            // reads it, and its next Revise* or Delete* drops it.
             superseded_ack_ids: Set<OccurrenceId>,
         }
 
@@ -160,6 +171,10 @@ machine! {
         }
 
         // --- Revise (per-phase, bumps revision) ---
+        //
+        // A revise supersedes at its new revision, so every acknowledgement
+        // recorded so far answers an earlier one: the update drops them all
+        // before this supersession's acknowledgements arrive.
 
         transition ReviseActive {
             on input Revise {
@@ -183,6 +198,7 @@ machine! {
                 self.planning_horizon_occurrences = planning_horizon_occurrences;
                 self.revision += 1;
                 self.planning_cursor_utc_ms = None;
+                self.superseded_ack_ids = EmptySet;
             }
             to Active
             emit EmitScheduleNotice { new_state: self.lifecycle_phase, revision: self.revision }
@@ -211,6 +227,7 @@ machine! {
                 self.planning_horizon_occurrences = planning_horizon_occurrences;
                 self.revision += 1;
                 self.planning_cursor_utc_ms = None;
+                self.superseded_ack_ids = EmptySet;
             }
             to Paused
             emit EmitScheduleNotice { new_state: self.lifecycle_phase, revision: self.revision }
@@ -328,6 +345,10 @@ machine! {
         }
 
         // --- Delete (per-phase, bumps revision) ---
+        //
+        // Delete supersedes like a revise: it drops every recorded
+        // acknowledgement, all of them of earlier revisions, and records its
+        // own supersession's acknowledgements, which arrive in Deleted.
 
         transition DeleteActive {
             on input Delete { at_utc_ms }
@@ -335,6 +356,7 @@ machine! {
             update {
                 self.revision += 1;
                 self.planning_cursor_utc_ms = None;
+                self.superseded_ack_ids = EmptySet;
             }
             to Deleted
             emit EmitScheduleNotice { new_state: self.lifecycle_phase, revision: self.revision }
@@ -347,6 +369,7 @@ machine! {
             update {
                 self.revision += 1;
                 self.planning_cursor_utc_ms = None;
+                self.superseded_ack_ids = EmptySet;
             }
             to Deleted
             emit EmitScheduleNotice { new_state: self.lifecycle_phase, revision: self.revision }
@@ -372,12 +395,23 @@ machine! {
         // leave the schedule in Deleted while acks are still arriving,
         // and the acks must land regardless of the schedule's onward
         // trajectory.
+        //
+        // Bounded retention: an ack is recorded only when it answers the
+        // latest supersession (`superseding_revision == revision`). Any other
+        // ack is accepted in every phase and changes nothing, so it keeps
+        // the answer it always had (accepted, no effect) without growing the
+        // set: a late ack of an earlier supersession, whose id a later Revise*
+        // or Delete* dropped, and an ack of a revision the schedule never
+        // reached. A repeated ack of the latest supersession re-inserts an id
+        // already recorded.
 
         transition ConfirmOccurrencesSupersededActive {
             on input ConfirmOccurrencesSuperseded { occurrence_id, superseding_revision }
             guard { self.lifecycle_phase == Phase::Active }
             update {
-                self.superseded_ack_ids.insert(occurrence_id);
+                if superseding_revision == self.revision {
+                    self.superseded_ack_ids.insert(occurrence_id);
+                }
             }
             to Active
         }
@@ -386,7 +420,9 @@ machine! {
             on input ConfirmOccurrencesSuperseded { occurrence_id, superseding_revision }
             guard { self.lifecycle_phase == Phase::Paused }
             update {
-                self.superseded_ack_ids.insert(occurrence_id);
+                if superseding_revision == self.revision {
+                    self.superseded_ack_ids.insert(occurrence_id);
+                }
             }
             to Paused
         }
@@ -395,7 +431,9 @@ machine! {
             on input ConfirmOccurrencesSuperseded { occurrence_id, superseding_revision }
             guard { self.lifecycle_phase == Phase::Deleted }
             update {
-                self.superseded_ack_ids.insert(occurrence_id);
+                if superseding_revision == self.revision {
+                    self.superseded_ack_ids.insert(occurrence_id);
+                }
             }
             to Deleted
         }
