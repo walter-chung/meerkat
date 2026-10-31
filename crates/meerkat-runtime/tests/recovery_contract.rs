@@ -6473,6 +6473,89 @@ async fn a_kept_directed_run_past_its_stops_max_age_fails_its_interaction_once()
     );
 }
 
+/// A kept run past its stop's max age whose stop was asked once the start
+/// registered it (the resumable branch of a stop needs no executor) settles
+/// as stopped, as every settlement of a stopped run does: its input ends
+/// `Abandoned { Cancelled }` and the run ends once on the session's stream
+/// as cancelled, not as expired. Nothing runs. RED while the expiry
+/// settlement ignored the stop: the input ended `RequeueExpired`. Unrun:
+/// written while Cargo is not run.
+#[tokio::test]
+async fn a_kept_run_past_its_stops_max_age_whose_stop_was_asked_settles_as_stopped() {
+    let store = Arc::new(InMemoryRuntimeStore::new());
+    let an_hour_ago = Utc::now() - chrono::Duration::hours(1);
+    let (session_id, run_id, input) = a_kept_run_of(
+        &store,
+        InputLifecycleState::AppliedPendingConsumption,
+        make_prompt("the run's prompt"),
+        Some(meerkat_runtime::input_state::StopRequeueMark {
+            stopped_at: an_hour_ago,
+            max_age_ms: 1_000,
+        }),
+    )
+    .await;
+    let runtime_id = LogicalRuntimeId::for_session(&session_id);
+    let machine = Arc::new(
+        MeerkatMachine::persistent(store.clone() as Arc<dyn RuntimeStore>, memory_blob_store())
+            .expect("persistent machine"),
+    );
+    machine
+        .register_session(session_id.clone())
+        .await
+        .expect("the session's runtime registers");
+    assert_eq!(
+        machine.resumable_run_id(&session_id).await,
+        Some(run_id.clone()),
+        "the registration keeps the run resumable"
+    );
+    machine
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("bind the runtime placement");
+    let stop = machine
+        .stop_run(&session_id, &run_id, "the caller stops the kept run")
+        .await
+        .expect("the stop of the run marked resumable is recorded");
+    assert!(
+        matches!(
+            &stop,
+            meerkat_runtime::RunStopReceipt::Stopped { contributors, .. } if contributors.is_empty()
+        ),
+        "a run marked resumable is stopped at once, with no contributors: {stop:?}"
+    );
+    let executor = PublishingRuns::new();
+    machine
+        .ensure_session_with_executor(session_id.clone(), Box::new(executor.clone()))
+        .await
+        .expect("attach the executor");
+    // The run's own terminal: an undirected input has no interaction
+    // terminal to publish.
+    executor.publications.wait_for(1).await;
+
+    assert_eq!(
+        stored_terminal(&store, &runtime_id, input.id()).await,
+        Some((
+            InputLifecycleState::Abandoned,
+            Some(InputTerminalOutcome::Abandoned {
+                reason: meerkat_runtime::input_state::InputAbandonReason::Cancelled,
+            }),
+        )),
+        "the start settles the stopped run as stopped, not as expired"
+    );
+    assert_eq!(
+        executor.publications.run_failures(&run_id),
+        vec![settled_run_report(
+            meerkat_core::lifecycle::SettledRunCause::Cancelled
+        )],
+        "the run ends once on the session's stream, as cancelled"
+    );
+    assert!(
+        executor.runs.applied().is_empty(),
+        "nothing of the stopped run runs: {:?}",
+        executor.runs.applied()
+    );
+}
+
 /// Answers every resume with `Superseded`.
 struct SupersededResume;
 

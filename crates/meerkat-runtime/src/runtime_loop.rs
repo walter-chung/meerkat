@@ -6028,7 +6028,7 @@ struct FeedWakeHoldState {
 /// The least time between two waits of a resume lap for a store fence that
 /// stays closed: the realm's own wait already lasts its bound, and a fence
 /// whose wait answers at once is polled no faster than this.
-const FENCE_GAP_REPOLL: std::time::Duration = std::time::Duration::from_secs(1);
+pub(crate) const FENCE_GAP_REPOLL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Wait out one lap of a store fence gap: the realm's own bounded wait for
 /// the writer's re-acquire, then, while the fence still reads closed and no
