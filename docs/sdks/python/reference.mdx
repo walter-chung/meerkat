@@ -214,10 +214,11 @@ Stops exactly `run_id` (read it from the `run_started` event's
 including durable steers that joined it. Returns `StopRunResult` /
 `MobStopMemberRunResult` whose `receipt["outcome"]` is `stopped` (with
 `contributors`), `not_current` (the run is no longer current; nothing was
-touched), or `not_stoppable`. A run a store fence gap suspended, or one whose
-session store's writer is stopped, is stopped without waiting: `stopped`
-with no `contributors`, and its inputs end cancelled once the store takes
-writes again.
+touched), or `not_stoppable`. A run a store fence gap suspended, one a restart
+left open that has not resumed yet, or one whose session store's writer is
+stopped, is stopped without waiting: `stopped` with no `contributors`, and
+its inputs end cancelled when the runtime settles it (once the store takes
+writes again, after a gap).
 
 ### `send_external_event`
 

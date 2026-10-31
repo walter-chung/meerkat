@@ -1975,11 +1975,12 @@ async fn a_closing_save_refused_in_a_short_gap_is_written_again_and_the_turn_com
     );
 }
 
-/// The documented residual of a closing save: when the gap outlasts the
-/// closing save's wait, its refusal stands. The turn's terminal was recorded
-/// before its closing save, so the run cannot be suspended there: the turn
-/// fails (the teardown class), its waiter is not told that its input stays
-/// queued, and the model is not asked again in this process.
+/// The documented residual of a closing save: a closing save still refused
+/// after its one wait keeps the teardown class. The turn's terminal was
+/// recorded before its closing save, so the run cannot be suspended there:
+/// the turn fails, its waiter is not told that its input stays queued, and
+/// the model is not asked again in this process. The wait and its one retry
+/// are the protection (the short-gap row above).
 #[tokio::test(start_paused = true)]
 async fn a_closing_save_whose_gap_outlasts_its_wait_still_fails_the_turn() {
     let run = run_with_stop(

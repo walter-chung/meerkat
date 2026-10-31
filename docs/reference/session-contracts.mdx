@@ -1322,12 +1322,20 @@ bound. 0.9.3 and earlier re-read such an input every 25 ms.
   stopped without waiting: the stop is recorded at once (the latter run is
   suspended, not interrupted), and the call returns
   `RunStopReceipt::Stopped { run_id, contributors }` with no contributors.
-  The run never resumes, and its inputs end `Abandoned { reason: Cancelled }`
-  once the session's store takes writes again: read their outcome later. A
-  process that ends first, or another writer that takes the session over,
-  runs them instead. A stop that races the gap's own suspension of the run
+  The run never resumes. Its inputs end `Abandoned { reason: Cancelled }`
+  when the runtime settles it (at its loop's next lap for a restart's run,
+  once the session's store takes writes again for a gap's): read their
+  outcome later. A process that ends first, or another writer that takes
+  the session over, runs them instead. A graceful requeue stop, or a Keep
+  rollback, that begins before that settlement ends them
+  `Abandoned { reason: Stopped }` and leaves the run to the next start,
+  which repairs its tail as an interrupted run (no run terminal is
+  published for it). A stop that races the gap's own suspension of the run
   can fail with an internal error naming an input whose wait was answered
-  `RequeuedAcrossStop`.
+  `RequeuedAcrossStop`. Where the run cannot be suspended (an executor that
+  cannot suspend, a stop that joins a hard interrupt already in flight, or
+  a published live-boundary join not yet retained), the stop is a hard
+  interrupt, which the gap undoes with a reload that resumes the run.
 
 The stop intent lives in machine state and is not recovered after a crash. A
 process that dies mid-stop recovers the run's staged inputs like any other

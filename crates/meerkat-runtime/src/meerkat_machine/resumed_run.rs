@@ -421,8 +421,9 @@ impl super::driver::DriverEntry {
 
     /// Whether a stop was asked of the run marked resumable (the machine's
     /// stop intent names it): a cancel the run accepted before a store fence
-    /// gap suspended it, or a stop or an interrupt of it while suspended.
-    /// Such a run never resumes; the runtime settles it.
+    /// gap suspended it, a stop or an interrupt of it at the fence, or one of
+    /// it while it was marked resumable (suspended by the gap, or left open
+    /// by a restart). Such a run never resumes; the runtime settles it.
     pub(crate) fn resumable_run_stop_requested(&self) -> bool {
         let authority = self.shared_dsl_authority();
         let authority = authority

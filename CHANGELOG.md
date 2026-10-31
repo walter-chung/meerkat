@@ -50,7 +50,7 @@ them.
   exhaustively. `ResumeRun` (and the resumed-run plan) now refuses a run
   whose stop was asked, `SettleResumableRun` refuses to settle such a run
   as `ResumeRefused`, and `ClassifyStopInputDisposition` keeps none of its
-  inputs (they are answered `Abandon`).
+  inputs, under `Requeue` or under `Keep` (they are answered `Abandon`).
 
 - Behaviour-only (not measured by the gate): a host store meets obligation
   5 (fencing) at commit: it refuses a batch whose token is below one
@@ -429,26 +429,32 @@ them.
     This holds on every runtime apply path: the facade's default executor,
     mob members, the CLI, REST, the MCP server and JSON-RPC. A direct turn,
     which no runtime run backs, fails with a retryable `StoreError` instead
-    of the teardown class. A closing save is written after the run's final
-    answer and terminal, so it cannot suspend the run: a gap that outlasts
-    its wait still fails the turn, with the teardown class (see Known
-    limitations);
-  - a cancel the run accepted before the gap, an interrupt or a stop that
-    reaches the run while its writer is stopped (which now suspends the run
-    instead of a hard interrupt, which the gap would have undone with a
-    reload), and an interrupt or a stop of a run marked resumable (a gap's,
-    or a restart's not resumed yet), end the run: it never resumes. Its
-    waiters are answered `RequeuedAcrossStop` within the wait, like any
-    suspended run's, and once the fence is back it is settled, its inputs
-    abandoned as `Cancelled`. For such a run `stop_run`, `turn/stop_run`
-    and `mob/stop_member_run` return at once, `stopped` with no
-    contributors (read the inputs' outcome later), and the runtime's
-    `hard_cancel_current_run` (a surface's interrupt) succeeds although no
-    turn runs. A graceful requeue stop that begins later keeps none of a
-    stopped run's inputs. The facade's default executor and the CLI's can
-    now suspend a run, so a graceful requeue stop suspends their in-flight
-    durable run too, as JSON-RPC, REST, the MCP server and mob members
-    already did;
+    of the teardown class, after up to two waits (its dispatch's, then its
+    closing write's: about 70 s at the defaults). A closing save is written
+    after the run's final answer and terminal, so it cannot suspend the
+    run: a closing save still refused after its one wait keeps the teardown
+    class, and the turn fails (see Known limitations);
+  - a cancel the run accepted before the gap, and an interrupt or a stop
+    that reaches the run while its writer is stopped (which now suspends
+    the run instead of a hard interrupt, which the gap would have undone
+    with a reload), end the run: it never resumes. Its waiters are answered
+    `RequeuedAcrossStop` within the wait, like any suspended run's, and
+    once the fence is back it is settled, its inputs abandoned as
+    `Cancelled`. An interrupt or a stop of a run marked resumable ends it
+    the same way: a gap's suspended run (its waiters were answered at the
+    suspension) is settled once the fence is back, and a restart's run that
+    has not resumed yet at its loop's next lap (the stop wakes the loop).
+    For such a run `stop_run`, `turn/stop_run` and `mob/stop_member_run`
+    return at once, `stopped` with no contributors (read the inputs'
+    outcome later), and the runtime's `hard_cancel_current_run` (a
+    surface's interrupt) succeeds although no turn runs. A graceful requeue
+    stop, or the Keep rollback of a refused start, that begins before that
+    settlement keeps none of a stopped run's inputs: it ends them
+    `Abandoned` with reason `Stopped`, and the next start repairs the run's
+    tail as an interrupted run, with no run terminal. The facade's default
+    executor and the CLI's can now suspend a run, so a graceful requeue
+    stop suspends their in-flight durable run too, as JSON-RPC, REST, the
+    MCP server and mob members already did;
   - only another writer (a live holder, a batch this writer did not write,
     or a renew or commit answered `FencedOut`, each of which poisons the
     realm) still ends the session, with the teardown class, wherever this
@@ -464,8 +470,9 @@ them.
   before every dispatch. Every write and dispatch that waits for a stopped
   writer's re-acquire waits on the realm's one attempt in flight, so waits
   that give up during an outage no longer leave a re-acquire each behind.
-  The realm logs a warning naming why a dispatch does not proceed. The warning logged for a runtime turn says when its run was
-  suspended, and no longer promises the live session to the next queued
+  The realm logs a warning naming why a dispatch does not proceed. The
+  warning logged for a runtime turn says when its run was suspended, and
+  no longer promises the live session to the next queued
   input when the failure requires a reload. The texts of
   `CompletionWaitError::RequeuedAcrossStop`, `MobError::MemberInputRequeuedAcrossStop`
   and `BoundedTurnFailure::RequeuedAcrossStop` name the store fence gap too,
@@ -632,10 +639,19 @@ them.
   suspension of the run can fail with an internal error naming a
   contributor whose wait was answered `RequeuedAcrossStop`. A gap met while
   a run re-bases its session is not suspended: the re-base's outcome is
-  unknown, and the session reloads as before. A gap that outlasts the wait
-  at a run's closing save, after its final answer, still fails the turn
-  with the teardown class: the turn's terminal is recorded before that
-  save, so the run cannot be suspended there.
+  unknown, and the session reloads as before. A closing save still
+  refused after its one wait (a gap that outlasts the wait after a run's
+  final answer) keeps the teardown class, and the turn fails: the turn's
+  terminal is recorded before that save, so the run cannot be suspended
+  there; the wait and its one retry are the protection. At a gap a stop or
+  an interrupt falls back to the hard interrupt, which the gap undoes with
+  a reload that resumes the stopped run, in three cases: an executor that
+  cannot suspend a run (`CoreExecutorInterruptHandle::suspend_run_if_current`
+  answers `false`: every shipped persistent surface suspends, a host's own
+  executor may not), a stop that joins a hard interrupt of the same run
+  already in flight, and a run the machine refuses to suspend (a published
+  live-boundary join not yet retained). A run stop has then already
+  answered `stopped`.
 
 - `meerkat-core`: a tool call that waits at the fence of a stopped host
   store writer waits within its own deadline, as it waits for its

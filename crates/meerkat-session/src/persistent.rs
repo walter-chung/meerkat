@@ -3101,9 +3101,12 @@ impl meerkat_core::SessionCheckpointer for StoreCheckpointer {
     /// suspends the run there, as at a dispatch: nothing of the round was
     /// written, so the run resumes from its last round commit and does the
     /// round again, as after a crash. A closing save comes after the run's
-    /// terminal (its cursor is gone by then), so its refusal stands, as does
-    /// a round commit's of a run the runtime did not dispatch here, and a
-    /// refusal of the teardown class.
+    /// terminal (its cursor is gone by then), so a closing save still refused
+    /// after its one wait returns its refusal, and the runtime ends the turn
+    /// with the teardown class (its terminal is already recorded). A round
+    /// commit of a run the runtime did not dispatch here also returns its
+    /// refusal after the wait, and a refusal of the teardown class is
+    /// returned at once.
     async fn checkpoint_run(
         &self,
         session: &mut Session,

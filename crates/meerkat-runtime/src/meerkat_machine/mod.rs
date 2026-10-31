@@ -4459,16 +4459,28 @@ impl PendingRuntimeExecutorAttachment {
             if let Some(run_id) = driver.resumable_run_id()
                 && driver.resumed_run_first_input_lacks_controller(&run_id)
             {
+                // A stop asked of the run since its registration (the
+                // resumable branch of a stop needs no executor) ends it as
+                // stopped: the machine refuses to settle a stopped run as a
+                // refused resume.
+                let stopped = driver.resumable_run_stop_requested();
+                let (reason, termination_reason) = if stopped {
+                    (
+                        crate::input_state::InputAbandonReason::Cancelled,
+                        crate::runtime_loop::STOPPED_RESUMABLE_RUN_TERMINATION_REASON,
+                    )
+                } else {
+                    (
+                        crate::input_state::InputAbandonReason::ResumeRefused,
+                        KEPT_GOVERNED_INPUT_TERMINATION_REASON,
+                    )
+                };
                 let crate::meerkat_machine::driver::SettledResumableRun {
                     abandoned,
                     batches,
                     terminal,
                 } = driver
-                    .settle_resumable_run_with_terminals(
-                        &run_id,
-                        crate::input_state::InputAbandonReason::ResumeRefused,
-                        KEPT_GOVERNED_INPUT_TERMINATION_REASON,
-                    )
+                    .settle_resumable_run_with_terminals(&run_id, reason, termination_reason)
                     .await?;
                 settled_batches = batches;
                 settled_terminal = terminal;
@@ -4476,7 +4488,8 @@ impl PendingRuntimeExecutorAttachment {
                     session_id = %self.witness.session_id(),
                     %run_id,
                     inputs = abandoned.len(),
-                    "a kept run's first input is kept governed work whose controller cannot be supplied again; settled as a refused resume instead of resumed"
+                    stopped,
+                    "a kept run's first input is kept governed work whose controller cannot be supplied again; settled (as stopped when its stop was asked) instead of resumed"
                 );
                 if !abandoned.is_empty() {
                     // Committed: told once this attachment releases its

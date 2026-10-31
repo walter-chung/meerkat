@@ -1708,6 +1708,13 @@ pub trait CoreExecutorInterruptHandle: Send + Sync {
     /// suspend; the stop then hard-cancels the run. The default suspends
     /// nothing. The same exact-run comparison as
     /// [`Self::hard_cancel_run_if_current`] applies.
+    ///
+    /// A stop or an interrupt that reaches a run while the writer of its
+    /// session's fenced store is stopped (a store fence gap) needs this too:
+    /// the runtime records the stop and asks for a suspension. Without it the
+    /// stop falls back to the hard cancel, which ends the run only in memory:
+    /// the gap refuses the cancel's writes, the session reloads, and the
+    /// reload resumes the stopped run.
     async fn suspend_run_if_current(
         &self,
         expected_run_id: &RunId,

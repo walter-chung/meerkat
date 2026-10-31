@@ -730,10 +730,11 @@ durable steers that joined it. Learn the run id from the `run_started` event
 
 `receipt.outcome` is `stopped`, `not_current` (the run is no longer current;
 nothing was touched), or `not_stoppable` (a runtime stop or teardown owns the
-still-bound run). A run a store fence gap suspended, or one whose session
-store's writer is stopped, is stopped without waiting: `stopped` with no
-contributors, and its inputs end `cancelled` once the store takes writes
-again (read their outcome later). A malformed `run_id` is `400`.
+still-bound run). A run a store fence gap suspended, one a restart left open
+that has not resumed yet, or one whose session store's writer is stopped, is
+stopped without waiting: `stopped` with no contributors, and its inputs end
+`cancelled` when the runtime settles it (once the store takes writes again,
+after a gap; read their outcome later). A malformed `run_id` is `400`.
 
 `POST /mob/{id}/members/{agent_identity}/runs/{run_id}/stop` stops one exact
 run of a mob member and returns `MobStopMemberRunResult`

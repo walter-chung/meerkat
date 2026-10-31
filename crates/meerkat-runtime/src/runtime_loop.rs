@@ -27,6 +27,10 @@ use crate::tokio;
 #[path = "runtime_loop/terminal_completion_tests.rs"]
 mod terminal_completion_tests;
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "runtime_loop/fence_gap_wait_tests.rs"]
+mod fence_gap_wait_tests;
+
 /// Extract a prompt string from an `Input`.
 #[cfg(test)]
 pub(crate) fn input_to_prompt(input: &Input) -> String {
@@ -6026,6 +6030,22 @@ struct FeedWakeHoldState {
 /// whose wait answers at once is polled no faster than this.
 const FENCE_GAP_REPOLL: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Wait out one lap of a store fence gap: the realm's own bounded wait for
+/// the writer's re-acquire, then, while the fence still reads closed and no
+/// other writer is proven, [`FENCE_GAP_REPOLL`], so a fence whose wait
+/// answers at once never spins the loop. Returns at once while the fence
+/// reads open, or lost (the lost fence's teardown is the lap's). The caller
+/// holds no guard while it waits.
+async fn wait_out_store_fence_gap(fence: &dyn meerkat_core::host_store::SelfFence) {
+    if fence.lost() || fence.window().is_open() {
+        return;
+    }
+    let window = fence.dispatch_window().await;
+    if !window.is_open() && !fence.lost() {
+        tokio::time::sleep(FENCE_GAP_REPOLL).await;
+    }
+}
+
 /// Tell the local waiters of the session's inputs that the store keeps (every
 /// unfinished input but an ephemeral one) that their inputs stay queued
 /// (`RequeuedAcrossStop`): another writer holds the session store's fence, so
@@ -7578,12 +7598,18 @@ async fn settle_refused_resumed_run(
     .await
 }
 
+/// The fixed, host-neutral reason the cross-runtime terminal of a run marked
+/// resumable that is settled because its stop was asked carries.
+pub(crate) const STOPPED_RESUMABLE_RUN_TERMINATION_REASON: &str = "the suspended run was stopped";
+
 /// Why a run marked resumable is settled without resuming.
 enum UnresumedRun {
     /// Its resume was refused; `detail` says why.
     Refused { detail: String },
     /// Its stop was asked: a cancel it accepted before a store fence gap
-    /// suspended it, or a stop or an interrupt of it while it was suspended.
+    /// suspended it, a stop or an interrupt of it at the fence, or one of it
+    /// while it was marked resumable (suspended by the gap, or left open by
+    /// a restart).
     Stopped,
 }
 
@@ -7600,7 +7626,7 @@ impl UnresumedRun {
     fn termination_reason(&self) -> &'static str {
         match self {
             Self::Refused { .. } => "the resumed run was refused",
-            Self::Stopped => "the suspended run was stopped",
+            Self::Stopped => STOPPED_RESUMABLE_RUN_TERMINATION_REASON,
         }
     }
 
@@ -7627,8 +7653,11 @@ async fn settle_unresumed_run(
     why: UnresumedRun,
 ) -> ResumedRunAdmissionLap {
     // The settlement writes, so it needs the session store's fence: when
-    // the fence closed again since the lap read it open, the lap waits for
-    // it again and then settles, instead of meeting the gap here.
+    // the fence reads closed (it closed again since the lap read it open, or
+    // a controller re-ask settles a refused run during a gap), nothing is
+    // changed and the caller waits for the fence before it goes round again
+    // (`wait_out_store_fence_gap`, with no guard held), so the settlement
+    // never meets the gap and the loop never spins through it.
     if authority_binding.store_fence_gap() {
         return ResumedRunAdmissionLap::Again;
     }
@@ -7682,8 +7711,14 @@ async fn settle_unresumed_run(
         Ok(settled) => (settled.abandoned, settled.terminal),
         Err(error) => {
             drop(queue_authority_guard);
-            // A settlement that met a new store fence gap is settled again
-            // once the fence is back: the lap waits for it, as for any gap.
+            // A settlement whose write met a new store fence gap goes round
+            // again, and the lap waits for the fence. That settles it again
+            // only where the failed write left the driver usable: a
+            // persistent driver with durability health has marked the
+            // registration for a reload, so the next lap's authority lock
+            // refuses and the loop ends, and the reload loses the run's
+            // in-memory stop intent (the accepted residual of a fence that
+            // closes during this write).
             if authority_binding.store_fence_gap() {
                 tracing::warn!(
                     %run_id,
@@ -8188,6 +8223,19 @@ async fn process_queue(
                 .await
                 {
                     ResumedRunAdmissionLap::Again | ResumedRunAdmissionLap::Resume(_) => {
+                        // A settlement that met a store fence gap answered
+                        // `Again` with nothing changed, and this branch asks
+                        // the refused row again at the next lap: wait for the
+                        // fence first, with no guard held, as the resumable
+                        // block below does, so the re-ask does not spin
+                        // through the gap.
+                        if let Some(fence) = authority_binding.store_self_fence()
+                            && !fence.lost()
+                            && !fence.window().is_open()
+                        {
+                            drop(turn_finalization_guard);
+                            wait_out_store_fence_gap(fence.as_ref()).await;
+                        }
                         continue;
                     }
                     ResumedRunAdmissionLap::Exit(wake) => return wake,
@@ -8250,12 +8298,7 @@ async fn process_queue(
             }
             if !fence.window().is_open() {
                 drop(turn_finalization_guard);
-                let window = fence.dispatch_window().await;
-                if !window.is_open() && !fence.lost() {
-                    // A fence whose wait answers at once must not spin the
-                    // loop.
-                    tokio::time::sleep(FENCE_GAP_REPOLL).await;
-                }
+                wait_out_store_fence_gap(fence.as_ref()).await;
                 continue 'lap;
             }
         }
