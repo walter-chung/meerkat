@@ -2009,13 +2009,20 @@ mod tests {
         const REVISES: i64 = 4;
         let store = Arc::new(MemoryScheduleStore::new()) as Arc<dyn ScheduleStore>;
         let service = ScheduleService::new(store.clone());
-        // Due a second ago: claimable now, inside the Skip policy's grace.
-        let due_at_utc = Utc::now() - Duration::seconds(1);
+        // Due a second before the round's own clock reading: claimable at
+        // once, inside the Skip policy's grace. Adding the round's
+        // millisecond keeps each round's due time apart from the previous
+        // one whatever the clock resolution, so every update below is a
+        // revision-affecting change.
+        let due_this_round =
+            |round: i64| Utc::now() - Duration::seconds(1) + Duration::milliseconds(round);
         let mut schedule = service
             .create(CreateScheduleRequest {
                 name: Some("ack-retention".into()),
                 description: None,
-                trigger: TriggerSpec::Once { due_at_utc },
+                trigger: TriggerSpec::Once {
+                    due_at_utc: due_this_round(0),
+                },
                 target: materialize_on_demand_target("initial prompt"),
                 misfire_policy: MisfirePolicy::Skip,
                 overlap_policy: OverlapPolicy::SkipIfRunning,
@@ -2046,7 +2053,7 @@ mod tests {
                         // A new due time each round: a revision-affecting
                         // change that plans the next claimable occurrence.
                         trigger: Some(TriggerSpec::Once {
-                            due_at_utc: due_at_utc + Duration::milliseconds(round),
+                            due_at_utc: due_this_round(round),
                         }),
                         ..UpdateScheduleRequest::default()
                     },
