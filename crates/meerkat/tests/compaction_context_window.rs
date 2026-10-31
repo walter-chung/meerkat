@@ -573,15 +573,17 @@ mod tests {
     }
 
     /// The run after the refusal, `continue`, and one more: the run compacts
-    /// the whole transcript before its first request, the round holding the
-    /// oversize listing folds into the summary, and the run completes. Its
-    /// summary request carries the listing too and is refused, so the summary
-    /// is the mechanical one. The next run compacts no more.
+    /// the whole transcript before its first request, the oversize content
+    /// (`still_carries` finds it) folds into the summary, and the run
+    /// completes. Its summary request carries that content too and is
+    /// refused, so the summary is the mechanical one. The next run compacts
+    /// no more.
     async fn assert_the_next_run_heals(
         service: &Arc<PersistentSessionService<FactoryAgentBuilder>>,
         adapter: &Arc<MeerkatMachine>,
         model: &Arc<WindowedModel>,
         session_id: &meerkat::SessionId,
+        still_carries: fn(&Session) -> bool,
     ) {
         let before = model.seen().len();
         let third = run_prompt(adapter, session_id, "continue").await;
@@ -597,13 +599,13 @@ mod tests {
         assert!(
             seen.last()
                 .is_some_and(|seen| !seen.summary && !seen.refused && seen.listing.is_none()),
-            "the run's request fits once the listing is folded: {seen:?}"
+            "the run's request fits once the oversize content is folded: {seen:?}"
         );
         let session = committed(service, session_id).await;
         assert!(has_compaction_summary(&session), "the compaction committed");
         assert!(
-            !carries_listing(&session),
-            "the oversize round folded into the summary"
+            !still_carries(&session),
+            "the oversize content folded into the summary"
         );
         assert!(
             user_texts(&session).iter().any(|text| text == "continue"),
@@ -632,7 +634,7 @@ mod tests {
         let (service, adapter) = build_service(temp.path(), &model);
         let session_id = refuse_an_oversize_round(&service, &adapter, &model, &tool).await;
 
-        assert_the_next_run_heals(&service, &adapter, &model, &session_id).await;
+        assert_the_next_run_heals(&service, &adapter, &model, &session_id, carries_listing).await;
     }
 
     /// The wedge across a restart: the refusal fact rides the session's
@@ -653,7 +655,118 @@ mod tests {
         let (service, adapter) = build_service(temp.path(), &model);
         let resume_source = committed(&service, &session_id).await;
         materialize(&service, &adapter, resume_source, &tool).await;
-        assert_the_next_run_heals(&service, &adapter, &model, &session_id).await;
+        assert_the_next_run_heals(&service, &adapter, &model, &session_id, carries_listing).await;
+    }
+
+    /// The oversize prompt a run's first request is refused for: `bytes`
+    /// of one repeated character, so its request bytes are its length.
+    fn refused_prompt(bytes: usize) -> String {
+        "c".repeat(bytes)
+    }
+
+    /// Whether `session` still holds the oversize prompt verbatim.
+    fn carries_refused_prompt(session: &Session) -> bool {
+        user_texts(session)
+            .iter()
+            .any(|text| text.starts_with("cccc"))
+    }
+
+    /// Runs a session into a context refusal of a run's FIRST request, the
+    /// shape a session wedged by an earlier release presents: after a short
+    /// first run, a prompt alone takes the next request past the window
+    /// (two bytes a token) while the projection, the history estimate and
+    /// the forecast read it at four bytes a token and stay under the
+    /// threshold, so nothing compacts. The run's only request is refused and
+    /// the run fails before any round commits; its hard-failure boundary
+    /// commits the session with the refusal fact. Returns the session id.
+    async fn refuse_a_first_request(
+        service: &Arc<PersistentSessionService<FactoryAgentBuilder>>,
+        adapter: &Arc<MeerkatMachine>,
+        model: &Arc<WindowedModel>,
+        tool: &Arc<ListingTool>,
+    ) -> meerkat::SessionId {
+        let session = Session::new();
+        let session_id = session.id().clone();
+        materialize(service, adapter, session, tool).await;
+        let first = run_prompt(adapter, &session_id, "hi").await;
+        assert!(completed(&first), "the first run completes: {first:?}");
+        let anchor = model.last_answered();
+        let prompt_bytes = 2 * (WINDOW - anchor) + 40_000;
+        assert!(
+            anchor + prompt_bytes / 4 + 2_000 < THRESHOLD,
+            "test setup: no measure crosses the threshold: anchor {anchor} + prompt {}",
+            prompt_bytes / 4
+        );
+
+        let before = model.seen().len();
+        let prompt = refused_prompt(usize::try_from(prompt_bytes).expect("prompt size"));
+        let second = run_prompt(adapter, &session_id, &prompt).await;
+        let seen = model.seen_since(before);
+        assert!(
+            !completed(&second),
+            "test setup: the oversize run fails: {second:?}; requests: {seen:?}"
+        );
+        assert!(
+            matches!(seen.as_slice(), [only] if only.refused && !only.summary),
+            "test setup: the run's first and only request is refused: {seen:?}"
+        );
+        assert_eq!(tool.calls(), 0, "test setup: the run took no tool round");
+        session_id
+    }
+
+    /// A refused first request, in the host that saw it: the next run
+    /// compacts the whole transcript first, folds the oversize prompt the
+    /// refused run left in it and completes.
+    #[tokio::test]
+    async fn the_run_after_a_refused_first_request_compacts_first() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let model = WindowedModel::new(WINDOW);
+        let tool = ListingTool::new();
+        let (service, adapter) = build_service(temp.path(), &model);
+        let session_id = refuse_a_first_request(&service, &adapter, &model, &tool).await;
+
+        assert_the_next_run_heals(
+            &service,
+            &adapter,
+            &model,
+            &session_id,
+            carries_refused_prompt,
+        )
+        .await;
+    }
+
+    /// A refused first request, then a NEW agent built from the same store
+    /// (a restart, a session not kept alive, a command-line resume): the
+    /// refused run wrote no round commit, and its failed boundary still
+    /// carries the refusal fact, so the new agent compacts the whole
+    /// transcript at its next run's first boundary and is not refused again.
+    #[tokio::test]
+    async fn a_new_agent_built_from_the_store_compacts_first_after_a_refused_first_request() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let model = WindowedModel::new(WINDOW);
+        let tool = ListingTool::new();
+        let session_id = {
+            let (service, adapter) = build_service(temp.path(), &model);
+            let session_id = refuse_a_first_request(&service, &adapter, &model, &tool).await;
+            stand_down(&service, &adapter).await;
+            session_id
+        };
+
+        let (service, adapter) = build_service(temp.path(), &model);
+        let resume_source = committed(&service, &session_id).await;
+        assert!(
+            carries_refused_prompt(&resume_source),
+            "test setup: the refused run's failed boundary committed its prompt"
+        );
+        materialize(&service, &adapter, resume_source, &tool).await;
+        assert_the_next_run_heals(
+            &service,
+            &adapter,
+            &model,
+            &session_id,
+            carries_refused_prompt,
+        )
+        .await;
     }
 
     /// A restored agent projects its first request from the anchor its
