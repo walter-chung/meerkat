@@ -40492,10 +40492,36 @@ mod tests {
         req
     }
 
+    /// `tail` carrying `run_id`'s cursor: the session a restart seeds a
+    /// resumed run's actor from (`seed_actor_from_continued_run` hands the
+    /// run's provisional tail, cursor included, to the actor's build), so a
+    /// resumed dispatch finds its run's cursor on the live session.
+    fn with_resumed_run_cursor(mut tail: Session, run_id: &RunId) -> Session {
+        tail.set_run_cursor(&meerkat_core::SessionRunCursor::new(
+            run_id.clone(),
+            Vec::new(),
+            0,
+            meerkat_core::RunResumePoint::AwaitingModel,
+        ))
+        .expect("the tail carries the run's cursor");
+        tail
+    }
+
+    /// The create request of an actor a restart seeded for resumed `run_id`:
+    /// a tail holding the run's prompt, with the run's cursor.
+    fn resumed_run_actor_request(run_id: &RunId) -> CreateSessionRequest {
+        let mut tail = Session::new();
+        tail.push(Message::User(UserMessage::text(
+            "the run's prompt".to_string(),
+        )));
+        resume_request(with_resumed_run_cursor(tail, run_id))
+    }
+
     /// A resumed dispatch reaches only an actor seeded from the run's
     /// provisional tail: an actor whose checkpointer holds no receipt for the
     /// run is refused before the session task runs anything, as an ordinary
-    /// run failure that replays the run's inputs.
+    /// run failure that replays the run's inputs. The actor carries the run's
+    /// cursor, as a restart seeds it, so the refusal is the missing receipt's.
     #[tokio::test]
     async fn test_apply_runtime_turn_resume_run_without_a_seeded_receipt_is_refused() {
         let service = PersistentSessionService::new(
@@ -40505,8 +40531,9 @@ mod tests {
             Arc::new(InMemoryRuntimeStore::new()),
             memory_blob_store(),
         );
+        let run_id = RunId::new();
         let created = service
-            .create_session(create_request("seed", InitialTurnPolicy::Defer))
+            .create_session(resumed_run_actor_request(&run_id))
             .await
             .expect("create_session should succeed");
         let probe = probe_resume(&created.session_id);
@@ -40514,7 +40541,7 @@ mod tests {
         let error = service
             .apply_runtime_turn(
                 &created.session_id,
-                RunId::new(),
+                run_id,
                 resume_run_request(),
                 RunApplyBoundary::RunStart,
                 vec![meerkat_core::lifecycle::InputId::new()],
@@ -40547,7 +40574,8 @@ mod tests {
 
     /// A resumed dispatch hands the agent the receipt its actor was seeded
     /// with, under the resumed run's id, and names the run's inputs, as every
-    /// runtime dispatch does.
+    /// runtime dispatch does. The actor carries the run's cursor, as a
+    /// restart seeds it.
     #[tokio::test]
     async fn test_apply_runtime_turn_resume_run_passes_the_seeded_receipt_and_run_inputs() {
         let service = PersistentSessionService::new(
@@ -40557,12 +40585,12 @@ mod tests {
             Arc::new(InMemoryRuntimeStore::new()),
             memory_blob_store(),
         );
+        let run_id = RunId::new();
         let created = service
-            .create_session(create_request("seed", InitialTurnPolicy::Defer))
+            .create_session(resumed_run_actor_request(&run_id))
             .await
             .expect("create_session should succeed");
         let probe = probe_resume(&created.session_id);
-        let run_id = RunId::new();
         // The receipt names exactly the live image, as the Continue seeding's
         // receipt names the tail the actor was seeded from.
         let live = service
@@ -40631,12 +40659,12 @@ mod tests {
             Arc::new(InMemoryRuntimeStore::new()),
             memory_blob_store(),
         );
+        let run_id = RunId::new();
         let created = service
-            .create_session(create_request("seed", InitialTurnPolicy::Defer))
+            .create_session(resumed_run_actor_request(&run_id))
             .await
             .expect("create_session should succeed");
         let probe = probe_resume(&created.session_id);
-        let run_id = RunId::new();
         let live = service
             .inner
             .export_session(&created.session_id)
@@ -40705,17 +40733,17 @@ mod tests {
             Arc::new(InMemoryRuntimeStore::new()),
             memory_blob_store(),
         );
+        let run_id = RunId::new();
         let mut seeded = Session::new();
         seeded.push(Message::User(UserMessage::text(
             "the run's prompt".to_string(),
         )));
         seeded.append_system_message("appended when the actor was built".to_string());
         let created = service
-            .create_session(resume_request(seeded))
+            .create_session(resume_request(with_resumed_run_cursor(seeded, &run_id)))
             .await
             .expect("create_session should succeed");
         let probe = probe_resume(&created.session_id);
-        let run_id = RunId::new();
         let live = service
             .inner
             .export_session(&created.session_id)
