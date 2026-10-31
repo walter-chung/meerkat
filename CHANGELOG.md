@@ -195,6 +195,68 @@ them.
   `NotCurrent` for it). This supersedes the 0.9.4 note that the discard
   waits for an attached loop's handoff.
 
+- Behaviour-only (not measured by the gate): `meerkat-schedule`: the
+  replies of the schedule tools, for agents and for every generic call path
+  that runs them through `handle_schedule_tools_call` (RPC `schedule/call`,
+  REST `POST /schedule/call`, the MCP server's `meerkat_schedule_*` tools,
+  the Python SDK's `call_schedule_tool` and the TypeScript SDK's
+  `callScheduleTool`):
+  - `meerkat_schedule_list` returns one page of summaries,
+    `{"schedules": [...], "page": {"returned", "has_more", "next_cursor"}}`,
+    in creation order (creation time, then schedule id): 50 schedules unless
+    `limit` asks for another size, at most 200 (a larger `limit` returns 200
+    with `page.has_more`), and `cursor` takes `page.next_cursor` to
+    continue. A summary carries `schedule_id`, `name`
+    (its first 200 characters), `phase`, `revision`, `trigger` (only its
+    `type` and `timezone`, with `trigger_chars`, when its serialized form is
+    over 1,024 bytes), the target's kind and ids (`target`, each id cut to
+    its first 200 characters), `action_head` (the first 160 characters of the
+    action text: a prompt, the content a member is sent, a helper's prompt
+    or an event's type) with `action_chars` (that text's full length),
+    `created_at_utc` and `updated_at_utc`. It returned every live schedule,
+    unpaged, in the persistence shape, whose machine state repeated the
+    trigger, the whole target and every revision's superseded acks, so a
+    realm of a few dozen long-prompt schedules filled much of a context
+    window in one reply. A `limit` of 0, a negative or non-integer `limit`,
+    or a cursor this listing did not write is refused as invalid arguments.
+  - Every tool that returns one schedule (`meerkat_schedule_get`,
+    `meerkat_schedule_create`, `meerkat_schedule_update`,
+    `meerkat_schedule_pause`, `meerkat_schedule_resume` and
+    `meerkat_schedule_delete`) returns it in the public shape of
+    `schedule/get` (`meerkat_contracts::wire::Schedule`): the same fields,
+    without `machine_state`.
+  - `meerkat_schedule_occurrences` pages every list reply: 50 occurrences
+    unless `limit` asks for another size, at most 200, and a larger `limit`
+    returns 200 (it took up to 500 before, and with only `schedule_id` it
+    returned every occurrence unpaged). A page's rows are summaries by
+    default (`view: "summary"`; whole occurrences were the default before):
+    ids, phase, due time, attempts, the last receipt summarized, the
+    target's kind and ids (each cut to 200 characters), the runtime
+    outcome's `kind` with a
+    `detail_head`, and a `failure_detail_head`, each head the first 160
+    characters of its text (the summary view carried the whole outcome,
+    callback payload included, and the whole `failure_detail` before). Whole
+    occurrences (`view: "full"`, and by default an `occurrence_id` read) are
+    the public shape of `schedule/occurrences`, without `machine_state` and
+    `claim_token`. Malformed options are refused as the listing's are.
+
+  The host listings do not move: RPC `schedule/list` and `schedule/get`,
+  REST `GET /schedules`, the Python SDK's `list_schedules` and the
+  TypeScript SDK's `listSchedules` return every schedule whole, as before.
+
+- `meerkat-core`: `CompactionContext` gains `projected_input_tokens:
+  Option<InputTokenProjection>` and `last_context_refusal_boundary_index:
+  Option<u64>`, and `SessionCompactionCadence` gains
+  `last_context_refusal_boundary_index: Option<u64>` and
+  `last_answered_request: Option<AnsweredRequestInput>` (see Fixed). Both
+  structs are exhaustive: a struct literal names the new fields (`None`
+  measures as before) or, for `SessionCompactionCadence`, ends with
+  `..Default::default()`; `CompactionContext` has no `Default`.
+  `meerkat_core::agent::compact::build_compaction_context` takes the last
+  answered request (`Option<AnsweredRequestAnchor<'_>>`) as its new third
+  parameter; `None` measures as before. A custom `Compactor` may read the
+  two new context fields or ignore them; no existing field changes meaning.
+
 ### Added
 
 - `meerkat-runtime`: `PromptInput::detached_job_completed_with_handling`
@@ -266,7 +328,64 @@ them.
   the same way on the dispatch and entered paths, and answers `Unavailable`
   only past the bounds; its prepared path does not wait.
 
+- `meerkat-core`: `InputTokenProjection` (the projection of a request's input
+  tokens: `anchor_tokens`, `appended_tokens` and `projected_tokens()`),
+  `AnsweredRequestInput` (the anchor a session's compaction cadence persists:
+  the last answered request's presented tokens, the transcript rows it was
+  composed from, and the provider and model that counted them, with
+  `counted_by`) and `agent::compact::AnsweredRequestAnchor` (that anchor's
+  presented tokens and the rows appended since, as `build_compaction_context`
+  measures them).
+
+- `meerkat-core`: `Agent::reload_compaction_cadence` adopts the compaction
+  cadence the agent's session carries; a host that swaps in a durable
+  snapshot of the session calls it after the swap.
+
 ### Fixed
+
+- `meerkat-core` and `meerkat-session`: one tool result no longer carries a
+  session's next request past the model's context window unnoticed. The
+  compaction check runs before every request, but the provider's count it
+  read (`last_input_tokens`) lagged by exactly the rows the boundary
+  appended, and the history estimate and request forecast count text bytes
+  (four a token), which under-read JSON-dense content. A session just under
+  its threshold that received a large tool result (a schedule listing, for
+  one) sent a request past the window, and the provider refused it.
+  `build_compaction_context` now projects each request's input tokens: the
+  provider's count for the last answered request plus the estimate of only
+  the rows appended since (`CompactionContext::projected_input_tokens`).
+  `DefaultCompactor` compacts when the projection reaches the threshold; the
+  cadence cannot veto a crossing the growth since the answered request made
+  (while the last rewrite left the history under the threshold, as for a
+  history crossing), and a projection whose answered request alone was over
+  the threshold waits for the cadence as the provider's count does. The
+  anchor is set by every answered request, dropped by a committed rewrite
+  (and restored when the rewrite rolls back), by a host transcript edit (a
+  rewrite, a revision restore or a system prompt update) and by a fork at a
+  point, and not used when the active provider or model is not the one that
+  counted it. It is persisted in the session's compaction cadence, so an
+  agent rebuilt from its store projects its first request too, and a live
+  session synced from the store adopts the stored cadence.
+
+- `meerkat-core` and `meerkat-session`: a session whose request the provider
+  refused for not fitting the model's context no longer stays wedged. The
+  refused request reported no usage, so the next run's first check saw the
+  same counts and sent the same request again, and so did every run after
+  it. The refusal is now recorded in the session's compaction cadence
+  (`last_context_refusal_boundary_index`), and the next check compacts the
+  whole transcript once, whatever the thresholds and the cadence say: a turn
+  too large for the window is summarized instead of being sent again. The
+  attempt clears the fact whether it commits or not, so a refusal costs one
+  compaction and cannot loop; an answered request clears it too. The refused
+  run still fails as before, and its hard-failure boundary commits the
+  fact with the session (the run's closing save, or, for a refusal of the
+  run's first request, the failed run's applied boundary), so a new agent
+  built from the store (after a restart, for a session not kept alive, for
+  a command-line resume) compacts first too, as does a session wedged by an
+  earlier release after its next refused run. A host transcript edit and a
+  fork at a point drop the fact with the anchor. A custom `Compactor`
+  receives the fact as
+  `CompactionContext::last_context_refusal_boundary_index`.
 
 - `meerkat-core`: a pending or approved human consent (R3) is now kept
   across unrelated authorization changes and past the end of its decision's
@@ -505,7 +624,53 @@ them.
   the 8 MiB budget. The added size is virtual address space; pages are
   committed only when touched.
 
+### Upgrade notes
+
+- A client of the generic schedule tool calls (`schedule/call`,
+  `POST /schedule/call`, the MCP server's schedule tools,
+  `call_schedule_tool`, `callScheduleTool`) that read whole schedules from
+  `meerkat_schedule_list` reads one with `meerkat_schedule_get`, or every
+  schedule whole with the host listing (`schedule/list`, `GET /schedules`);
+  one that read `machine_state` from a schedule tool reply reads the public
+  fields beside it; one that read a schedule's occurrence history with only
+  `schedule_id` now gets pages of summaries, passes `view: "full"` for
+  whole occurrences and follows `page.next_cursor`; one that passed a
+  `limit` over 200 gets pages of 200. Bulk readers of schedules and
+  occurrences use the typed host surfaces, not the agent tools: RPC
+  `schedule/list` and `schedule/occurrences`, REST `GET /schedules` and
+  `GET /schedules/{id}/occurrences`, the Python SDK's `list_schedules` and
+  `list_schedule_occurrences`, and the TypeScript SDK's `listSchedules` and
+  `listScheduleOccurrences`. See Breaking.
+
+- No storage migration. A session's compaction cadence gains two optional
+  fields, written only when set; 0.9.8 and earlier ignore them, and a cadence
+  they wrote reads without them, so its first answered request on this
+  release sets the anchor.
+
+- A host that builds `CompactionContext` or `SessionCompactionCadence` by
+  struct literal, or calls `build_compaction_context`, adds the new fields or
+  argument (see Breaking). A custom `Compactor` that wants the projection or
+  the refusal reads the new context fields; one that ignores them decides as
+  before.
+
+- A lower explicit `auto_compact_threshold` (config, or a mob profile's)
+  still widens the headroom the derived four-fifths of the context window
+  leaves for what one boundary appends.
+
 ### Known limitations
+
+- `meerkat-core`: a run whose own newest round is larger than what the
+  context window leaves once the rows before the run are folded still fails
+  with a context refusal: a compaction inside a run keeps the run's request
+  and newest round verbatim. The next run compacts first and continues (see
+  Fixed).
+
+- `meerkat-core`: a context refusal whose run's closing save or boundary
+  build fails is not persisted; the next refusal records it again.
+
+- `meerkat-schedule`: a schedule's superseded acks still grow with every
+  revision. `meerkat_schedule_list` summaries leave them out;
+  `meerkat_schedule_get` and the host APIs return them with the schedule.
 
 - `meerkat-runtime`: a governed input admitted under its own authority
   association (a governed prompt, for example) that a graceful requeue stop
