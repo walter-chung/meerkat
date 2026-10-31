@@ -4,7 +4,9 @@
 //! one timed-out renew stopped waits for its re-acquire instead: the turn goes
 //! on once the re-acquire succeeds, and is refused as before when the
 //! re-acquire fails, finds another writer's batch, or does not finish within
-//! the self-fence window. Unrun until the candidate's validation.
+//! the self-fence window. Each turn is a runtime-queued input, so a row reads
+//! what became of that input in the store. Unrun until the candidate's
+//! validation.
 
 use super::*;
 use futures::stream;
@@ -20,10 +22,12 @@ use meerkat_core::{
     ToolError, ToolResult,
 };
 use meerkat_runtime::MeerkatMachine;
+use meerkat_runtime::completion::{CompletionOutcome, CompletionWaitError};
 use meerkat_runtime::identifiers::LogicalRuntimeId;
 use meerkat_runtime::input_state::InputLifecycleState;
 use meerkat_runtime::store::spi::{SpiRealm, SpiRealmConfig, SpiRuntimeStore};
 use meerkat_runtime::store::{InputStateRow, RuntimeStore};
+use meerkat_runtime::{Input, PromptInput};
 use meerkat_session::PersistentSessionService;
 use meerkat_store::{MemoryBlobStore, MemoryStore};
 use serde_json::json;
@@ -560,122 +564,196 @@ impl SessionAgentBuilder for FenceBuilder {
     }
 }
 
-/// What a run whose writer stopped during one of its steps did.
-struct FencedRun {
-    failed: bool,
-    error: String,
-    model_requests: usize,
-    dispatched: usize,
-    lease_live_after: bool,
-    poisoned_after: bool,
-    /// The phase of each of the session's input rows after the turn (`None`
-    /// for a row that does not decode), when the store answered.
-    input_phases: Option<Vec<Option<InputLifecycleState>>>,
-    /// The realm, kept open for a row that waits on it after the turn.
+/// How a row's turn reaches the agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Turn {
+    /// The session's initial turn, which the surface runs as a direct
+    /// service turn: no runtime input row backs it.
+    Direct,
+    /// A prompt queued on the session's runtime, which the runtime loop
+    /// stages and dispatches as a run of one input row.
+    Queued,
+}
+
+/// One session over a host store realm whose writer stops, the way `stop`
+/// names, during the step `closes_during` names: the session's executor is
+/// attached and its turn not yet run.
+struct FenceRow {
     realm: Arc<SpiRealm>,
+    runtime_store: Arc<SpiRuntimeStore>,
+    client: Arc<FenceModel>,
+    tools: Arc<FenceTools>,
+    machine: Arc<MeerkatMachine>,
+    session_id: meerkat_core::SessionId,
+    service: Arc<PersistentSessionService<FenceBuilder>>,
+    /// A direct row's initial turn, until it runs.
+    initial_turn: Option<crate::surface::RuntimeBackedInitialTurn>,
+    _temp: TempDir,
 }
 
-/// Run one turn of a fresh session over a host store realm whose writer's
-/// window closes during the round commit `closes_during` names, through
-/// renews that fail from then on.
-async fn run_with_window_closing_during(closes_during: ClosesDuring) -> FencedRun {
-    run_with_stop(closes_during, Stop::FailingRenews).await
-}
-
-/// Run one turn of a fresh session over a host store realm whose writer
-/// stops, the way `stop` names, during the step `closes_during` names.
-async fn run_with_stop(closes_during: ClosesDuring, stop: Stop) -> FencedRun {
-    let temp = TempDir::new().expect("temp");
-    let control = Arc::new(FenceControl {
-        stop,
-        ..FenceControl::default()
-    });
-    let host: Arc<dyn HostStore> = Arc::new(FenceHost::new(Arc::clone(&control)));
-    let realm = SpiRealm::open(host, SpiRealmConfig::default())
-        .await
-        .expect("the realm opens");
-    let _ = control.realm.set(Arc::downgrade(&realm));
-    let runtime_store = Arc::new(
-        SpiRuntimeStore::open(Arc::clone(&realm))
+impl FenceRow {
+    async fn open(closes_during: ClosesDuring, stop: Stop, turn: Turn) -> Self {
+        let temp = TempDir::new().expect("temp");
+        let control = Arc::new(FenceControl {
+            stop,
+            ..FenceControl::default()
+        });
+        let host: Arc<dyn HostStore> = Arc::new(FenceHost::new(Arc::clone(&control)));
+        let realm = SpiRealm::open(Arc::clone(&host), SpiRealmConfig::default())
             .await
-            .expect("the runtime store opens"),
-    );
-    let store = Arc::new(MemoryStore::new());
-    let blob_store = Arc::new(MemoryBlobStore::new());
-    let machine = Arc::new(
-        MeerkatMachine::persistent(runtime_store.clone(), blob_store.clone())
-            .expect("canonical machine"),
-    );
-    let client = Arc::new(FenceModel {
-        requests: AtomicUsize::new(0),
-        control: Arc::clone(&control),
-        closes_during,
-    });
-    let tools = Arc::new(FenceTools {
-        dispatched: AtomicUsize::new(0),
-        control: Arc::clone(&control),
-        closes_during,
-    });
-    let mut config = Config::default();
-    if closes_during == ClosesDuring::FirstCall {
-        // One call at a time: the round's second call asks the fence once
-        // the first one has run.
-        config.tools.max_concurrent = 1;
-    }
-    let builder = FenceBuilder {
-        factory: AgentFactory::new(temp.path().join("sessions")).session_store(store.clone()),
-        client: client.clone(),
-        tools: tools.clone(),
-        config,
-    };
-    let service = Arc::new(
-        PersistentSessionService::new(builder, 1, store.clone(), runtime_store.clone(), blob_store)
+            .expect("the realm opens");
+        let _ = control.realm.set(Arc::downgrade(&realm));
+        let runtime_store = Arc::new(
+            SpiRuntimeStore::open(Arc::clone(&realm))
+                .await
+                .expect("the runtime store opens"),
+        );
+        let store = Arc::new(MemoryStore::new());
+        let blob_store = Arc::new(MemoryBlobStore::new());
+        let machine = Arc::new(
+            MeerkatMachine::persistent(runtime_store.clone(), blob_store.clone())
+                .expect("canonical machine"),
+        );
+        let client = Arc::new(FenceModel {
+            requests: AtomicUsize::new(0),
+            control: Arc::clone(&control),
+            closes_during,
+        });
+        let tools = Arc::new(FenceTools {
+            dispatched: AtomicUsize::new(0),
+            control: Arc::clone(&control),
+            closes_during,
+        });
+        let mut config = Config::default();
+        if closes_during == ClosesDuring::FirstCall {
+            // One call at a time: the round's second call asks the fence
+            // once the first one has run.
+            config.tools.max_concurrent = 1;
+        }
+        let builder = FenceBuilder {
+            factory: AgentFactory::new(temp.path().join("sessions")).session_store(store.clone()),
+            client: client.clone(),
+            tools: tools.clone(),
+            config,
+        };
+        let service = Arc::new(
+            PersistentSessionService::new(
+                builder,
+                1,
+                store.clone(),
+                runtime_store.clone(),
+                blob_store,
+            )
             .with_canonical_runtime_adapter(machine.clone()),
-    );
-    let request = CreateSessionRequest {
-        model: "claude-sonnet-4-5".into(),
-        prompt: "probe once".into(),
-        injected_context: Vec::new(),
-        system_prompt: meerkat_core::SystemPromptOverride::Inherit,
-        max_tokens: None,
-        event_tx: None,
-        initial_turn: InitialTurnPolicy::RunImmediately,
-        deferred_prompt_policy: DeferredPromptPolicy::Discard,
-        build: None,
-        labels: None,
-    };
-    let (request, initial_turn) =
-        crate::surface::split_runtime_backed_eager_create_request(request);
-    let created = Box::pin(crate::surface::materialize_session(
-        &service,
-        &machine,
-        meerkat_core::Session::new(),
-        request,
-        {
-            let service = service.clone();
-            let machine = machine.clone();
-            move |id| crate::surface::default_persistent_executor(service, machine, id)
-        },
-    ))
-    .await
-    .expect("materialize the session and its executor");
-    let deadline = match stop {
-        Stop::FailingRenews => DEADLINE,
-        Stop::TimedOutRenew(_) => PAUSED_DEADLINE,
-    };
-    let turn = tokio::time::timeout(
-        deadline,
-        crate::surface::run_runtime_backed_initial_turn_with_machine(
+        );
+        // A queued row's session has no first turn of its own.
+        let request = CreateSessionRequest {
+            model: "claude-sonnet-4-5".into(),
+            prompt: match turn {
+                Turn::Direct => "probe once",
+                Turn::Queued => "unused",
+            }
+            .into(),
+            injected_context: Vec::new(),
+            system_prompt: meerkat_core::SystemPromptOverride::Inherit,
+            max_tokens: None,
+            event_tx: None,
+            initial_turn: match turn {
+                Turn::Direct => InitialTurnPolicy::RunImmediately,
+                Turn::Queued => InitialTurnPolicy::Defer,
+            },
+            deferred_prompt_policy: DeferredPromptPolicy::Discard,
+            build: None,
+            labels: None,
+        };
+        let (request, initial_turn) =
+            crate::surface::split_runtime_backed_eager_create_request(request);
+        let created = Box::pin(crate::surface::materialize_session(
             &service,
             &machine,
-            &created.session_id,
-            initial_turn.expect("initial turn"),
-        ),
-    )
-    .await
-    .expect("the turn ends");
-    let input_phases: Option<Vec<Option<InputLifecycleState>>> = runtime_store
-        .load_input_states(&LogicalRuntimeId::for_session(&created.session_id))
+            meerkat_core::Session::new(),
+            request,
+            {
+                let service = service.clone();
+                let machine = machine.clone();
+                move |id| crate::surface::default_persistent_executor(service, machine, id)
+            },
+        ))
+        .await
+        .expect("materialize the session and its executor");
+        Self {
+            realm,
+            runtime_store,
+            client,
+            tools,
+            machine,
+            session_id: created.session_id,
+            service,
+            initial_turn,
+            _temp: temp,
+        }
+    }
+
+    /// Run the row's turn, waiting at most `deadline` for its answer: a
+    /// direct row's initial turn, or a queued row's prompt, whose answer is
+    /// its input's waiter's.
+    async fn run_turn(&mut self, deadline: Duration) -> TurnAnswer {
+        match self.initial_turn.take() {
+            Some(initial_turn) => {
+                let turn = tokio::time::timeout(
+                    deadline,
+                    crate::surface::run_runtime_backed_initial_turn_with_machine(
+                        &self.service,
+                        &self.machine,
+                        &self.session_id,
+                        initial_turn,
+                    ),
+                )
+                .await
+                .expect("the turn ends");
+                TurnAnswer::Direct(turn.map(|_| ()).map_err(|error| format!("{error:?}")))
+            }
+            None => {
+                let (_, completion) = self
+                    .machine
+                    .accept_input_with_completion(
+                        &self.session_id,
+                        Input::Prompt(PromptInput::new("probe once", None)),
+                    )
+                    .await
+                    .expect("the runtime accepts the prompt");
+                let completion = completion.expect("a completion waiter");
+                TurnAnswer::Queued(
+                    tokio::time::timeout(deadline, completion.wait())
+                        .await
+                        .expect("the input's waiter is answered"),
+                )
+            }
+        }
+    }
+
+    fn model_requests(&self) -> usize {
+        self.client.requests.load(Ordering::SeqCst)
+    }
+
+    fn dispatched(&self) -> usize {
+        self.tools.dispatched.load(Ordering::SeqCst)
+    }
+
+    /// The phase of each of the session's input rows (`None` for a row that
+    /// does not decode), when the store answers.
+    async fn input_phases(&self) -> Option<Vec<Option<InputLifecycleState>>> {
+        input_phases_in(self.runtime_store.as_ref(), &self.session_id).await
+    }
+}
+
+/// The phase of each input row of `session_id`'s runtime in `store`.
+async fn input_phases_in(
+    store: &dyn RuntimeStore,
+    session_id: &meerkat_core::SessionId,
+) -> Option<Vec<Option<InputLifecycleState>>> {
+    store
+        .load_input_states(&LogicalRuntimeId::for_session(session_id))
         .await
         .ok()
         .map(|rows| {
@@ -685,19 +763,75 @@ async fn run_with_stop(closes_during: ClosesDuring, stop: Stop) -> FencedRun {
                     _ => None,
                 })
                 .collect()
-        });
+        })
+}
+
+/// What a row's turn was answered.
+#[derive(Debug)]
+enum TurnAnswer {
+    /// A direct turn's result, its error in `Debug` form.
+    Direct(Result<(), String>),
+    /// A queued input's waiter's answer.
+    Queued(Result<CompletionOutcome, CompletionWaitError>),
+}
+
+/// What a turn whose writer stopped during one of its steps did.
+struct FencedRun {
+    /// The turn's answer.
+    answer: TurnAnswer,
+    model_requests: usize,
+    dispatched: usize,
+    lease_live_after: bool,
+    poisoned_after: bool,
+    /// The phase of each of the session's input rows once the waiter was
+    /// answered, when the store answered.
+    input_phases: Option<Vec<Option<InputLifecycleState>>>,
+    /// The row, kept open for one that goes on observing it.
+    row: FenceRow,
+}
+
+impl FencedRun {
+    /// Whether the turn completed: a direct turn's result, or a queued
+    /// input's completed result.
+    fn completed(&self) -> bool {
+        matches!(
+            self.answer,
+            TurnAnswer::Direct(Ok(())) | TurnAnswer::Queued(Ok(CompletionOutcome::Completed(_)))
+        )
+    }
+
+    /// The turn's answer, for a row's messages and text checks.
+    fn answer_text(&self) -> String {
+        format!("{:?}", self.answer)
+    }
+}
+
+/// Run the initial turn of a fresh session over a host store realm whose
+/// writer's window closes during the round commit `closes_during` names,
+/// through renews that fail from then on.
+async fn run_with_window_closing_during(closes_during: ClosesDuring) -> FencedRun {
+    run_with_stop(closes_during, Stop::FailingRenews, Turn::Direct).await
+}
+
+/// Run one turn, the way `turn` names, of a fresh session over a host
+/// store realm whose writer stops, the way `stop` names, during the step
+/// `closes_during` names.
+async fn run_with_stop(closes_during: ClosesDuring, stop: Stop, turn: Turn) -> FencedRun {
+    let mut row = FenceRow::open(closes_during, stop, turn).await;
+    let deadline = match stop {
+        Stop::FailingRenews => DEADLINE,
+        Stop::TimedOutRenew(_) => PAUSED_DEADLINE,
+    };
+    let answer = row.run_turn(deadline).await;
+    let input_phases = row.input_phases().await;
     FencedRun {
-        failed: turn.is_err(),
-        error: turn
-            .err()
-            .map(|error| format!("{error:?}"))
-            .unwrap_or_default(),
-        model_requests: client.requests.load(Ordering::SeqCst),
-        dispatched: tools.dispatched.load(Ordering::SeqCst),
-        lease_live_after: realm.lease_is_live(),
-        poisoned_after: realm.realm_poisoned().is_some(),
+        answer,
+        model_requests: row.model_requests(),
+        dispatched: row.dispatched(),
+        lease_live_after: row.realm.lease_is_live(),
+        poisoned_after: row.realm.realm_poisoned().is_some(),
         input_phases,
-        realm,
+        row,
     }
 }
 
@@ -706,9 +840,9 @@ async fn run_with_stop(closes_during: ClosesDuring, stop: Stop) -> FencedRun {
 /// for the re-acquire, and nothing ran twice.
 fn assert_completed_once(run: &FencedRun, site: &str, calls: usize) {
     assert!(
-        !run.failed,
+        run.completed(),
         "{site}: the dispatch waits for the re-acquire, and the turn completes: {}",
-        run.error
+        run.answer_text()
     );
     assert_eq!(
         run.model_requests, 2,
@@ -734,11 +868,14 @@ fn assert_completed_once(run: &FencedRun, site: &str, calls: usize) {
 /// flight, and whose re-acquire did not restore its window, made no model
 /// call after the stop: the dispatch fence refused it, as before.
 fn assert_refused_after_the_round(run: &FencedRun, row: &str) {
-    assert!(run.failed, "{row}: the run stops at the closed window");
     assert!(
-        run.error.contains("self-fence window closed"),
+        !run.completed(),
+        "{row}: the run stops at the closed window"
+    );
+    assert!(
+        run.answer_text().contains("self-fence window closed"),
         "{row}: the dispatch fence refused it, not the write path: {}",
-        run.error
+        run.answer_text()
     );
     assert_eq!(
         run.dispatched, 1,
@@ -763,22 +900,22 @@ fn assert_refused_after_the_round(run: &FencedRun, row: &str) {
 async fn a_writer_past_its_fence_window_makes_no_model_call_and_dispatches_no_tool() {
     let first = run_with_window_closing_during(ClosesDuring::FirstCommit).await;
     assert!(!first.lease_live_after, "the window closed");
-    assert!(first.failed, "the run stops at the closed window");
+    assert!(!first.completed(), "the run stops at the closed window");
     assert!(
-        first.error.contains("self-fence window closed"),
+        first.answer_text().contains("self-fence window closed"),
         "the dispatch fence refused it, not the write path: {}",
-        first.error
+        first.answer_text()
     );
     assert_eq!(first.dispatched, 0, "the round's call is never dispatched");
     assert_eq!(first.model_requests, 1, "no model call follows");
 
     let second = run_with_window_closing_during(ClosesDuring::SecondCommit).await;
     assert!(!second.lease_live_after, "the window closed");
-    assert!(second.failed, "the run stops at the closed window");
+    assert!(!second.completed(), "the run stops at the closed window");
     assert!(
-        second.error.contains("self-fence window closed"),
+        second.answer_text().contains("self-fence window closed"),
         "the dispatch fence refused it, not the write path: {}",
-        second.error
+        second.answer_text()
     );
     assert_eq!(
         second.dispatched, 1,
@@ -800,6 +937,7 @@ async fn a_model_call_after_a_timed_out_renew_waits_for_the_reacquire() {
     let run = run_with_stop(
         ClosesDuring::SecondCommit,
         Stop::TimedOutRenew(Reacquire::ListsIn(LISTING_WITHIN_THE_WINDOW)),
+        Turn::Queued,
     )
     .await;
     assert_completed_once(&run, "the model call after the round", 1);
@@ -814,6 +952,7 @@ async fn a_tool_round_after_a_timed_out_renew_waits_for_the_reacquire() {
     let run = run_with_stop(
         ClosesDuring::FirstCommit,
         Stop::TimedOutRenew(Reacquire::ListsIn(LISTING_WITHIN_THE_WINDOW)),
+        Turn::Queued,
     )
     .await;
     assert_completed_once(&run, "the round after its first commit", 1);
@@ -829,6 +968,7 @@ async fn a_tool_call_after_a_timed_out_renew_waits_for_the_reacquire() {
     let run = run_with_stop(
         ClosesDuring::FirstCall,
         Stop::TimedOutRenew(Reacquire::ListsIn(LISTING_WITHIN_THE_WINDOW)),
+        Turn::Queued,
     )
     .await;
     assert_completed_once(&run, "the second call of the round", 2);
@@ -842,6 +982,7 @@ async fn a_failed_reacquire_still_refuses_the_dispatch() {
     let run = run_with_stop(
         ClosesDuring::SecondCommit,
         Stop::TimedOutRenew(Reacquire::Fails),
+        Turn::Direct,
     )
     .await;
     assert_refused_after_the_round(&run, "a failed re-acquire");
@@ -857,6 +998,7 @@ async fn a_foreign_batch_at_the_reacquire_refuses_the_dispatch() {
     let run = run_with_stop(
         ClosesDuring::SecondCommit,
         Stop::TimedOutRenew(Reacquire::FindsForeignBatch),
+        Turn::Direct,
     )
     .await;
     assert_refused_after_the_round(&run, "another writer's batch");
@@ -873,13 +1015,14 @@ async fn a_reacquire_slower_than_the_window_refuses_the_dispatch() {
     let run = run_with_stop(
         ClosesDuring::SecondCommit,
         Stop::TimedOutRenew(Reacquire::ListsIn(LISTING_PAST_THE_WINDOW)),
+        Turn::Direct,
     )
     .await;
     assert_refused_after_the_round(&run, "a re-acquire slower than the window");
     assert!(!run.poisoned_after, "a slow listing poisons nothing");
     tokio::time::sleep(LISTING_PAST_THE_WINDOW + Duration::from_secs(5)).await;
     assert!(
-        run.realm.lease_is_live(),
+        run.row.realm.lease_is_live(),
         "the slow re-acquire resumes the writer once its listing answers"
     );
 }
