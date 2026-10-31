@@ -5961,8 +5961,10 @@ enum RetainedEndpointSweep {
     /// Placed-edge retirement, which unwires the edge: a failed removal
     /// aborts that unwire, so the edge's route installs are restored.
     Retirement,
-    /// An existing edge's repair: the edge stays wired and the repair is
-    /// retried, so a failed removal restores nothing.
+    /// An existing edge's repair: the edge stays wired, so a failed removal
+    /// restores nothing and fails the repair. After a wake or an owed repair
+    /// the edge stays owed and is retried; an explicit `wire` returns the
+    /// error.
     Repair,
 }
 
