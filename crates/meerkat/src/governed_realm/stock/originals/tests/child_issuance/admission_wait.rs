@@ -1,10 +1,11 @@
 //! The waiting form of the governed helper admission
 //! (`GovernedHelperAdmissionFence::create_idempotent_after_owner_change`):
-//! every attempt is a new fence and the same idempotent create, only a
-//! refusal that met contention is waited out, outside every lock, and every
-//! other answer comes at once. Contention is another writer's reservation of
-//! the publication that has not published, or an owner change in progress
-//! on it.
+//! every attempt is a new fence and the same idempotent create. A refusal
+//! that met contention (another writer's reservation of the publication that
+//! has not published, or an owner change in progress on it), and on the
+//! dispatch paths every refusal to rebuild, as Core's waiting step forms
+//! treat it, is waited out outside every lock; every other answer comes at
+//! once.
 //!
 //! The rows run on paused virtual time. The other writer holds the
 //! publication on its own thread, which never touches the runtime, and every
@@ -17,7 +18,7 @@ use meerkat_authorization::grants::{
     DurableGrantOwner, GrantOwnerChange, GrantOwnerIdentity, GrantOwnerStore, GrantStoreError,
     InMemoryGrantOwnerStore,
 };
-use meerkat_core::authorization::OWNER_CHANGE_WAIT_BOUND;
+use meerkat_core::authorization::{OWNER_CHANGE_FREE_REBUILDS, OWNER_CHANGE_WAIT_BOUND};
 use meerkat_workgraph::{WorkGraphError, WorkItemFilter};
 use std::task::Poll;
 use std::time::Duration;
@@ -382,9 +383,11 @@ async fn a_denied_admission_answers_at_once_after_one_attempt() {
 }
 
 /// GUARD-3 (no contention): an `Unavailable` that met no other writer is
-/// answered at once, after exactly one attempt: the owners' refusal to
-/// rebuild with no change in progress (a host policy answering
-/// `ReprepareRequired`), and a poisoned publication. On every path.
+/// answered at once, after exactly one attempt: a poisoned publication, on
+/// every path, and on the prepared path the setup check's refusal to rebuild
+/// (a host policy answering `ReprepareRequired`), which ran inside the
+/// fence's own exclusion. A dispatch-path refusal to rebuild is retried
+/// instead (RED-7).
 ///
 /// Passes on the single-attempt form too; it fails for a form that waits
 /// after every `Unavailable`.
@@ -393,12 +396,15 @@ async fn an_unavailable_admission_without_contention_answers_at_once_after_one_a
     let owner = Arc::new(ChurnedRecords(std::sync::atomic::AtomicU8::new(0)));
     let admissions = Admissions::of(Fixture::new_with(owner.clone()));
     owner.0.store(1, Ordering::SeqCst);
-    for (cause, poison) in [("rebuild", false), ("poisoned", true)] {
+    for (cause, poison, paths) in [
+        ("rebuild", false, &[FenceFrom::Prepared][..]),
+        ("poisoned", true, &PATHS[..]),
+    ] {
         if poison {
             owner.0.store(0, Ordering::SeqCst);
             admissions.f.publication.poison();
         }
-        for from in PATHS {
+        for &from in paths {
             let key = format!("{}-{cause}", from.label());
             let template = admissions.fence(from, &key);
             let answer = {
@@ -587,5 +593,75 @@ async fn a_dropped_waiting_admission_creates_nothing_and_uses_no_further_fence()
             Ok(WorkAdmissionOutcome::Created(_))
         ),
         "a new admission of the key creates the item"
+    );
+}
+
+/// RED-7 (a dispatch-path refusal to rebuild): on the dispatch and entered
+/// paths a refusal to rebuild with no change in progress (a host policy
+/// answering `ReprepareRequired` inside the work owners' exclusion) is
+/// retried as Core's waiting step forms retry it: after a 1 ms pause, as one
+/// of the call's free rebuilds. Once the owners answer again, the next
+/// attempt creates the item. While they keep refusing, the waiting admission
+/// makes one attempt per free rebuild, each after its pause, and answers the
+/// last `Unavailable` once they are spent. The prepared path answers such a
+/// refusal at once (GUARD-3).
+///
+/// RED before the dispatch-path rule: the refusal named no change or hold, so
+/// it was answered at once, after one attempt.
+#[tokio::test(start_paused = true)]
+async fn a_dispatch_refusal_to_rebuild_is_retried_once_per_free_rebuild() {
+    let owner = Arc::new(ChurnedRecords(std::sync::atomic::AtomicU8::new(0)));
+    let admissions = Admissions::of(Fixture::new_with(owner.clone()));
+    let pauses = Duration::from_millis(u64::from(OWNER_CHANGE_FREE_REBUILDS));
+    for from in [FenceFrom::Dispatch, FenceFrom::Entered] {
+        owner.0.store(1, Ordering::SeqCst);
+        let key = format!("{}-rebuilt", from.label());
+        let template = admissions.fence(from, &key);
+        let mut waiting = std::pin::pin!(admissions.create(&template, &key));
+        assert!(
+            futures::poll!(waiting.as_mut()).is_pending(),
+            "RED-7 {from:?}: the refusal to rebuild was answered at once"
+        );
+        owner.0.store(0, Ordering::SeqCst);
+        assert!(
+            matches!(waiting.await, Ok(WorkAdmissionOutcome::Created(_))),
+            "{from:?}: created once the owners answer again"
+        );
+        assert_eq!(
+            template.attempts().len(),
+            2,
+            "{from:?}: one retry after the pause"
+        );
+
+        owner.0.store(1, Ordering::SeqCst);
+        let key = format!("{}-still-refused", from.label());
+        let template = admissions.fence(from, &key);
+        let started = tokio::time::Instant::now();
+        let answer = admissions.create(&template, &key).await;
+        let waited = started.elapsed();
+        assert!(
+            matches!(answer, Err(WorkGraphError::Conflict(_))),
+            "{from:?}: refused"
+        );
+        assert_eq!(
+            template.refusal(),
+            Some(HelperAdmissionRefusal::Unavailable),
+            "{from:?}: the last attempt's unavailability"
+        );
+        assert_eq!(
+            template.attempts().len(),
+            1 + usize::from(OWNER_CHANGE_FREE_REBUILDS),
+            "RED-7 {from:?}: one attempt per free rebuild"
+        );
+        assert!(
+            (pauses..pauses + Duration::from_millis(2)).contains(&waited),
+            "{from:?}: a 1 ms pause before each retry: {waited:?}"
+        );
+    }
+    owner.0.store(0, Ordering::SeqCst);
+    assert_eq!(
+        admissions.items().await,
+        2,
+        "one item per path whose owners answered again"
     );
 }
