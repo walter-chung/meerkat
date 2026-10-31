@@ -196,12 +196,13 @@ them.
   waits for an attached loop's handoff.
 
 - Behaviour-only (not measured by the gate): `meerkat-schedule`: a
-  schedule's `superseded_ack_ids` (`Schedule::superseded_ack_ids`, and the
-  field of that name on the `Schedule` wire projection and the SDK
-  schedule types) lists only the occurrences the latest revise or delete
-  superseded. Each revise or delete drops the ids recorded before it, so
-  after a second one the field no longer lists the occurrences an earlier
-  one superseded. An acknowledgement given to `Schedule::apply`
+  schedule's superseded acknowledgements (the `superseded_ack_ids` field of
+  `Schedule` and of the `Schedule` wire projection, `superseded_ack_ids` in
+  the Python SDK and `supersededAckIds` in the TypeScript SDK) list only
+  the occurrences the latest revise or delete superseded. Each revise or
+  delete drops the ids recorded before it, so after a second one the field
+  no longer lists the occurrences an earlier one superseded. An
+  acknowledgement given to `Schedule::apply`
   (`ScheduleLifecycleInput::ConfirmOccurrencesSuperseded`) or
   `apply_supersession_feedback` that does not answer the schedule's
   current revision is still accepted with no effect, and is no longer
