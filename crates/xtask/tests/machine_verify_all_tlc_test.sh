@@ -257,10 +257,11 @@ fi
 # current revision is recorded). It requires three witnesses reached (a
 # revise and a delete that drop an earlier acknowledgement while recording
 # their own, a late acknowledgement of a dropped id accepted without effect)
-# and refuses six seeded defects (--mutants): each revise and delete arm
-# keeping the old ids, a late acknowledgement recorded and a current one
-# dropped. 6 steps reach every witness and mutant with room to spare. It runs
-# in shard audits-h.
+# and refuses eight seeded defects (--mutants): each revise and delete arm
+# keeping the old ids, the Active and Paused acknowledgement arms recording
+# late acknowledgements, and the Paused and Deleted ones dropping current
+# acknowledgements. 6 steps reach every witness and mutant with room to
+# spare. It runs in shard audits-h.
 superseded_ack_retention_audit="${workspace_root}/specs/machines/schedule_lifecycle/superseded_ack_retention_audit.sh"
 if [[ ! -x "${superseded_ack_retention_audit}" ]]; then
   echo "error: superseded-ack retention audit runner is missing from workspace runfiles: ${superseded_ack_retention_audit}" >&2
@@ -807,7 +808,7 @@ run_machine_verify() {
 # (1617 distinct states at 14 steps), nine witness runs and nine
 # single-worker mutant runs took 100 s on a 4-worker local run; and the
 # superseded-ack retention audit with --mutants: its safety run (1382
-# distinct states at 6 steps), three witness runs and six mutant runs took
+# distinct states at 6 steps), three witness runs and eight mutant runs took
 # about 5 s on a 4-worker local run. Neither is yet measured on a hosted
 # runner.
 # Each job adds about 20 s of checkout and TLC setup: 6-10 minutes a shard,

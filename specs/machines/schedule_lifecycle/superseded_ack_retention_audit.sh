@@ -26,11 +26,13 @@
 # of a state, so each mutant run lists its expected invariant first):
 #   - ReviseActive, RevisePaused, DeleteActive or DeletePaused keeping the old
 #     ids (AuditAckSetAnswersTheLatestSupersession);
-#   - ConfirmOccurrencesSupersededActive recording every acknowledgement, late
-#     ones included, as before the bound
-#     (AuditAckSetAnswersTheLatestSupersession);
-#   - ConfirmOccurrencesSupersededDeleted recording none
-#     (AuditLatestSupersessionAcksAreKept).
+#   - ConfirmOccurrencesSupersededActive or ConfirmOccurrencesSupersededPaused
+#     recording every acknowledgement, late ones included, as before the
+#     bound (AuditAckSetAnswersTheLatestSupersession);
+#   - ConfirmOccurrencesSupersededPaused or ConfirmOccurrencesSupersededDeleted
+#     recording none (AuditLatestSupersessionAcksAreKept).
+# So every arm the bound changed is seeded at least once, and every
+# acknowledgement arm in at least one direction.
 # Each mutant replaces the one superseded_ack_ids update of its arm, so it
 # needs the model generated from the bounded DSL; an arm without exactly one
 # such update fails the run. Each TLC run is held to the canonical lane's
@@ -215,10 +217,13 @@ PY
     mutate "${arm}_keeps_old_acks" "Invariant AuditAckSetAnswersTheLatestSupersession" \
       AuditAckSetAnswersTheLatestSupersession "${arm}" "superseded_ack_ids"
   done
-  mutate late_ack_recorded "Invariant AuditAckSetAnswersTheLatestSupersession" \
-    AuditAckSetAnswersTheLatestSupersession ConfirmOccurrencesSupersededActive \
-    '(superseded_ack_ids \cup {occurrence_id})'
-  mutate current_ack_dropped "Invariant AuditLatestSupersessionAcksAreKept" \
-    AuditLatestSupersessionAcksAreKept ConfirmOccurrencesSupersededDeleted "superseded_ack_ids"
+  for arm in ConfirmOccurrencesSupersededActive ConfirmOccurrencesSupersededPaused; do
+    mutate "${arm}_records_late_acks" "Invariant AuditAckSetAnswersTheLatestSupersession" \
+      AuditAckSetAnswersTheLatestSupersession "${arm}" '(superseded_ack_ids \cup {occurrence_id})'
+  done
+  for arm in ConfirmOccurrencesSupersededPaused ConfirmOccurrencesSupersededDeleted; do
+    mutate "${arm}_drops_current_acks" "Invariant AuditLatestSupersessionAcksAreKept" \
+      AuditLatestSupersessionAcksAreKept "${arm}" "superseded_ack_ids"
+  done
 fi
 echo "superseded-ack retention audit passed at model_step_count <= ${max_steps}"

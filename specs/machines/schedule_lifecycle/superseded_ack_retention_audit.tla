@@ -42,8 +42,9 @@
 \* (AuditWitnessLateAckAccepted); a delete dropped an earlier supersession's
 \* acknowledgement and recorded its own (AuditWitnessDeleteDropsEarlierAck).
 \* With --mutants the runner seeds one defect at a time into a copy of the
-\* generated model (each revise and delete arm keeping the old ids, a late
-\* acknowledgement recorded, a current one dropped) and requires TLC to
+\* generated model (each revise and delete arm keeping the old ids, the Active
+\* and Paused acknowledgement arms recording late acknowledgements, the Paused
+\* and Deleted ones dropping current acknowledgements) and requires TLC to
 \* refuse it with the property it breaks.
 \*
 \* The TLC config is DERIVED from the generated ci.cfg on every run by
