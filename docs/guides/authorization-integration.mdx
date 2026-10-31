@@ -313,8 +313,9 @@ bounds above outside the store call (site `helper_admission`): on the prepared
 path only after an attempt whose fence named such a change or hold as it
 refused, and on the dispatch and entered paths after every refusal to rebuild,
 as the waiting forms above do. A fence built with `from_dispatch` reports those
-waits as the call's. It answers every other refusal at once. This is shell
-synchronization: no machine input or owner fact changes.
+waits on the call's surface, without an operation id. Await it holding no lock
+or store transaction of your own. It answers every other refusal at once. This
+is shell synchronization: no machine input or owner fact changes.
 
 A custom `WorkAuthorization` reports a change in progress through
 `owner_change_in_progress` (provided; default `None`), a waiting hint that is

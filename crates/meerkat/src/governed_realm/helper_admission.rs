@@ -202,7 +202,7 @@ enum FenceCheck {
         /// The dispatch context's own waiting state
         /// (`ToolDispatchContext::owner_change_churn`), taken by the one
         /// waiting admission of the fence, so that its waits report to the
-        /// host's operation refusal observer as the call's.
+        /// host's operation refusal observer on the call's surface.
         churn: std::sync::Mutex<Option<OwnerChangeChurn>>,
     },
     /// A further step of a governed tool dispatch's entered operation,
@@ -276,7 +276,8 @@ impl GovernedHelperAdmissionFence {
     /// dispatch context's own waiting state
     /// ([`meerkat_core::ToolDispatchContext::owner_change_churn`]) for its
     /// waiting admission ([`Self::create_idempotent_after_owner_change`]),
-    /// whose waits then report as the call's.
+    /// whose waits then report on the call's surface, without an operation
+    /// id.
     ///
     /// # Errors
     /// An ungoverned or default context, or another call, refuses.
@@ -421,11 +422,21 @@ impl GovernedHelperAdmissionFence {
     /// first wait, clamped to `budget_remaining` (in a tool body,
     /// `ToolDispatchContext::remaining_tool_time`), and each settled wait is
     /// one of its [`meerkat_core::authorization::OWNER_CHANGE_FREE_REBUILDS`]
-    /// retries. For a fence built from a dispatch the churn is that dispatch
+    /// retries. Read `budget_remaining` immediately before the call: the
+    /// deadline is armed at the first wait, after the first attempt, so it
+    /// can end later than the caller's own deadline by that attempt's time.
+    /// For a fence built from a dispatch the churn is that dispatch
     /// context's own ([`meerkat_core::ToolDispatchContext::owner_change_churn`]),
-    /// so each wait is also reported as the call's to the host's operation
-    /// refusal observer, as Core's step waits are; the prepared and entered
-    /// fences have no such context, and their waits are traced only.
+    /// so each wait is also reported to the host's operation refusal
+    /// observer on the call's surface, without an operation id (the
+    /// dispatch's prepared operation is not public); the prepared and
+    /// entered fences have no such context, and their waits are traced only.
+    ///
+    /// Await it holding no lock, guard or store transaction of your own (no
+    /// owner or host lock): its waits run inside this call, and the wait's
+    /// contract ([`OwnerChangeChurn::wait_after_stale_read`]) holds its
+    /// caller to that. A host that must keep a lock of its own makes its
+    /// single attempt under the lock and retries outside it.
     ///
     /// It answers at once with an attempt's own answer on:
     /// - success: the store's outcome for the key (`Created`, `Replayed`, or

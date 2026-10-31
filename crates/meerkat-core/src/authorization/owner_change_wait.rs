@@ -184,7 +184,9 @@ impl OwnerChangeChurn {
     /// - [`OwnerChangeWait::NotSettled`]: stop. The deadline passed, or every
     ///   free rebuild is spent. Answer the observation as stale and keep it
     ///   typed (for an operation, `ReprepareRequired`), never as
-    ///   unavailability.
+    ///   unavailability. A governed helper admission (below) answers with
+    ///   its fence's own last refusal instead, `Unavailable`, the only
+    ///   non-denial its refusal type has.
     ///
     /// Call it only after a stale read, between attempts of the same pure
     /// observation, and hold nothing across it: no publication guard or

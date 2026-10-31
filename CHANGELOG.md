@@ -282,18 +282,20 @@ them.
   waiting step forms do, it waits out for a change or hold in progress, or
   with none named after a 1 ms pause. Every wait is `wait_after_stale_read`
   of one `OwnerChangeChurn` per call (2 s and three free rebuilds, clamped
-  to the `budget_remaining` passed). A fence built with `from_dispatch`
-  waits with that dispatch context's own churn
+  to the `budget_remaining` passed, which the caller reads right before the
+  call: the deadline is armed after the first attempt). A fence built with
+  `from_dispatch` waits with that dispatch context's own churn
   (`ToolDispatchContext::owner_change_churn`), so its waits also report to
-  the host's operation refusal observer as the call's; prepared and entered
-  fences trace their waits only. It answers success, `Denied` and every
-  other `Unavailable` (a refusal to rebuild inside the prepared path's own
-  exclusion, clock or custody unavailable, a poisoned publication) at once,
-  and returns the last `Unavailable` once a wait is not settled. `refusal()`
-  on the fence it was called on reads the answered attempt's reason, and
-  that fence serves this one admission. Each wait is traced at site
-  `helper_admission`, and dropping the future commits nothing an attempt
-  did not commit itself.
+  the host's operation refusal observer on the call's surface, without an
+  operation id; prepared and entered fences trace their waits only. The
+  caller awaits it holding no lock or store transaction of its own. It
+  answers success, `Denied` and every other `Unavailable` (a refusal to
+  rebuild inside the prepared path's own exclusion, clock or custody
+  unavailable, a poisoned publication) at once, and returns the last
+  `Unavailable` once a wait is not settled. `refusal()` on the fence it was
+  called on reads the answered attempt's reason, and that fence serves this
+  one admission. Each wait is traced at site `helper_admission`, and
+  dropping the future commits nothing an attempt did not commit itself.
 
 - `meerkat-core`: `EnteredDispatchOperation::work_authorization`, the
   entered operation's governed work context: the dispatch's own, as
@@ -552,12 +554,12 @@ them.
   store transaction, as
   `GovernedHelperAdmissionFence::create_idempotent_after_owner_change` does.
   The wait's documentation and `HelperAdmissionRefusal::Unavailable` now say
-  so. `AdmittedWorkPolicyOwner` now says that an `Unavailable` answer is
-  final where it is asked (at a controller's model request it ends the run
-  with nothing sent), so an owner never answers its own transient lock
-  contention that way: it waits briefly for its own lock or reads an
-  immutable snapshot, and keeps `Unavailable` for when it genuinely cannot
-  answer.
+  so. `AdmittedWorkPolicyOwner` and `OperationPolicyOwner` now say that an
+  `Unavailable` answer is final where it is asked (at a controller's model
+  request it ends the run with nothing sent), so an owner never answers its
+  own transient lock contention that way: it waits briefly for its own lock
+  or reads an immutable snapshot, and keeps `Unavailable` for when it
+  genuinely cannot answer.
 
 ### Known limitations
 

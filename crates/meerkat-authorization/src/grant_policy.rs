@@ -338,6 +338,15 @@ pub trait AdmittedWorkPolicyOwner: Send + Sync {
 /// The returned bounds and deadline are current owner facts, read under the
 /// enclosing publication observation. This is a trusted extension seam for
 /// application ABAC, not a generic policy language or an allow-by-default hook.
+///
+/// As for [`AdmittedWorkPolicyOwner`], an `Unavailable` answer is final where
+/// it is asked: Core neither rebuilds nor retries it, and at a controller's
+/// model request, where this owner is asked too, it ends that run with no
+/// retry, and nothing is sent. An owner's contention on its own locks names
+/// no owner change in progress, so an owner must not answer `Unavailable` for
+/// it: it waits briefly for its lock (never one its caller holds) or reads an
+/// immutable snapshot that its writers replace. `Unavailable` is for an owner
+/// that genuinely cannot answer now.
 pub trait OperationPolicyOwner: Send + Sync {
     /// Authorize the actual canonical tool/arguments or qualified resource
     /// bound for a fresh UI submission. Resolve source registration and target

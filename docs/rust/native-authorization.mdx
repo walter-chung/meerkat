@@ -908,8 +908,11 @@ bounds.
   budget, in a tool body `ToolDispatchContext::remaining_tool_time`). A fence
   built with `from_dispatch` waits with that dispatch context's own churn
   (`ToolDispatchContext::owner_change_churn`), so its waits also report to the
-  host's operation refusal observer as the call's; prepared and entered fences
-  trace their waits only. It answers success, `Denied` and every other
+  host's operation refusal observer on the call's surface, without an
+  operation id; prepared and entered fences trace their waits only. Read the
+  budget right before the call (the deadline is armed after the first attempt),
+  and await the call holding no lock or store transaction of your own: its
+  waits run inside it. It answers success, `Denied` and every other
   `Unavailable` (a refusal to rebuild inside the prepared path's own
   exclusion, clock or custody unavailable, a poisoned publication) at once, and
   the last `Unavailable` once a wait is not settled; `refusal()` on the fence
