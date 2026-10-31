@@ -12136,6 +12136,20 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         } else {
             Some(self.acquire_runtime_turn_finalization_guard(id).await)
         };
+        // While a run waits to resume (a store fence gap suspended it, or a
+        // restart left it open), the machine starts no direct run beside it
+        // (`no_other_resumable_run`): the turn is refused busy, retryable,
+        // before it touches the live session. The runtime resumes or settles
+        // the marked run under the turn boundary held here, so the caller's
+        // retry finds the mark gone once it has.
+        if protocol
+            .runtime_adapter
+            .resumable_run_id(id)
+            .await
+            .is_some()
+        {
+            return Err((SessionError::Busy { id: id.clone() }, Some(admission)));
+        }
         let turn_identity = match protocol
             .runtime_adapter
             .capture_service_turn_identity(id)
