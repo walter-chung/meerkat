@@ -31,7 +31,8 @@
 //! the host level.
 //! [`GovernedHelperAdmissionFence::create_idempotent_after_owner_change`]
 //! makes the keyed create through a new fence for each attempt and waits for
-//! the holder outside every lock between attempts.
+//! the holder outside every lock between attempts. On the dispatch paths it
+//! retries every refusal to rebuild, as Core's waiting step forms do.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -83,10 +84,11 @@ pub enum HelperAdmissionRefusal {
     /// lock and store transaction
     /// ([`OwnerChangeChurn::wait_after_stale_read`]), as
     /// [`GovernedHelperAdmissionFence::create_idempotent_after_owner_change`]
-    /// does. That form answers the other causes at once: a refusal to
-    /// rebuild with no change in progress, clock or custody unavailable, a
-    /// poisoned publication. A later attempt may still succeed once the
-    /// owners can answer.
+    /// does. That form also retries a refusal to rebuild on the dispatch
+    /// paths, as Core's waiting step forms do, and answers the other causes
+    /// at once: a refusal to rebuild inside the prepared path's own
+    /// exclusion, clock or custody unavailable, a poisoned publication. A
+    /// later attempt may still succeed once the owners can answer.
     Unavailable,
 }
 
@@ -162,10 +164,13 @@ pub struct GovernedHelperAdmissionFence {
     admission: WorkAdmission,
     attempted: AtomicBool,
     refusal: OnceLock<HelperAdmissionRefusal>,
-    /// The owner change or hold in progress that this fence's attempt met
-    /// when it refused for contention: the waiting admission's signal to
-    /// wait and try again with a new fence.
-    contention: OnceLock<OwnerChangeInProgress>,
+    /// Whether this fence's attempt refused in a way its waiting admission
+    /// waits out before it tries again: on the dispatch paths a refusal to
+    /// rebuild (`ReprepareRequired`), as Core's waiting step forms treat it;
+    /// on the prepared path an exclusion its fence could not take while the
+    /// publication named an owner change in progress or another writer's
+    /// hold, read as it refused.
+    rebuild_refused: AtomicBool,
     /// Test seam: the fences a waiting admission through this fence made, in
     /// order.
     #[cfg(test)]
@@ -194,6 +199,11 @@ enum FenceCheck {
     Dispatch {
         operation: meerkat_core::GovernedDispatchOperation,
         further: FurtherOriginals,
+        /// The dispatch context's own waiting state
+        /// (`ToolDispatchContext::owner_change_churn`), taken by the one
+        /// waiting admission of the fence, so that its waits report to the
+        /// host's operation refusal observer as the call's.
+        churn: std::sync::Mutex<Option<OwnerChangeChurn>>,
     },
     /// A further step of a governed tool dispatch's entered operation,
     /// checked by that dispatch's own retained work owners within the review
@@ -262,7 +272,11 @@ impl GovernedHelperAdmissionFence {
     /// the dispatch context's own authorization chain, never on an owner
     /// looked up or supplied separately. A `WorkAuthorization` that does not
     /// implement `run_if_current_within` (the generic composition boundary)
-    /// refuses as unavailable and the commit never runs.
+    /// refuses as unavailable and the commit never runs. The fence keeps the
+    /// dispatch context's own waiting state
+    /// ([`meerkat_core::ToolDispatchContext::owner_change_churn`]) for its
+    /// waiting admission ([`Self::create_idempotent_after_owner_change`]),
+    /// whose waits then report as the call's.
     ///
     /// # Errors
     /// An ungoverned or default context, or another call, refuses.
@@ -285,6 +299,7 @@ impl GovernedHelperAdmissionFence {
                     originals: complete_contributors,
                     source: Arc::new(SourceOriginalBasis::new(originals)),
                 },
+                churn: std::sync::Mutex::new(Some(context.owner_change_churn())),
             },
             realm_id.into(),
             namespace,
@@ -350,7 +365,7 @@ impl GovernedHelperAdmissionFence {
             admission,
             attempted: AtomicBool::new(false),
             refusal: OnceLock::new(),
-            contention: OnceLock::new(),
+            rebuild_refused: AtomicBool::new(false),
             #[cfg(test)]
             attempts: std::sync::Mutex::new(Vec::new()),
         })
@@ -385,25 +400,40 @@ impl GovernedHelperAdmissionFence {
     /// this fence's check, scope and admission (a fence serves one attempt)
     /// and the same idempotent `create_idempotent_with_fence(admission_key,
     /// request)` on `service`, so the one attempt the owners admit creates
-    /// the item, or replays it. After an attempt refused as
-    /// [`HelperAdmissionRefusal::Unavailable`] whose fence named such a
-    /// change or hold when it refused, it waits with this call's one
-    /// [`OwnerChangeChurn`] ([`OwnerChangeChurn::wait_after_stale_read`]),
-    /// outside every lock and store transaction, then tries again. The
-    /// churn's one deadline is
+    /// the item, or replays it.
+    ///
+    /// After an attempt refused as [`HelperAdmissionRefusal::Unavailable`]
+    /// for one of these, it waits outside every lock and store transaction,
+    /// then tries again:
+    /// - on the prepared path ([`Self::new`]), an exclusion its fence could
+    ///   not take while the publication named an owner change in progress
+    ///   or another writer's hold, read as it refused;
+    /// - on the dispatch paths ([`Self::from_dispatch`],
+    ///   [`Self::from_entered`]), a refusal to rebuild (`ReprepareRequired`),
+    ///   which the native work owner also answers while another actor holds
+    ///   its exclusion. As Core's waiting step forms do, it waits for a
+    ///   change or hold in progress, or, with none named (the holder may
+    ///   have finished in between), pauses one backoff step (1 ms).
+    ///
+    /// Every wait is [`OwnerChangeChurn::wait_after_stale_read`] of this
+    /// call's one [`OwnerChangeChurn`]: one deadline,
     /// [`meerkat_core::authorization::OWNER_CHANGE_WAIT_BOUND`] from its
     /// first wait, clamped to `budget_remaining` (in a tool body,
     /// `ToolDispatchContext::remaining_tool_time`), and each settled wait is
     /// one of its [`meerkat_core::authorization::OWNER_CHANGE_FREE_REBUILDS`]
-    /// retries.
+    /// retries. For a fence built from a dispatch the churn is that dispatch
+    /// context's own ([`meerkat_core::ToolDispatchContext::owner_change_churn`]),
+    /// so each wait is also reported as the call's to the host's operation
+    /// refusal observer, as Core's step waits are; the prepared and entered
+    /// fences have no such context, and their waits are traced only.
     ///
     /// It answers at once with an attempt's own answer on:
     /// - success: the store's outcome for the key (`Created`, `Replayed`, or
     ///   `Conflict` for another request under it);
     /// - [`HelperAdmissionRefusal::Denied`];
-    /// - an `Unavailable` that met no contention: a refusal to rebuild with
-    ///   no change in progress, clock or custody unavailable, or a poisoned
-    ///   publication;
+    /// - any other `Unavailable`: a refusal to rebuild inside the prepared
+    ///   path's own exclusion, clock or custody unavailable, owners that
+    ///   cannot answer now, or a poisoned publication;
     /// - any other store error.
     ///
     /// Once a wait answers
@@ -443,7 +473,7 @@ impl GovernedHelperAdmissionFence {
         // once.
         let waiting = self.check.waiting_work();
         let operation = self.check.operation_id();
-        let mut churn = OwnerChangeChurn::new();
+        let mut churn = self.check.take_churn();
         loop {
             let attempt = self.renewed();
             #[cfg(test)]
@@ -455,10 +485,10 @@ impl GovernedHelperAdmissionFence {
                     attempt.clone(),
                 )
                 .await;
-            // Only an attempt that met contention waits: it ran and
-            // committed nothing, and nothing is held across the wait.
+            // Only an attempt that refused for what is waited out waits: it
+            // ran and committed nothing, and nothing is held across the wait.
             if answer.is_err()
-                && attempt.contention.get().is_some()
+                && attempt.rebuild_refused.load(Ordering::Acquire)
                 && let Some(work) = waiting
                 && churn
                     .wait_after_stale_read(work, budget_remaining, ADMISSION_WAIT_SITE, operation)
@@ -516,7 +546,7 @@ impl GovernedHelperAdmissionFence {
             (_, Some(result)) => result,
             // A refusal to rebuild, which the work owner also answers while
             // another actor holds its exclusion.
-            (Err(error), None) if refused_to_rebuild(&error) => Err(self.refuse_contended()),
+            (Err(error), None) if refused_to_rebuild(&error) => Err(self.refuse_rebuild()),
             (Err(error), None) => Err(self.refuse(refusal(&error))),
             (Ok(()), None) => Err(self.refuse(HelperAdmissionRefusal::Unavailable)),
         }
@@ -532,15 +562,25 @@ impl GovernedHelperAdmissionFence {
         })
     }
 
-    /// [`Self::refuse`] as unavailable, for a refusal another holder of the
-    /// check's publication can cause. When that publication names an owner
-    /// change in progress or a hold of its writer, read at once after the
-    /// refusal, the attempt met contention, and the waiting admission waits
-    /// for it.
-    fn refuse_contended(&self) -> WorkGraphError {
-        if let Some(change) = self.check.owner_change_in_progress() {
-            let _ = self.contention.set(change);
+    /// [`Self::refuse`] as unavailable, for the prepared path's exclusion
+    /// refused: another holder of the writer, or a publication that can no
+    /// longer answer. When the publication names an owner change in progress
+    /// or a hold of its writer, read at once after the refusal, the attempt
+    /// met contention and its waiting admission waits for it; a poisoned
+    /// publication names nothing.
+    fn refuse_exclusion(&self) -> WorkGraphError {
+        if self.check.owner_change_in_progress().is_some() {
+            self.rebuild_refused.store(true, Ordering::Release);
         }
+        self.refuse(HelperAdmissionRefusal::Unavailable)
+    }
+
+    /// [`Self::refuse`] as unavailable, for a dispatch-path step that refused
+    /// to rebuild: its waiting admission waits it out as Core's waiting step
+    /// forms do, for a change or hold in progress, or one backoff step when
+    /// none is named.
+    fn refuse_rebuild(&self) -> WorkGraphError {
+        self.rebuild_refused.store(true, Ordering::Release);
         self.refuse(HelperAdmissionRefusal::Unavailable)
     }
 }
@@ -596,6 +636,21 @@ impl FenceCheck {
     /// The owner change or hold in progress on that publication now.
     fn owner_change_in_progress(&self) -> Option<OwnerChangeInProgress> {
         self.waiting_work()?.owner_change_in_progress()
+    }
+
+    /// The waiting state of the one waiting admission of this check's fence:
+    /// on the dispatch path the dispatch context's own, which reports each
+    /// wait as the call's; on the prepared and entered paths a new one,
+    /// whose waits are traced only.
+    fn take_churn(&self) -> OwnerChangeChurn {
+        match self {
+            Self::Dispatch { churn, .. } => churn
+                .lock()
+                .ok()
+                .and_then(|mut kept| kept.take())
+                .unwrap_or_default(),
+            Self::Prepared { .. } | Self::Entered { .. } => OwnerChangeChurn::new(),
+        }
     }
 
     /// The operation a waiting admission's waits are traced for: the setup
@@ -667,8 +722,9 @@ fn serves_one_attempt() -> WorkGraphError {
 
 /// Whether a dispatch-path step refused to rebuild (`ReprepareRequired`):
 /// the native work owner's answer while another actor holds its exclusion,
-/// and so the one step refusal that can be contention. Both dispatch paths
-/// answer it as unavailable.
+/// and the one step refusal a waiting admission retries, as Core's waiting
+/// step forms do (`refuses_to_rebuild` there). Both dispatch paths answer it
+/// as unavailable.
 fn refused_to_rebuild(error: &meerkat_core::ToolError) -> bool {
     matches!(
         error,
@@ -770,12 +826,13 @@ impl WorkGraphAdmissionFence for GovernedHelperAdmissionFence {
                     // Another reservation holds the writer, or the
                     // publication can no longer answer: contention only
                     // while it names a change or a hold in progress.
-                    Err(_) => Err(self.refuse_contended()),
+                    Err(_) => Err(self.refuse_exclusion()),
                 }
             }
             FenceCheck::Dispatch {
                 operation: governed,
                 further,
+                churn: _,
             } => self.commit_within(
                 |commit| governed.run_if_current_within(further, commit),
                 operation,
