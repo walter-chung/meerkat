@@ -59,44 +59,62 @@ const TURN_DEADLINE: Duration = Duration::from_secs(FENCE_GAP.as_secs() * 4);
 /// How long a row waits for the writer to stop.
 const STOP_DEADLINE: Duration = Duration::from_secs(30);
 
+// The rows' timings are scaled together to the floors the host store
+// contract allows, so the module's real-time run stays short, and keep the
+// relations each row relies on: a listing within the 2 s window
+// finishes inside it; the dispatch wait bound outlasts the window; a slow
+// listing outlasts the bound; a short gap ends within one wait, after the
+// first write that meets it; a fence gap outlasts three waits; a cancel
+// lands inside a run's wait; and the answer slack is shorter than a wait, so
+// an answer after a second wait fails the one-wait check. The window cannot
+// shrink: a renew interval is at least 1 s and the window at least two.
+
 /// The host's renew interval on its 3 s lease leaves a self-fence window of
-/// 2 s; the realm holds a renew to the interval (1 s).
+/// 2 s, the contract's floor; the realm holds a renew to the interval (1 s).
 const RENEW_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The rows' realm renew timeout: its renews are held to the 1 s interval
+/// anyway, and its two acquires, which this host answers at once, are held
+/// to it too instead of the default 5 s.
+const RENEW_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// A re-acquire listing that answers within the 2 s window.
 const LISTING_WITHIN_THE_WINDOW: Duration = Duration::from_millis(1500);
 
 /// A re-acquire listing that answers long after the 2 s window and the
-/// 13 s dispatch wait bound.
-const LISTING_PAST_THE_WINDOW: Duration = Duration::from_secs(30);
+/// 5 s dispatch wait bound.
+const LISTING_PAST_THE_WINDOW: Duration = Duration::from_secs(12);
 
 /// How long a dispatch waits for a stopped writer's re-acquire on this host:
 /// its 2 s self-fence window plus the re-acquire's own timeouts, two acquires
-/// under the realm's default 5 s renew timeout and a renew held to the 1 s
-/// interval.
-const DISPATCH_WAIT_BOUND: Duration = Duration::from_secs(13);
+/// and a renew under the rows' 1 s renew timeout. Each row's realm reports
+/// it (`SpiRealm::dispatch_wait_bound`), checked when the row opens.
+const DISPATCH_WAIT_BOUND: Duration = Duration::from_secs(5);
 
 /// A store fence gap longer than three dispatch wait bounds: acquires fail
 /// for this long from the stop on.
-const FENCE_GAP: Duration = Duration::from_secs(45);
+const FENCE_GAP: Duration = Duration::from_secs(18);
 
 /// How long a suspended run's waiter waits for its answer: the stop, one
 /// dispatch wait bound and the run's retry, with room to spare.
 const ANSWER_DEADLINE: Duration = Duration::from_secs(30);
 
 /// What a waiter's answer may take beyond one dispatch wait bound from the
-/// stop: the agent's retry backoff before it reaches the fence.
-const ANSWER_SLACK: Duration = Duration::from_secs(5);
+/// stop: the agent's retry backoff before it reaches the fence. Shorter than
+/// a bound, so an answer that came after a second wait fails the check.
+const ANSWER_SLACK: Duration = Duration::from_secs(3);
 
 /// How far into the gap a row's cancel comes: the run's retry then waits at
 /// the fence of the stopped writer (it reaches the fence half a second after
-/// the stop and waits up to the 13 s bound).
-const CANCEL_INTO_THE_WAIT: Duration = Duration::from_secs(5);
+/// the stop and waits up to the 5 s bound).
+const CANCEL_INTO_THE_WAIT: Duration = Duration::from_secs(2);
 
 /// A store fence gap shorter than one dispatch wait bound: acquires fail for
-/// this long from the stop on, so the first write after the stop is refused
-/// and a later re-acquire within the wait restores the writer.
-const SHORT_GAP: Duration = Duration::from_secs(4);
+/// this long from the stop on, so the first write after the stop (at most
+/// two renew intervals in, once the stop is seen) is refused and a later
+/// re-acquire within the wait (they are tried once per renew interval)
+/// restores the writer.
+const SHORT_GAP: Duration = Duration::from_secs(3);
 
 /// The scope another writer's batch creates in the foreign-batch rows, in a
 /// family Core never uses (Core leaves `x` families to the layers above it),
@@ -884,9 +902,20 @@ impl FenceRow {
             ..FenceControl::default()
         });
         let host: Arc<dyn HostStore> = Arc::new(FenceHost::new(Arc::clone(&control)));
-        let realm = SpiRealm::open(Arc::clone(&host), SpiRealmConfig::default())
-            .await
-            .expect("the realm opens");
+        let realm = SpiRealm::open(
+            Arc::clone(&host),
+            SpiRealmConfig {
+                renew_timeout: RENEW_TIMEOUT,
+                ..SpiRealmConfig::default()
+            },
+        )
+        .await
+        .expect("the realm opens");
+        assert_eq!(
+            realm.dispatch_wait_bound(),
+            DISPATCH_WAIT_BOUND,
+            "the rows' dispatch wait bound is the realm's"
+        );
         let _ = control.realm.set(Arc::downgrade(&realm));
         let runtime_store = Arc::new(
             SpiRuntimeStore::open(Arc::clone(&realm))
@@ -1623,8 +1652,8 @@ async fn a_foreign_batch_at_the_reacquire_refuses_the_dispatch() {
     assert!(!run.lease_live_after, "the writer never resumes");
 }
 
-/// The wait is bounded: a re-acquire whose listing takes 30 s outlasts the
-/// 13 s dispatch wait bound, so the direct turn fails with a retryable store
+/// The wait is bounded: a re-acquire whose listing takes 12 s outlasts the
+/// 5 s dispatch wait bound, so the direct turn fails with a retryable store
 /// error after that one wait, its run stopped and suspended there. Another
 /// direct turn asked while the fence stays closed is refused busy
 /// (`SESSION_BUSY`): no run starts beside the suspended one while it is
@@ -1656,7 +1685,7 @@ async fn a_direct_turn_fails_retryably_when_its_reacquire_outlasts_the_bound() {
         "a direct turn while the stopped run waits for the fence is refused busy: \
          {during_the_gap:?}"
     );
-    tokio::time::sleep(LISTING_PAST_THE_WINDOW + Duration::from_secs(5)).await;
+    tokio::time::sleep(LISTING_PAST_THE_WINDOW + Duration::from_secs(2)).await;
     assert!(
         run.row.realm.lease_is_live(),
         "the slow re-acquire resumes the writer once its listing answers"
@@ -1717,7 +1746,7 @@ async fn a_direct_turns_round_commit_at_a_fence_gap_fails_retryably_after_one_wa
 
 /// An ordinary run whose writer stopped before its first round commit (its
 /// first model call failed retryably once the writer stopped, so the retry
-/// waits at the fence), with acquires failing for 45 s, longer than three
+/// waits at the fence), with acquires failing for 18 s, longer than three
 /// dispatch wait bounds: the run is suspended at the end of its first wait,
 /// its waiter is told the input stays queued, and the input stays pending
 /// through the gap with no stage attempt spent on it. Once the fence is back
@@ -1757,7 +1786,7 @@ async fn an_ordinary_runs_fence_gap_before_its_first_commit_suspends_it_and_it_r
 }
 
 /// An ordinary run whose writer stopped while its round's second commit was
-/// in flight, with acquires failing for 45 s: the run is suspended at its
+/// in flight, with acquires failing for 18 s: the run is suspended at its
 /// next model call, its waiter is told the input stays queued, and the input
 /// stays pending through the gap. Once the fence is back the run resumes from
 /// that commit: its tool round is kept, the call does not run again, and the
@@ -1800,7 +1829,7 @@ async fn an_ordinary_runs_fence_gap_after_a_round_suspends_it_and_it_resumes_onc
 
 /// A resumed run is suspended for a fence gap the same way. The run of the
 /// row above resumes once the first gap ends, and its first model call stops
-/// the writer again, with acquires failing for another 45 s: the resumed run
+/// the writer again, with acquires failing for another 18 s: the resumed run
 /// is suspended in its turn, keeps its round, and resumes again once the
 /// fence is back, without running its call again. Before, a resumed run's
 /// failure stopped the runtime and ended its input stopped.
@@ -1895,7 +1924,7 @@ async fn a_foreign_batch_tells_the_waiter_its_input_stays_queued_for_the_new_own
 
 /// A round commit that meets a fence gap waits for the re-acquire as a
 /// dispatch does, and suspends the run when none restores the writer: the
-/// run's first model call stops the writer, with acquires failing for 45 s,
+/// run's first model call stops the writer, with acquires failing for 18 s,
 /// and answers with the round's call, so the round's first commit is the
 /// first write that meets the stopped writer. The waiter is told the input
 /// stays queued, the input stays pending through the gap with no stage
@@ -2099,7 +2128,7 @@ async fn a_takeover_met_while_a_suspended_run_waits_tears_the_session_down() {
 /// A closing save that meets a store fence gap waits for the re-acquire as
 /// a round commit does, and is written again, once, when a re-acquire within
 /// the wait restored the writer: the run's one model call stops the writer
-/// (acquires fail for 4 s) and answers with text, so the run's closing save
+/// (acquires fail for 3 s) and answers with text, so the run's closing save
 /// is its first write after the stop. The turn completes once, its input
 /// consumed. Before, the refused closing save failed the turn at once, after
 /// its final answer, with the teardown class.
@@ -2290,7 +2319,7 @@ async fn a_takeover_met_by_a_dispatch_whose_window_reads_open_refuses_it() {
 
 /// A round commit refused in a gap shorter than its wait is written again,
 /// once, when a re-acquire within the wait restored the writer: the run's
-/// first model call stops the writer (acquires fail for 4 s) and answers
+/// first model call stops the writer (acquires fail for 3 s) and answers
 /// with the round's call, the round's first commit is refused, waits, and is
 /// written again. The round's call runs once and the run completes once.
 #[tokio::test]
