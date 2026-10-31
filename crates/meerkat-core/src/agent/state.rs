@@ -16853,7 +16853,7 @@ mod tests {
             );
         };
         assert!(
-            head.len() >= 4 * 1024 && head.len() < 400_000,
+            (4 * 1024..400_000).contains(&head.len()),
             "the head is bounded: {} bytes",
             head.len()
         );

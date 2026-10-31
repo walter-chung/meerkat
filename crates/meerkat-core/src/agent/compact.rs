@@ -4271,7 +4271,7 @@ mod tests {
         assert_eq!(cap.bound.axis, ToolResultBoundAxis::RequestBytes);
         let head = result_texts(&cap.messages, 4)[0].len();
         assert!(
-            head < 72_000 && head >= MIN_BOUNDED_RUN_RESULT_BYTES,
+            (MIN_BOUNDED_RUN_RESULT_BYTES..72_000).contains(&head),
             "the cap leaves the smaller head: {head}"
         );
     }
@@ -4301,7 +4301,7 @@ mod tests {
         .expect("the bounded request over the fallback's cap is bounded again");
         let texts = result_texts(&again.messages, 4);
         assert!(
-            texts[0].len() < 72_000 && texts[0].len() >= MIN_BOUNDED_RUN_RESULT_BYTES,
+            (MIN_BOUNDED_RUN_RESULT_BYTES..72_000).contains(&texts[0].len()),
             "the cap leaves a smaller head: {}",
             texts[0].len()
         );
