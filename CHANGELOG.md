@@ -512,19 +512,25 @@ them.
   member and role; that session's key gives the member a new endpoint.
   MobMachine kept the old endpoint as the member's history, but the wake
   only added the new endpoint to each live or placed peer's trust, so every
-  wired peer kept a second row under the member's name until its comms
-  runtime was rebuilt (a restart, its own release and wake, or a mob
-  resume): its `peers` listed the member twice, and every send to the old
-  peer id failed `peer_not_found_or_not_trusted`. The repair of an existing
-  edge (a wake's topology step, an owed edge repair, an idempotent `wire`)
-  now first removes each end's retained endpoints from the other end, as a
-  resume and a retirement do, each removal under MobMachine's
-  `AuthorizeMemberEndpointMigrationTrustCleanup` (for a placed peer, through
-  a `RemovePeerTrust` its host acknowledges). A removal that fails fails the
-  edge's repair, which stays owed and is retried. A member-to-member message
-  whose delivery woke the member still fails once with `PeerNotFound`, as
-  before: it was addressed to the old endpoint, which the peer's directory
-  no longer lists.
+  wired peer kept a second row under the member's name until that peer's
+  comms runtime was rebuilt (a local peer: a restart, its own release and
+  wake, or a mob resume; a placed peer: a rebuild of its runtime on its
+  host) or the member retired: its `peers` listed the member twice, and
+  every send to the old peer id failed `peer_not_found_or_not_trusted`. The
+  repair of an existing edge (a wake's topology step, an owed edge repair,
+  an idempotent `wire`) now removes each end's retained endpoints from the
+  other end, as a retirement does (a resume does it for local peers only),
+  each removal under MobMachine's
+  `AuthorizeMemberEndpointMigrationTrustCleanup`. A local peer drops the old
+  row before it trusts the new endpoint. A placed peer's host drops it
+  through a `RemovePeerTrust` it acknowledges, after the local side's trust
+  is reinstalled and before the placed side's is re-driven, so a slow or
+  refusing host never leaves the woken member without trust toward its
+  placed peer. A removal that fails fails that repair: after a wake or an
+  owed repair the edge stays owed and is retried; an explicit `wire`
+  returns the error. A member-to-member message whose delivery woke the
+  member still fails once with `PeerNotFound`, as before: it was addressed
+  to the old endpoint, which the peer's directory no longer lists.
 
 ### Known limitations
 
