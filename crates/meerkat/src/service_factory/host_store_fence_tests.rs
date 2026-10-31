@@ -96,8 +96,13 @@ const SHORT_GAP: Duration = Duration::from_secs(4);
 
 /// The scope another writer's batch creates in the foreign-batch rows, in a
 /// family Core never uses (Core leaves `x` families to the layers above it),
-/// so the new owner's runtime store reads past it.
-const FOREIGN_SCOPE: &str = "x:another-writer";
+/// so the new owner's runtime store reads past it. Its name encodes the key
+/// `foreign` and an incarnation, as every journaled scope's name does.
+const FOREIGN_SCOPE: &str = "x:rforeign~another-writer";
+
+/// [`FOREIGN_SCOPE`]'s head: the smallest valid V1 head of an empty scope,
+/// which a realm's listing decodes and checks against the scope's name.
+const FOREIGN_HEAD: &[u8] = br#"{"f":1,"fam":"x","key":"foreign","w":{"s":0,"e":0},"lb":0,"sb":0}"#;
 
 /// Which step of the turn the writer stops during.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -448,7 +453,7 @@ impl HostStore for FenceHost {
                 StoredScope {
                     version: ScopeVersion::FIRST,
                     commit_id: CommitId::try_new("another-writers-batch")?,
-                    head: Vec::new(),
+                    head: FOREIGN_HEAD.to_vec(),
                     start: 0,
                     rows: BTreeMap::new(),
                     end: 0,
