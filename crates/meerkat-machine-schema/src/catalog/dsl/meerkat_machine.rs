@@ -22189,6 +22189,13 @@ macro_rules! meerkat_catalog_machine_dsl {
                     || admitted_content_shape == ContentShape::Empty)
             }
             guard "run_starts_not_held" { self.run_start_holds == EmptySet }
+            // While a run waits to resume (a store fence gap suspended it,
+            // or a restart left it open), no direct run starts beside it, as
+            // no other run is prepared (Prepare's guard): its boundary would
+            // commit over the marked run's provisional tail, or, under the
+            // marked run's own id, resume that run outside `ResumeRun`. The
+            // session service refuses such a turn busy before it gets here.
+            guard "no_other_resumable_run" { self.resumable_run_id == None }
             update {
                 self.current_run_id = Some(run_id);
                 if self.run_stop_requested != Some(run_id) {
@@ -22248,6 +22255,8 @@ macro_rules! meerkat_catalog_machine_dsl {
                     || admitted_content_shape == ContentShape::Empty)
             }
             guard "run_starts_not_held" { self.run_start_holds == EmptySet }
+            // No direct run starts beside a run marked resumable (above).
+            guard "no_other_resumable_run" { self.resumable_run_id == None }
             update {
                 self.current_run_id = Some(run_id);
                 if self.run_stop_requested != Some(run_id) {
@@ -22307,6 +22316,8 @@ macro_rules! meerkat_catalog_machine_dsl {
                     || admitted_content_shape == ContentShape::Empty)
             }
             guard "run_starts_not_held" { self.run_start_holds == EmptySet }
+            // No direct run starts beside a run marked resumable (above).
+            guard "no_other_resumable_run" { self.resumable_run_id == None }
             update {
                 self.current_run_id = Some(run_id);
                 if self.run_stop_requested != Some(run_id) {
