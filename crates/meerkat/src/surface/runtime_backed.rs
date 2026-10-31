@@ -1237,7 +1237,8 @@ async fn materialize_prepared_session_actor_transaction_with_admission<
         .await;
     // Refused before it admitted anything: the rollback keeps every input the
     // registration recovered, so a held durable tail stays held with its
-    // inputs open.
+    // inputs open. The inputs bound to a run the registration marked
+    // resumable whose stop was asked still end as stopped.
     let result = match create_result {
         Ok(result) => result,
         Err(error) => {

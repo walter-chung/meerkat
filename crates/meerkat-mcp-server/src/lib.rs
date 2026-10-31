@@ -258,7 +258,9 @@ async fn prepare_mcp_actor_materialization_claim(
     .await
     {
         // Nothing was admitted: the rollback keeps every input the
-        // registration recovered from the store.
+        // registration recovered from the store, except the inputs bound to a
+        // run the registration marked resumable whose stop was asked, which
+        // end as stopped.
         let rollback = prepared.rollback_now().await.err();
         let rollback = rollback
             .map(|error| format!("; exact rollback also failed: {error}"))

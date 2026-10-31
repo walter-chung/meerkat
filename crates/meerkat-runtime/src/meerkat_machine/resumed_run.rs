@@ -463,9 +463,10 @@ impl super::driver::DriverEntry {
     /// Whether this runtime's stop keeps its queued work for the next start:
     /// a graceful unregister that requeues, or the rollback of a
     /// materialization that never served, which keeps every input its
-    /// registration recovered. Such a stop leaves a run the session left
-    /// open to the next registration, which finds it open again; every
-    /// other stop ends that run with the stop.
+    /// registration recovered (either way, the inputs bound to a run marked
+    /// resumable whose stop was asked end as stopped). Such a stop leaves a
+    /// run the session left open to the next registration, which finds it
+    /// open again; every other stop ends that run with the stop.
     pub(crate) fn stop_keeps_queued_work(&self) -> bool {
         let authority = self.shared_dsl_authority();
         let authority = authority

@@ -10818,7 +10818,9 @@ impl SessionRuntime {
                         // Nothing was admitted (a no-turn materialization),
                         // so the rollback keeps every input the registration
                         // recovered (rollback_now): a refused resume ends
-                        // nothing a later start would run.
+                        // nothing a later start would run. The inputs bound
+                        // to a run the registration marked resumable whose
+                        // stop was asked still end as stopped.
                         let rollback = prepared.rollback_now().await;
                         #[cfg(feature = "mcp")]
                         runtime.mcp_sessions.write().await.remove(&id);

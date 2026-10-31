@@ -2910,9 +2910,10 @@ pub enum UnregisterQueuedInputsDisposition {
     /// store exactly as the store holds it, with no requeue mark: the
     /// rollback of a materialization that never served and admitted no
     /// input. An input admitted while the registration stood still ends
-    /// as stopped. A registration that served live work (an admission, a
-    /// deduplicated resubmission or a recycle) records a requested Keep as
-    /// Stop.
+    /// as stopped, and so does an input bound to a run marked resumable
+    /// whose stop was asked. A registration that served live work (an
+    /// admission, a deduplicated resubmission or a recycle) records a
+    /// requested Keep as Stop.
     Keep,
 }
 
@@ -39954,7 +39955,8 @@ macro_rules! meerkat_catalog_machine_dsl {
         // other input is Abandon, so under the Stop disposition, or outside
         // an unregister, the verdict is today's blanket abandon. Under the
         // Keep disposition (ClassifyStopInputDispositionKeep, appended last)
-        // an input the registration recovered is Keep and every other input
+        // an input the registration recovered is Keep, unless it is bound to
+        // a run marked resumable whose stop was asked, and every other input
         // is Abandon. The shell supplies durability, directedness and the
         // objective binding; the phase, lane and kind are machine facts.
         transition ClassifyStopInputDispositionRetain {
