@@ -1147,9 +1147,10 @@ struct ServiceTurnGuard {
 
 impl ServiceTurnGuard {
     /// The refusal the turn answers when a store fence gap suspended its
-    /// run `run_id` ([`StoreCheckpointer::dispatch_fence_ready`] or a round
-    /// commit's wait); `None` when no gap suspended that run, as for a run a
-    /// graceful requeue stop suspended.
+    /// run `run_id` (at a dispatch's wait,
+    /// [`meerkat_core::SessionCheckpointer::dispatch_fence_ready`], or a
+    /// round commit's); `None` when no gap suspended that run, as for a run
+    /// a graceful requeue stop suspended.
     fn take_fence_gap_suspension(&self, run_id: &RunId) -> Option<AgentError> {
         let checkpointer = self.checkpointer.upgrade()?;
         let mut slot = checkpointer
