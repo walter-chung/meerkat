@@ -461,7 +461,7 @@ async fn a_hold_past_the_bound_answers_unavailable_with_no_attempt_after_the_dea
             "budget {budget:?}: the last attempt's unavailability"
         );
         assert!(
-            waited >= deadline && waited < deadline + Duration::from_millis(2),
+            (deadline..deadline + Duration::from_millis(2)).contains(&waited),
             "RED-4 budget {budget:?}: it waits to its deadline and not past it: {waited:?}"
         );
         assert_eq!(
