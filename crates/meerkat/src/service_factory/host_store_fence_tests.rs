@@ -6,13 +6,17 @@
 //! wait's bound and no other writer is found (a store fence gap), a runtime
 //! run is suspended: its input stays pending, its waiter is told so, and the
 //! run resumes once the fence is back. A round commit that meets the gap waits
-//! the same way and suspends the run the same way. A cancel accepted before
-//! the gap, or an interrupt of the suspended run, ends the run once the fence
-//! is back: it never resumes. Another writer, met at the re-acquire, at a
-//! commit or while a suspended run waits, still refuses and tears the live
-//! session down, and the waiters are told the store keeps their inputs for
-//! the new owner; a direct turn, which has no runtime run to suspend, fails
-//! with a retryable store error. Unrun until the candidate's validation.
+//! the same way and suspends the run the same way; a closing save waits the
+//! same way, and its refusal stands when the gap outlasts the wait. A cancel
+//! accepted before the gap, an interrupt or a stop of a run that waits at the
+//! fence, and an interrupt of the suspended run, end the run once the fence
+//! is back: it never resumes, and its waiter is told within one wait that its
+//! input stays queued. Another writer, met at the re-acquire, at a dispatch
+//! whose window still reads open, at a commit or while a suspended run waits,
+//! still refuses and tears the live session down, and the waiters are told
+//! the store keeps their inputs for the new owner; a direct turn, which has
+//! no runtime run to suspend, fails with a retryable store error. Unrun until
+//! the candidate's validation.
 
 use super::*;
 use futures::stream;
@@ -30,10 +34,10 @@ use meerkat_core::{
 use meerkat_runtime::MeerkatMachine;
 use meerkat_runtime::completion::{CompletionOutcome, CompletionWaitError};
 use meerkat_runtime::identifiers::LogicalRuntimeId;
-use meerkat_runtime::input_state::InputLifecycleState;
+use meerkat_runtime::input_state::{InputAbandonReason, InputLifecycleState, InputTerminalOutcome};
 use meerkat_runtime::store::spi::{SpiRealm, SpiRealmConfig, SpiRuntimeStore};
 use meerkat_runtime::store::{InputStateRow, RuntimeStore};
-use meerkat_runtime::{Input, PromptInput};
+use meerkat_runtime::{Input, PromptInput, RunStopReceipt};
 use meerkat_session::PersistentSessionService;
 use meerkat_store::{MemoryBlobStore, MemoryStore};
 use serde_json::json;
@@ -85,6 +89,11 @@ const ANSWER_SLACK: Duration = Duration::from_secs(5);
 /// the stop and waits up to the 13 s bound).
 const CANCEL_INTO_THE_WAIT: Duration = Duration::from_secs(5);
 
+/// A store fence gap shorter than one dispatch wait bound: acquires fail for
+/// this long from the stop on, so the first write after the stop is refused
+/// and a later re-acquire within the wait restores the writer.
+const SHORT_GAP: Duration = Duration::from_secs(4);
+
 /// The scope another writer's batch creates in the foreign-batch rows, in a
 /// family Core never uses (Core leaves `x` families to the layers above it),
 /// so the new owner's runtime store reads past it.
@@ -112,6 +121,9 @@ enum ClosesDuring {
     /// The round's one call: the writer stops, or another writer takes the
     /// fence over, while it runs, so the round's next commit meets it first.
     OnlyCall,
+    /// The run's one model call, which stops the writer and answers with
+    /// text: the run's closing save is its first write after the stop.
+    TextModelCall,
 }
 
 /// How the row stops the writer.
@@ -571,11 +583,15 @@ enum ModelStep {
     /// closes during the first call.
     Tools,
     /// Stop the writer, the way the row's stop names, then fail retryably
-    /// (503): the agent's retry asks the fence of the stopped writer.
+    /// (503): the agent's retry asks the fence of the stopped writer (or of
+    /// the realm another writer took over).
     StopThenOverloaded,
     /// Stop the writer, the way the row's stop names, then answer with one
     /// call of `probe`: the round's first commit meets the stopped writer.
     StopThenTools,
+    /// Stop the writer, the way the row's stop names, then answer with text:
+    /// the run's closing save meets the stopped writer.
+    StopThenText,
     /// Answer with text.
     Text,
 }
@@ -612,9 +628,29 @@ impl LlmClient for FenceModel {
         if step == ModelStep::StopThenOverloaded {
             let control = Arc::clone(&self.control);
             return Box::pin(stream::once(async move {
-                control.stop_with_a_timed_out_renew().await;
+                control.stop_the_writer().await;
                 Err(LlmError::ServerOverloaded)
             }));
+        }
+        if step == ModelStep::StopThenText {
+            let control = Arc::clone(&self.control);
+            let events: Vec<Result<LlmEvent, LlmError>> = vec![
+                Ok(LlmEvent::TextDelta {
+                    delta: "probed".into(),
+                    meta: None,
+                }),
+                Ok(LlmEvent::UsageUpdate { usage }),
+                Ok(LlmEvent::Done {
+                    outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
+                }),
+            ];
+            return Box::pin(futures::StreamExt::flat_map(
+                stream::once(async move {
+                    control.stop_the_writer().await;
+                    events
+                }),
+                stream::iter,
+            ));
         }
         if step == ModelStep::StopThenTools {
             let control = Arc::clone(&self.control);
@@ -712,7 +748,8 @@ impl AgentToolDispatcher for FenceTools {
             | ClosesDuring::FirstCall
             | ClosesDuring::FirstModelCall
             | ClosesDuring::RoundModelCall
-            | ClosesDuring::OnlyCall => {}
+            | ClosesDuring::OnlyCall
+            | ClosesDuring::TextModelCall => {}
         }
         Ok(ToolDispatchOutcome::sync_result(ToolResult::new(
             call.id.into(),
@@ -803,6 +840,7 @@ impl FenceRow {
         let script = match closes_during {
             ClosesDuring::FirstModelCall => vec![ModelStep::StopThenOverloaded],
             ClosesDuring::RoundModelCall => vec![ModelStep::StopThenTools, ModelStep::Tools],
+            ClosesDuring::TextModelCall => vec![ModelStep::StopThenText],
             ClosesDuring::FirstCommit
             | ClosesDuring::SecondCommit
             | ClosesDuring::FirstCall
@@ -1021,6 +1059,66 @@ impl FenceRow {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    }
+
+    /// The terminal outcome of each of the session's input rows (`None` for
+    /// a row with none yet, or one that does not decode), when the store
+    /// answers.
+    async fn input_terminals(&self) -> Option<Vec<Option<InputTerminalOutcome>>> {
+        self.runtime_store
+            .load_input_states(&LogicalRuntimeId::for_session(&self.session_id))
+            .await
+            .ok()
+            .map(|rows| {
+                rows.iter()
+                    .map(|row| match row {
+                        InputStateRow::Decoded(stored) => stored.seed.terminal_outcome.clone(),
+                        _ => None,
+                    })
+                    .collect()
+            })
+    }
+
+    /// Check that a stopped run's one input ends once the fence is back,
+    /// abandoned as cancelled (the run was settled, not resumed), and that
+    /// the run never asked the model again: `requests` is what it asked
+    /// before.
+    async fn assert_settled_as_cancelled(&self, site: &str, requests: usize) {
+        let phases = self
+            .wait_for_input_phases(&[InputLifecycleState::Abandoned], PAUSED_DEADLINE)
+            .await;
+        assert_eq!(
+            phases,
+            Some(vec![Some(InputLifecycleState::Abandoned)]),
+            "{site}: the stopped run's input ends abandoned once the fence is back"
+        );
+        assert_eq!(
+            self.input_terminals().await,
+            Some(vec![Some(InputTerminalOutcome::Abandoned {
+                reason: InputAbandonReason::Cancelled,
+            })]),
+            "{site}: the stopped run's input ends as cancelled"
+        );
+        assert_eq!(
+            self.model_requests(),
+            requests,
+            "{site}: the stopped run never asks the model again"
+        );
+    }
+
+    /// Check that a waiter answered just now was answered within one
+    /// dispatch wait bound (and the agent's retry backoff) of the writer's
+    /// stop.
+    fn assert_answered_within_one_wait(&self, site: &str) {
+        let stopped_at = self
+            .control
+            .stopped_at()
+            .expect("the writer stopped during the run");
+        let answered_after = tokio::time::Instant::now().duration_since(stopped_at);
+        assert!(
+            answered_after <= DISPATCH_WAIT_BOUND + ANSWER_SLACK,
+            "{site}: the waiter is answered within one dispatch wait of the stop: {answered_after:?}"
+        );
     }
 
     /// What another process that takes the session over reads: the phase of
@@ -1266,15 +1364,7 @@ async fn assert_suspended_through_the_gap(
         ),
         "{site}: the suspended run's waiter is told that its input stays queued: {answer:?}"
     );
-    let stopped_at = row
-        .control
-        .stopped_at()
-        .expect("the writer stopped during the run");
-    let answered_after = tokio::time::Instant::now().duration_since(stopped_at);
-    assert!(
-        answered_after <= DISPATCH_WAIT_BOUND + ANSWER_SLACK,
-        "{site}: the waiter is answered within one dispatch wait of the stop: {answered_after:?}"
-    );
+    row.assert_answered_within_one_wait(site);
     let phases = row.input_phases().await;
     assert!(
         all_pending(&phases),
@@ -1720,9 +1810,12 @@ async fn a_takeover_first_met_at_a_commit_tells_the_waiter_its_input_stays_queue
 /// A cancel accepted while the run waits at the fence of its stopped writer
 /// survives the fence gap that then suspends the run: the suspension keeps
 /// the run's stop intent, the run never resumes, and once the fence is back
-/// it is settled, its input abandoned. Its waiter is never told the input
-/// stays queued. Before, the suspension dropped the cancel (the resumed
-/// turn's start cleared it), and the run resumed and completed.
+/// it is settled, its input abandoned as cancelled. Its waiter is answered
+/// at the suspension, within one dispatch wait of the stop, that the input
+/// stays queued (`RequeuedAcrossStop`): it does not wait out the gap. Before
+/// round 3 the suspension dropped the cancel (the resumed turn's start
+/// cleared it), and the run resumed and completed; before round 4 the
+/// waiter waited for the fence to come back, or for the whole outage.
 #[tokio::test(start_paused = true)]
 async fn a_cancel_accepted_before_a_fence_gap_survives_it_and_the_run_does_not_come_back() {
     let row = FenceRow::open(
@@ -1747,24 +1840,18 @@ async fn a_cancel_accepted_before_a_fence_gap_survives_it_and_the_run_does_not_c
         .await
         .expect("the input's waiter is answered");
     assert!(
-        !matches!(
-            answer,
-            Err(CompletionWaitError::RequeuedAcrossStop { .. })
-                | Ok(CompletionOutcome::Completed(_))
-        ),
-        "the cancelled run's input neither stays queued nor completes: {answer:?}"
+        matches!(answer, Err(CompletionWaitError::RequeuedAcrossStop { .. })),
+        "the suspended run's waiter is told that its input stays queued: {answer:?}"
     );
+    row.assert_answered_within_one_wait("a cancel before the gap");
     tokio::time::sleep(DISPATCH_WAIT_BOUND * 2).await;
     assert_eq!(
         row.model_requests(),
         1,
         "the cancelled run never asks the model again"
     );
-    assert_eq!(
-        row.input_phases().await,
-        Some(vec![Some(InputLifecycleState::Abandoned)]),
-        "the cancelled run's input ends abandoned once the fence is back"
-    );
+    row.assert_settled_as_cancelled("a cancel before the gap", 1)
+        .await;
 }
 
 /// An interrupt of a session whose run a fence gap suspended settles that
@@ -1788,23 +1875,13 @@ async fn an_interrupt_settles_a_run_a_fence_gap_suspended_and_it_does_not_come_b
         ),
         "the gap suspends the run: {answer:?}"
     );
+    row.assert_answered_within_one_wait("an interrupt of the suspended run");
     row.machine
         .hard_cancel_current_run(&row.session_id, "the user stops the suspended run")
         .await
         .expect("the interrupt is accepted for the run the gap suspended");
-    let phases = row
-        .wait_for_input_phases(&[InputLifecycleState::Abandoned], PAUSED_DEADLINE)
+    row.assert_settled_as_cancelled("an interrupt of the suspended run", 1)
         .await;
-    assert_eq!(
-        phases,
-        Some(vec![Some(InputLifecycleState::Abandoned)]),
-        "the interrupted run's input ends abandoned once the fence is back"
-    );
-    assert_eq!(
-        row.model_requests(),
-        1,
-        "the interrupted run never asks the model again"
-    );
 }
 
 /// A run a fence gap suspended waits in the runtime loop for the fence to
@@ -1828,6 +1905,7 @@ async fn a_takeover_met_while_a_suspended_run_waits_tears_the_session_down() {
         ),
         "the gap suspends the run: {answer:?}"
     );
+    row.assert_answered_within_one_wait("a takeover while suspended");
     let started = tokio::time::Instant::now();
     while row.realm.realm_poisoned().is_none() && started.elapsed() < PAUSED_DEADLINE {
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1845,5 +1923,237 @@ async fn a_takeover_met_while_a_suspended_run_waits_tears_the_session_down() {
     assert!(
         all_pending(&phases),
         "the new owner finds the input pending, to run it: {phases:?}"
+    );
+}
+
+/// A closing save that meets a store fence gap waits for the re-acquire as
+/// a round commit does, and is written again, once, when a re-acquire within
+/// the wait restored the writer: the run's one model call stops the writer
+/// (acquires fail for 4 s) and answers with text, so the run's closing save
+/// is its first write after the stop. The turn completes once, its input
+/// consumed. Before, the refused closing save failed the turn at once, after
+/// its final answer, with the teardown class.
+#[tokio::test(start_paused = true)]
+async fn a_closing_save_refused_in_a_short_gap_is_written_again_and_the_turn_completes_once() {
+    let run = run_with_stop(
+        ClosesDuring::TextModelCall,
+        Stop::TimedOutRenew(Reacquire::FailsFor(SHORT_GAP)),
+        Turn::Queued,
+    )
+    .await;
+    assert!(
+        run.completed(),
+        "the closing save waits for the re-acquire and the turn completes: {}",
+        run.answer_text()
+    );
+    assert_eq!(run.model_requests, 1, "the model was asked once");
+    assert!(run.lease_live_after, "the re-acquire resumed the writer");
+    assert!(!run.poisoned_after, "no other writer showed up");
+    assert_eq!(
+        run.input_phases,
+        Some(vec![Some(InputLifecycleState::Consumed)]),
+        "the turn's one input is consumed once"
+    );
+    assert_eq!(
+        run.row.committed_rows().await,
+        vec![
+            "user probe once".to_string(),
+            "assistant probed".to_string()
+        ],
+        "the prompt and the answer are in the transcript once"
+    );
+}
+
+/// The documented residual of a closing save: when the gap outlasts the
+/// closing save's wait, its refusal stands. The turn's terminal was recorded
+/// before its closing save, so the run cannot be suspended there: the turn
+/// fails (the teardown class), its waiter is not told that its input stays
+/// queued, and the model is not asked again in this process.
+#[tokio::test(start_paused = true)]
+async fn a_closing_save_whose_gap_outlasts_its_wait_still_fails_the_turn() {
+    let run = run_with_stop(
+        ClosesDuring::TextModelCall,
+        Stop::TimedOutRenew(Reacquire::FailsFor(FENCE_GAP)),
+        Turn::Queued,
+    )
+    .await;
+    assert!(
+        !run.completed(),
+        "the turn fails after its final answer: {}",
+        run.answer_text()
+    );
+    assert!(
+        !matches!(
+            run.answer,
+            TurnAnswer::Queued(Err(CompletionWaitError::RequeuedAcrossStop { .. }))
+        ),
+        "the run is not suspended, so its input is not answered as queued: {}",
+        run.answer_text()
+    );
+    assert_eq!(run.model_requests, 1, "the model is not asked again");
+    assert!(!run.poisoned_after, "no other writer showed up");
+}
+
+/// An interrupt that reaches a run waiting at the fence of its stopped
+/// writer stops it through a suspension, not a hard interrupt: the stop is
+/// recorded on the run and the run is suspended at once, its waiter told
+/// within one dispatch wait of the stop that its input stays queued. The run
+/// never comes back, and once the fence is back it is settled, its input
+/// abandoned as cancelled. Before, the hard interrupt cancelled the run only
+/// in memory: the gap refused the cancel's writes, the session had to reload,
+/// and the reload resumed the stopped run from the store.
+#[tokio::test(start_paused = true)]
+async fn an_interrupt_of_a_run_waiting_at_the_fence_suspends_it_and_it_does_not_come_back() {
+    let row = FenceRow::open(
+        ClosesDuring::FirstModelCall,
+        Stop::TimedOutRenew(Reacquire::FailsFor(FENCE_GAP)),
+        Turn::Queued,
+    )
+    .await;
+    let completion = row.accept_prompt().await;
+    row.control.wait_until_stopped().await;
+    // The run's retry now waits at the fence of the stopped writer.
+    tokio::time::sleep(CANCEL_INTO_THE_WAIT).await;
+    row.machine
+        .hard_cancel_current_run(&row.session_id, "the user stops the run")
+        .await
+        .expect("the interrupt is accepted for the run waiting at the fence");
+    let answer = tokio::time::timeout(ANSWER_DEADLINE, completion.wait())
+        .await
+        .expect("the input's waiter is answered");
+    assert!(
+        matches!(answer, Err(CompletionWaitError::RequeuedAcrossStop { .. })),
+        "the stopped run is suspended and its waiter told the input stays queued: {answer:?}"
+    );
+    row.assert_answered_within_one_wait("an interrupt at the fence");
+    row.assert_settled_as_cancelled("an interrupt at the fence", 1)
+        .await;
+}
+
+/// A run stop that reaches a run waiting at the fence of its stopped writer
+/// is recorded and the run suspended, as an interrupt there is: the call
+/// returns at once, its receipt listing no contributor (the inputs end only
+/// once the fence is back), the waiter is told within one dispatch wait of
+/// the stop that its input stays queued, and once the fence is back the run
+/// is settled, its input abandoned as cancelled. Before, the stop's hard
+/// interrupt cancelled the run only in memory, the contributor waits failed
+/// with the reload that followed, and the reload resumed the stopped run.
+#[tokio::test(start_paused = true)]
+async fn a_stop_of_a_run_waiting_at_the_fence_returns_at_once_and_the_run_does_not_come_back() {
+    let row = FenceRow::open(
+        ClosesDuring::FirstModelCall,
+        Stop::TimedOutRenew(Reacquire::FailsFor(FENCE_GAP)),
+        Turn::Queued,
+    )
+    .await;
+    let completion = row.accept_prompt().await;
+    row.control.wait_until_stopped().await;
+    tokio::time::sleep(CANCEL_INTO_THE_WAIT).await;
+    let run_id = row
+        .machine
+        .current_run(&row.session_id)
+        .await
+        .expect("the run waits at the fence");
+    let receipt = tokio::time::timeout(
+        ANSWER_DEADLINE,
+        row.machine
+            .stop_run(&row.session_id, &run_id, "the user stops the run"),
+    )
+    .await
+    .expect("the stop returns at once")
+    .expect("the stop is accepted");
+    assert!(
+        matches!(
+            &receipt,
+            RunStopReceipt::Stopped { contributors, .. } if contributors.is_empty()
+        ),
+        "the stop is recorded and its receipt lists no contributor: {receipt:?}"
+    );
+    let answer = tokio::time::timeout(ANSWER_DEADLINE, completion.wait())
+        .await
+        .expect("the input's waiter is answered");
+    assert!(
+        matches!(answer, Err(CompletionWaitError::RequeuedAcrossStop { .. })),
+        "the stopped run is suspended and its waiter told the input stays queued: {answer:?}"
+    );
+    row.assert_answered_within_one_wait("a stop at the fence");
+    row.assert_settled_as_cancelled("a stop at the fence", 1)
+        .await;
+}
+
+/// Another writer that takes the fence over during the run's first model
+/// call poisons the realm while this writer's own window still reads open
+/// (the fenced-out renew came a renew interval after the last one, within
+/// the 2 s window). The model call fails retryably, and the retry, half a
+/// second later and still within the window, is refused at once on the lost
+/// fence by its dispatch check, before the open-window fast path: no model
+/// call follows, the live session is torn down, and the waiter is told the
+/// input stays queued for the new owner, which reads it pending. Without
+/// that check the retry would ask the model on a realm another writer holds.
+#[tokio::test(start_paused = true)]
+async fn a_takeover_met_by_a_dispatch_whose_window_reads_open_refuses_it() {
+    let mut row = FenceRow::open(ClosesDuring::FirstModelCall, Stop::TakenOver, Turn::Queued).await;
+    let answer = row.run_turn(ANSWER_DEADLINE).await;
+    assert!(
+        matches!(
+            answer,
+            TurnAnswer::Queued(Err(CompletionWaitError::RequeuedAcrossStop { .. }))
+        ),
+        "the waiter is told the input stays queued for the new owner: {answer:?}"
+    );
+    assert!(
+        row.realm.realm_poisoned().is_some(),
+        "the fenced-out renew poisons the realm"
+    );
+    assert_eq!(
+        row.model_requests(),
+        1,
+        "the retry's model call never starts on the lost fence"
+    );
+    let phases = row.new_owner_input_phases().await;
+    assert!(
+        all_pending(&phases),
+        "the new owner finds the input pending, to run it: {phases:?}"
+    );
+}
+
+/// A round commit refused in a gap shorter than its wait is written again,
+/// once, when a re-acquire within the wait restored the writer: the run's
+/// first model call stops the writer (acquires fail for 4 s) and answers
+/// with the round's call, the round's first commit is refused, waits, and is
+/// written again. The round's call runs once and the run completes once.
+#[tokio::test(start_paused = true)]
+async fn a_round_commit_refused_in_a_short_gap_is_written_again_and_the_run_completes_once() {
+    let run = run_with_stop(
+        ClosesDuring::RoundModelCall,
+        Stop::TimedOutRenew(Reacquire::FailsFor(SHORT_GAP)),
+        Turn::Queued,
+    )
+    .await;
+    assert!(
+        run.completed(),
+        "the round commit waits for the re-acquire and the run completes: {}",
+        run.answer_text()
+    );
+    assert_eq!(
+        run.model_requests, 2,
+        "the round and the answer, each asked once"
+    );
+    assert_eq!(run.dispatched, 1, "the round's call runs once");
+    assert!(run.lease_live_after, "the re-acquire resumed the writer");
+    assert_eq!(
+        run.input_phases,
+        Some(vec![Some(InputLifecycleState::Consumed)]),
+        "the run's one input is consumed once"
+    );
+    assert_eq!(
+        run.row.committed_rows().await,
+        vec![
+            "user probe once".to_string(),
+            "assistant tool use".to_string(),
+            "tool results".to_string(),
+            "assistant probed".to_string(),
+        ],
+        "the prompt and the round are in the transcript once"
     );
 }

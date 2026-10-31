@@ -5,8 +5,9 @@
 //! answers) and fails retryably, and every acquire fails for longer than the
 //! realm's dispatch wait bound: the retry waits at the fence, and when no
 //! re-acquire restores the writer the run is suspended, not failed. The turn
-//! answers that its input stays queued (`requeued_across_stop`), and once the
-//! fence is back the input runs once, in the stage attempt it already had.
+//! answers, within one dispatch wait bound of the stop, that its input stays
+//! queued (`requeued_across_stop`), and once the fence is back the input runs
+//! once, in the stage attempt it already had.
 //! Unrun until the candidate's validation.
 
 use super::*;
@@ -32,6 +33,9 @@ const MODEL: &str = "claude-sonnet-4-5";
 /// window, two acquires under the 1 s renew timeout and a renew held to the
 /// 1 s interval).
 const GAP: Duration = Duration::from_secs(12);
+/// What the turn's answer may take beyond one dispatch wait bound from the
+/// stop: the agent's retry backoff before it reaches the fence.
+const ANSWER_SLACK: Duration = Duration::from_secs(5);
 
 /// How the row stops the writer, shared by the host and the model.
 #[derive(Default)]
@@ -42,6 +46,8 @@ struct GapControl {
     acquires_fail_until: StdMutex<Option<tokio::time::Instant>>,
     /// The realm, once it is open.
     realm: std::sync::OnceLock<std::sync::Weak<SpiRealm>>,
+    /// When the writer's window read closed after the stop.
+    stopped_at: StdMutex<Option<tokio::time::Instant>>,
 }
 
 impl GapControl {
@@ -74,6 +80,21 @@ impl GapControl {
             }
         })
         .await;
+        if self.writer_stopped() {
+            *self
+                .stopped_at
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(tokio::time::Instant::now());
+        }
+    }
+
+    /// When the writer's window read closed after the stop.
+    fn stopped_at(&self) -> Option<tokio::time::Instant> {
+        *self
+            .stopped_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -434,6 +455,15 @@ async fn an_rpc_turn_whose_run_meets_a_fence_gap_is_suspended_and_runs_once_the_
             .and_then(serde_json::Value::as_str),
         Some("requeued_across_stop"),
         "the turn answers that its input stays queued: {error:?}"
+    );
+    let answered_after = tokio::time::Instant::now().duration_since(
+        control
+            .stopped_at()
+            .expect("the writer stopped during the run"),
+    );
+    assert!(
+        answered_after <= realm.dispatch_wait_bound() + ANSWER_SLACK,
+        "the turn is answered within one dispatch wait of the stop: {answered_after:?}"
     );
 
     let started = tokio::time::Instant::now();

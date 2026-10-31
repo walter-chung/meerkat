@@ -6,7 +6,8 @@
 //! renew never answers) and fails retryably, and every acquire fails for
 //! longer than the realm's dispatch wait bound: the retry waits at the fence,
 //! and when no re-acquire restores the writer the member's run is suspended,
-//! not failed. Its bounded turn answers that the input stays queued
+//! not failed. Its bounded turn answers, within one dispatch wait bound of
+//! the stop, that the input stays queued
 //! (`BoundedTurnFailure::RequeuedAcrossStop`), and once the fence is back the
 //! input runs once, in the stage attempt it already had. Unrun until the
 //! candidate's validation.
@@ -30,6 +31,10 @@ const WAIT: Duration = Duration::from_secs(60);
 /// 1 s interval).
 const GAP: Duration = Duration::from_secs(12);
 
+/// What the member's answer may take beyond one dispatch wait bound from
+/// the stop: the agent's retry backoff before it reaches the fence.
+const ANSWER_SLACK: Duration = Duration::from_secs(5);
+
 type Service = meerkat_session::PersistentSessionService<meerkat::FactoryAgentBuilder>;
 
 /// How the row stops the writer, shared by the host and the model.
@@ -41,6 +46,8 @@ struct GapControl {
     acquires_fail_until: Mutex<Option<tokio::time::Instant>>,
     /// The realm, once it is open.
     realm: OnceLock<std::sync::Weak<SpiRealm>>,
+    /// When the writer's window read closed after the stop.
+    stopped_at: Mutex<Option<tokio::time::Instant>>,
 }
 
 impl GapControl {
@@ -73,6 +80,21 @@ impl GapControl {
             }
         })
         .await;
+        if self.writer_stopped() {
+            *self
+                .stopped_at
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(tokio::time::Instant::now());
+        }
+    }
+
+    /// When the writer's window read closed after the stop.
+    fn stopped_at(&self) -> Option<tokio::time::Instant> {
+        *self
+            .stopped_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -312,6 +334,15 @@ async fn a_member_turn_that_meets_a_fence_gap_is_suspended_and_runs_once_the_fen
         ),
         "the member's turn answers that its input stays queued: {:?}",
         answer.as_ref().map(|_| ()).map_err(ToString::to_string)
+    );
+    let answered_after = tokio::time::Instant::now().duration_since(
+        control
+            .stopped_at()
+            .expect("the writer stopped during the member's run"),
+    );
+    assert!(
+        answered_after <= realm.dispatch_wait_bound() + ANSWER_SLACK,
+        "the member's turn is answered within one dispatch wait of the stop: {answered_after:?}"
     );
 
     let started = tokio::time::Instant::now();

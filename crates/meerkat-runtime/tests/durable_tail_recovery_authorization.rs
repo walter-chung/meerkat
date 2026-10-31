@@ -1266,10 +1266,10 @@ fn a_fence_gap_suspends_a_durable_in_flight_run_and_the_registration_resumes_it(
 
 /// A cancel a run accepted before a store fence gap survives the gap's
 /// suspension as the run's stop intent, and a stop of the suspended run is
-/// recorded the same way: such a run never resumes, and settling it ends the
-/// mark. A registration draining for its unregister refuses a stop of its
-/// resumable run, which is the next start's. Unrun: written while Cargo is not
-/// run.
+/// recorded the same way: such a run never resumes, it is never settled as a
+/// refused resume, and settling it as cancelled ends the mark. A
+/// registration draining for its unregister refuses a stop of its resumable
+/// run, which is the next start's. Unrun: written while Cargo is not run.
 #[test]
 fn a_stop_intent_survives_a_fence_gap_and_the_stopped_run_never_resumes() {
     let run = mm_dsl::RunId("run-in-flight".to_string());
@@ -1346,6 +1346,18 @@ fn a_stop_intent_survives_a_fence_gap_and_the_stopped_run_never_resumes() {
         mm_dsl::MeerkatMachineMutator::apply(&mut resumed_after_stop, resume()).is_err(),
         "a run stopped while suspended never resumes"
     );
+    assert!(
+        mm_dsl::MeerkatMachineMutator::apply(
+            &mut suspended,
+            mm_dsl::MeerkatMachineInput::SettleResumableRun {
+                run_id: run.clone(),
+                reason: mm_dsl::InputAbandonReason::ResumeRefused,
+            },
+        )
+        .is_err(),
+        "a run whose stop was asked is not settled as a refused resume"
+    );
+    assert_eq!(suspended.state().resumable_run_id, Some(run.clone()));
     mm_dsl::MeerkatMachineMutator::apply(
         &mut suspended,
         mm_dsl::MeerkatMachineInput::SettleResumableRun {

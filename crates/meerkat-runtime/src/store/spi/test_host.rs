@@ -75,6 +75,9 @@ pub(crate) struct Faults {
     pub(crate) renew_hang: u32,
     /// Acquires that answer `Unavailable`.
     pub(crate) acquire_unavailable: u32,
+    /// Acquires that never answer and grant nothing: the realm's acquire
+    /// timeout gives up on them.
+    pub(crate) acquire_hang: u32,
     /// How long every acquire takes to answer: the host decides when the
     /// call arrives, and the answer reaches the caller this much later, as
     /// over a slow network.
@@ -294,14 +297,21 @@ impl TestHost {
 impl HostStore for TestHost {
     async fn acquire_fence(&self, mode: AcquireMode) -> Result<FenceGrant, HostStoreError> {
         self.record(HostCall::AcquireFence);
-        let delay = {
+        let (delay, hang) = {
             let mut faults = self.faults();
             if faults.acquire_unavailable > 0 {
                 faults.acquire_unavailable -= 1;
                 return Err(HostStoreError::Unavailable("injected".into()));
             }
-            faults.acquire_delay
+            let hang = faults.acquire_hang > 0;
+            if hang {
+                faults.acquire_hang -= 1;
+            }
+            (faults.acquire_delay, hang)
         };
+        if hang {
+            std::future::pending::<()>().await;
+        }
         let answer = self.decide_acquire(mode);
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;

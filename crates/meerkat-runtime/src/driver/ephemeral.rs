@@ -9507,6 +9507,84 @@ mod tests {
         );
     }
 
+    /// A stop recorded on a run a store fence gap suspended stands at a
+    /// graceful requeue stop that begins later: the stop classifier keeps
+    /// none of the stopped run's inputs (they end under the stop) and still
+    /// keeps the session's eligible queued prompt. The resumed-run plan
+    /// refuses the stopped run as well (it mirrors `ResumeRun`'s
+    /// `run_not_stopped`). Before, the requeue stop kept the stopped run's
+    /// input bound for the next start, whose fresh machine resumed the run.
+    /// Unrun: written while Cargo is not run.
+    #[tokio::test]
+    async fn a_requeue_stop_keeps_no_input_of_a_suspended_run_whose_stop_was_asked() {
+        use crate::meerkat_machine::driver::{DriverEntry, machine_suspend_run_for_stop};
+        use crate::meerkat_machine::dsl::command_capabilities::AuthorizedResumedRun;
+
+        let (mut driver, durable_id, _ephemeral_id, staged_id) =
+            stop_classification_fixture("stopped-suspended-run-requeue").await;
+        let run_id = driver
+            .current_run_id()
+            .expect("the fixture's run is current");
+        let dsl_run = mm_dsl::RunId::from_domain(&run_id);
+        driver
+            .dsl_apply(
+                mm_dsl::MeerkatMachineInput::StartConversationRun {
+                    run_id: dsl_run.clone(),
+                    primitive_kind: mm_dsl::TurnPrimitiveKind::ConversationTurn,
+                    admitted_content_shape: mm_dsl::ContentShape::Conversation,
+                    vision_enabled: false,
+                    image_tool_results_enabled: false,
+                    max_extraction_retries: 0,
+                },
+                "StartConversationRun",
+            )
+            .expect("the run's turn starts");
+        let mut entry = DriverEntry::Ephemeral(driver);
+        assert!(
+            machine_suspend_run_for_stop(
+                &mut entry,
+                &run_id,
+                true,
+                mm_dsl::RunSuspensionCause::FenceGap
+            )
+            .expect("the machine answers"),
+            "a fence gap suspends the run"
+        );
+        let DriverEntry::Ephemeral(mut driver) = entry else {
+            panic!("the entry stays ephemeral");
+        };
+        driver
+            .dsl_apply(
+                mm_dsl::MeerkatMachineInput::StopCurrentRunForRun {
+                    run_id: dsl_run.clone(),
+                },
+                "StopCurrentRunForRun",
+            )
+            .expect("a stop of the suspended run is recorded");
+        assert!(
+            driver.with_dsl_state(|state| {
+                AuthorizedResumedRun::authorize_resumed_run_from_state(state, &dsl_run).is_none()
+            }),
+            "the resumed-run plan refuses a run whose stop was asked"
+        );
+
+        begin_unregister_with(
+            &mut driver,
+            mm_dsl::UnregisterQueuedInputsDisposition::Requeue,
+            900_000,
+        );
+        let active = driver.active_input_ids();
+        let retained = driver.stop_retained_input_ids(&active).unwrap();
+        assert!(
+            !retained.contains(&staged_id),
+            "the stopped run's input is not kept for the next start: {retained:?}"
+        );
+        assert!(
+            retained.contains(&durable_id),
+            "the eligible queued prompt is still kept: {retained:?}"
+        );
+    }
+
     /// A store fence gap suspends the in-flight run outside any stop: the
     /// run stops being current and is marked resumable, and its staged input
     /// keeps its phase, its run and its stage attempts, with no stop mark.

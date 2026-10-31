@@ -1388,6 +1388,45 @@ async fn concurrent_dispatches_share_one_reacquire() {
     );
 }
 
+// Unrun until the candidate's validation. During an outage, waits that give
+// up (a resume lap's, or a dispatch's at its bound) leave no re-acquire of
+// their own behind: every caller of the stopped writer joins the one
+// re-acquire in flight, so the realm runs one at a time however many waits
+// start and give up. Here every acquire hangs until the realm's acquire
+// timeout, and twenty waits each give up after 100 ms: one task at most is
+// left. Before, each wait spawned a re-acquire task of its own, which stayed
+// queued behind the others after its caller gave up, for as long as the
+// outage lasted.
+#[tokio::test(start_paused = true)]
+async fn waits_that_give_up_during_an_outage_leave_one_reacquire_in_flight() {
+    use meerkat_core::host_store::SelfFence;
+    let timing = FenceTiming::try_new(Duration::from_secs(1), Duration::from_secs(3)).unwrap();
+    let host = Arc::new(TestHost::with_timing(timing));
+    let (realm, _store) = open(&host).await;
+    {
+        let mut faults = host.faults.lock().unwrap();
+        faults.renew_unavailable = 1;
+        faults.acquire_hang = 1000;
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !realm.lease_is_live(),
+        "the failed renew stopped the writer"
+    );
+    let metrics = tokio::runtime::Handle::current().metrics();
+    let alive_before = metrics.num_alive_tasks();
+    for _ in 0..20 {
+        let _ = tokio::time::timeout(Duration::from_millis(100), realm.dispatch_window()).await;
+    }
+    let alive_after = metrics.num_alive_tasks();
+    assert!(
+        alive_after <= alive_before + 1,
+        "the waits that gave up left one re-acquire in flight at most: \
+         {alive_before} tasks before, {alive_after} after"
+    );
+    assert!(realm.realm_poisoned().is_none());
+}
+
 // Unrun until the candidate's validation. The bound covers the re-acquire at
 // Core's default timing and at every timing advised to hosts with a slow
 // store (interval / renew timeout / margin / lease): after the re-acquire's
