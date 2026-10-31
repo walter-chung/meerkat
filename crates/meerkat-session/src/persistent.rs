@@ -1113,12 +1113,74 @@ struct StoreCheckpointer {
     rebase_outcome_unknown: std::sync::Mutex<Option<RunId>>,
     /// The run the runtime dispatched to this actor, while the service
     /// applies it: a store fence gap that run meets suspends it, for the
-    /// runtime to resume. `None` outside a runtime turn (a direct turn has
-    /// no runtime run to suspend).
+    /// runtime to resume. `None` outside a runtime turn.
     runtime_run: std::sync::Mutex<Option<RunId>>,
+    /// A direct service turn open on this actor, while the service runs it
+    /// (no runtime run is then dispatched here): a store fence gap the
+    /// turn's run meets suspends that run too, and is recorded here for the
+    /// turn ([`ServiceTurnGuard::take_fence_gap_suspension`]).
+    service_turn: std::sync::Mutex<ServiceTurnSlot>,
     /// Suspends this actor's live run for a store fence gap; attached once
     /// the actor exists.
     run_suspension: std::sync::OnceLock<crate::ephemeral::RunSuspensionHandle>,
+}
+
+/// Whether a direct service turn is open on a store checkpointer's actor,
+/// and what a store fence gap did to its run.
+#[derive(Debug)]
+enum ServiceTurnSlot {
+    /// No direct turn is open.
+    Closed,
+    /// A direct turn is open, and no fence gap suspended its run.
+    Open,
+    /// A store fence gap suspended the open turn's run: the session task
+    /// drops the turn there, and the turn answers `refusal`, retryable,
+    /// once the runtime has stopped and suspended the run.
+    Suspended { run_id: RunId, refusal: AgentError },
+}
+
+/// Closes the direct service turn open on a store checkpointer's actor
+/// ([`StoreCheckpointer::open_service_turn`]) when the turn ends.
+struct ServiceTurnGuard {
+    checkpointer: std::sync::Weak<StoreCheckpointer>,
+}
+
+impl ServiceTurnGuard {
+    /// The refusal the turn answers when a store fence gap suspended its
+    /// run `run_id` ([`StoreCheckpointer::dispatch_fence_ready`] or a round
+    /// commit's wait); `None` when no gap suspended that run, as for a run a
+    /// graceful requeue stop suspended.
+    fn take_fence_gap_suspension(&self, run_id: &RunId) -> Option<AgentError> {
+        let checkpointer = self.checkpointer.upgrade()?;
+        let mut slot = checkpointer
+            .service_turn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ServiceTurnSlot::Suspended {
+            run_id: suspended, ..
+        } = &*slot
+        else {
+            return None;
+        };
+        if suspended != run_id {
+            return None;
+        }
+        match std::mem::replace(&mut *slot, ServiceTurnSlot::Open) {
+            ServiceTurnSlot::Suspended { refusal, .. } => Some(refusal),
+            ServiceTurnSlot::Closed | ServiceTurnSlot::Open => None,
+        }
+    }
+}
+
+impl Drop for ServiceTurnGuard {
+    fn drop(&mut self) {
+        if let Some(checkpointer) = self.checkpointer.upgrade() {
+            *checkpointer
+                .service_turn
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = ServiceTurnSlot::Closed;
+        }
+    }
 }
 
 /// What a refused checkpoint (a round commit or a closing save) met at the
@@ -3139,7 +3201,11 @@ impl meerkat_core::SessionCheckpointer for StoreCheckpointer {
                 self.checkpoint_run_once(session, run_id, previous).await
             }
             CommitFenceGap::Closed(window) => {
-                if round_commit && self.suspend_runtime_run(run_id) {
+                if round_commit
+                    && self.suspend_run_at_fence_gap(run_id, || {
+                        self.commit_fence_gap_refusal(window, &error)
+                    })
+                {
                     tracing::warn!(
                         %run_id,
                         %error,
@@ -3147,8 +3213,8 @@ impl meerkat_core::SessionCheckpointer for StoreCheckpointer {
                         window = ?window.window,
                         "a round commit met a store fence gap: the session store's writer stayed \
                          stopped through the commit's wait and no other writer was found; the run \
-                         is suspended and resumes from its last round commit once the fence is \
-                         back"
+                         is suspended at its last round commit, for the runtime to resume or settle \
+                         once the fence is back"
                     );
                     return std::future::pending().await;
                 }
@@ -3270,14 +3336,15 @@ impl meerkat_core::SessionCheckpointer for StoreCheckpointer {
             return Err(self.dispatch_fence_refusal(window));
         }
         if let Some(run_id) = suspendable_run
-            && self.suspend_runtime_run(run_id)
+            && self.suspend_run_at_fence_gap(run_id, || self.fence_gap_refusal(window))
         {
             tracing::warn!(
                 %run_id,
                 elapsed = ?window.elapsed,
                 window = ?window.window,
                 "the session store's writer stayed stopped through the run's dispatch wait and no \
-                 other writer was found; the run is suspended and resumes once the fence is back"
+                 other writer was found; the run is suspended at its last round commit, for the \
+                 runtime to resume or settle once the fence is back"
             );
             return std::future::pending().await;
         }
@@ -3358,20 +3425,56 @@ impl StoreCheckpointer {
     }
 
     /// Ask the session task to suspend `run_id` for a store fence gap, when
-    /// it is the run the runtime dispatched to this actor and the actor's
-    /// suspension handle is attached; whether the suspension was asked.
-    fn suspend_runtime_run(&self, run_id: &RunId) -> bool {
+    /// it is the run of this actor's open turn and the actor's suspension
+    /// handle is attached; whether the suspension was asked. The run is the
+    /// run the runtime dispatched to this actor, which the runtime then
+    /// suspends and resumes once the fence is back, or the run of a direct
+    /// service turn open on it (no runtime run is dispatched here then): the
+    /// suspension is recorded for that turn with `refusal`, the retryable
+    /// refusal it answers once the runtime has stopped and suspended the run
+    /// ([`ServiceTurnGuard::take_fence_gap_suspension`]).
+    fn suspend_run_at_fence_gap(
+        &self,
+        run_id: &RunId,
+        refusal: impl FnOnce() -> AgentError,
+    ) -> bool {
         let runtime_run = self
             .runtime_run
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        if runtime_run.as_ref() != Some(run_id) {
+        let mut service_turn = self
+            .service_turn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let direct_run = runtime_run.is_none() && matches!(&*service_turn, ServiceTurnSlot::Open);
+        if runtime_run.as_ref() != Some(run_id) && !direct_run {
             return false;
         }
-        self.run_suspension
+        let asked = self
+            .run_suspension
             .get()
-            .is_some_and(|suspension| suspension.suspend_if_current(run_id))
+            .is_some_and(|suspension| suspension.suspend_if_current(run_id));
+        if asked && direct_run {
+            *service_turn = ServiceTurnSlot::Suspended {
+                run_id: run_id.clone(),
+                refusal: refusal(),
+            };
+        }
+        asked
+    }
+
+    /// Open a direct service turn on this actor until the returned guard
+    /// drops: a store fence gap the turn's run meets then suspends the run
+    /// ([`Self::suspend_run_at_fence_gap`]).
+    fn open_service_turn(self: &Arc<Self>) -> ServiceTurnGuard {
+        *self
+            .service_turn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = ServiceTurnSlot::Open;
+        ServiceTurnGuard {
+            checkpointer: Arc::downgrade(self),
+        }
     }
 
     /// Record `run_id` as the run the runtime dispatched to this actor until
@@ -3409,6 +3512,28 @@ impl StoreCheckpointer {
              since its last acquire or renew started, window {:?}, renew failed: {}) and no \
              other writer was found; nothing was dispatched, and the turn can be retried once \
              the store's fence is back",
+            self.session_label(),
+            window.elapsed,
+            window.window,
+            window.renew_failed
+        ))
+    }
+
+    /// The retryable refusal a direct turn answers when its round commit was
+    /// refused (`error`) while the store's writer was stopped, the writer
+    /// stayed stopped through the commit's whole wait with no other writer
+    /// found (a store fence gap), and its run was suspended there: the round
+    /// was not written, and nothing proves another owner.
+    fn commit_fence_gap_refusal(
+        &self,
+        window: meerkat_core::host_store::SelfFenceWindow,
+        error: &AgentError,
+    ) -> AgentError {
+        AgentError::StoreError(format!(
+            "{}: this writer's self-fence window stayed closed through its round commit's wait \
+             ({:?} since its last acquire or renew started, window {:?}, renew failed: {}) and no \
+             other writer was found; the round was not written ({error}), and the turn can be \
+             retried once the store's fence is back",
             self.session_label(),
             window.elapsed,
             window.window,
@@ -12369,6 +12494,9 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         let resumable_run_id = self.runtime_resumable_run_id(id).await;
         self.forget_other_runs_checkpoint_receipt(id, resumable_run_id.as_ref())
             .await;
+        // A store fence gap the turn's run meets suspends the run on the
+        // actor, as it suspends a runtime run, instead of failing it there.
+        let service_turn = self.open_service_turn(id).await;
         let execution = match admission.take() {
             Some(admission) => {
                 self.inner
@@ -12393,6 +12521,29 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         let result = match result.map_err(SessionError::Agent) {
             Ok(result) => result,
             Err(error) => {
+                // The session task dropped the turn at a store fence gap,
+                // with no terminal and no closing save. The runtime records
+                // the run's stop and suspends it, so it never resumes and is
+                // settled once the store's fence is back: no write meets the
+                // gap, and the turn answers its retryable refusal now.
+                if let SessionError::Agent(AgentError::RunSuspended { run_id }) = &error
+                    && let Some(refusal) = service_turn
+                        .as_ref()
+                        .and_then(|turn| turn.take_fence_gap_suspension(run_id))
+                {
+                    drop(turn_guard);
+                    return Err((
+                        self.stop_service_turn_run_at_fence_gap(
+                            id,
+                            protocol,
+                            turn_identity,
+                            run_id,
+                            refusal,
+                        )
+                        .await,
+                        None,
+                    ));
+                }
                 let terminal_error = match machine_terminal_failure.as_ref() {
                     Some(witness) => Self::terminal_surface_error(error, witness),
                     None => error,
@@ -12427,6 +12578,69 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         }
 
         Ok(result)
+    }
+
+    /// Stop and suspend the run of a direct turn that a store fence gap
+    /// suspended on the actor, through the runtime, and return the error the
+    /// turn answers: `refusal`, the gap's retryable store error. The runtime
+    /// records the run's stop, marks it resumable and wakes its loop, which
+    /// settles the run as cancelled once the store's fence is back; until
+    /// then a direct turn is refused busy. When the runtime refuses the
+    /// suspension (the registration drains for its unregister), the run the
+    /// session task dropped stays current with no terminal, so the session's
+    /// runtime reloads from the store, as after any write that may have
+    /// diverged, and the turn still answers `refusal`.
+    async fn stop_service_turn_run_at_fence_gap(
+        &self,
+        id: &SessionId,
+        protocol: MachineServiceTurnCommitProtocol<'_>,
+        turn_identity: &meerkat_runtime::MachineServiceTurnIdentity,
+        run_id: &RunId,
+        refusal: AgentError,
+    ) -> SessionError {
+        let refused = match protocol
+            .runtime_adapter
+            .stop_and_suspend_service_turn_for_fence_gap(turn_identity, run_id)
+            .await
+        {
+            Ok(true) => {
+                tracing::warn!(
+                    session_id = %id,
+                    %run_id,
+                    "a store fence gap met the direct turn's run: the run is stopped and \
+                     suspended, and its runtime settles it once the store's fence is back"
+                );
+                return SessionError::Agent(refusal);
+            }
+            Ok(false) => "the runtime refused to suspend it".to_string(),
+            Err(error) => error.to_string(),
+        };
+        tracing::error!(
+            session_id = %id,
+            %run_id,
+            %refused,
+            "a store fence gap met the direct turn's run and the run was not suspended; the \
+             session's runtime reloads from the store"
+        );
+        if !protocol
+            .runtime_adapter
+            .require_session_durability_reload(
+                id,
+                "service_turn_fence_gap_suspension",
+                format!(
+                    "direct turn run {run_id} was dropped at a store fence gap and not \
+                     suspended: {refused}"
+                ),
+            )
+            .await
+        {
+            tracing::warn!(
+                session_id = %id,
+                %run_id,
+                "no persistent runtime registration to degrade for the unsuspended run"
+            );
+        }
+        SessionError::Agent(refusal)
     }
 
     pub async fn event_log_latest_seq(&self, id: &SessionId) -> Result<Option<u64>, SessionError> {
@@ -15625,6 +15839,22 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         Some(checkpointer.enter_runtime_run(run_id))
     }
 
+    /// Open a direct service turn on `id`'s live actor until the returned
+    /// guard drops: a store fence gap the turn's run meets on that actor's
+    /// checkpointer then suspends the run and is recorded for the turn
+    /// (`StoreCheckpointer::suspend_run_at_fence_gap`). `None` when no live
+    /// actor checkpointer is registered.
+    async fn open_service_turn(&self, id: &SessionId) -> Option<ServiceTurnGuard> {
+        let checkpointer = self
+            .live_checkpointers
+            .lock()
+            .await
+            .get(id)
+            .cloned()
+            .and_then(|checkpointer| checkpointer.upgrade())?;
+        Some(checkpointer.open_service_turn())
+    }
+
     /// Forget a provisional receipt, and the run cursor held beside it, that
     /// the session's live actor holds for a run other than `keep`, as a turn
     /// starts on that actor.
@@ -16789,6 +17019,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             latest_run_checkpoint_cursor: std::sync::Mutex::new(None),
             rebase_outcome_unknown: std::sync::Mutex::new(None),
             runtime_run: std::sync::Mutex::new(None),
+            service_turn: std::sync::Mutex::new(ServiceTurnSlot::Closed),
             run_suspension: std::sync::OnceLock::new(),
             rewrite_audit: self
                 .event_store
@@ -22761,6 +22992,7 @@ mod tests {
             latest_run_checkpoint_cursor: std::sync::Mutex::new(None),
             rebase_outcome_unknown: std::sync::Mutex::new(None),
             runtime_run: std::sync::Mutex::new(None),
+            service_turn: std::sync::Mutex::new(ServiceTurnSlot::Closed),
             run_suspension: std::sync::OnceLock::new(),
             rewrite_audit: None,
         };
@@ -22969,6 +23201,7 @@ mod tests {
             latest_run_checkpoint_cursor: std::sync::Mutex::new(None),
             rebase_outcome_unknown: std::sync::Mutex::new(None),
             runtime_run: std::sync::Mutex::new(None),
+            service_turn: std::sync::Mutex::new(ServiceTurnSlot::Closed),
             run_suspension: std::sync::OnceLock::new(),
             rewrite_audit: None,
         };
@@ -23150,6 +23383,7 @@ mod tests {
             latest_run_checkpoint_cursor: std::sync::Mutex::new(None),
             rebase_outcome_unknown: std::sync::Mutex::new(None),
             runtime_run: std::sync::Mutex::new(None),
+            service_turn: std::sync::Mutex::new(ServiceTurnSlot::Closed),
             run_suspension: std::sync::OnceLock::new(),
             rewrite_audit: None,
         };
@@ -30103,6 +30337,7 @@ mod tests {
             latest_run_checkpoint_cursor: std::sync::Mutex::new(None),
             rebase_outcome_unknown: std::sync::Mutex::new(None),
             runtime_run: std::sync::Mutex::new(None),
+            service_turn: std::sync::Mutex::new(ServiceTurnSlot::Closed),
             run_suspension: std::sync::OnceLock::new(),
             rewrite_audit: None,
         };
@@ -30184,6 +30419,7 @@ mod tests {
             latest_run_checkpoint_cursor: std::sync::Mutex::new(None),
             rebase_outcome_unknown: std::sync::Mutex::new(None),
             runtime_run: std::sync::Mutex::new(None),
+            service_turn: std::sync::Mutex::new(ServiceTurnSlot::Closed),
             run_suspension: std::sync::OnceLock::new(),
             rewrite_audit: None,
         };
@@ -30392,6 +30628,7 @@ mod tests {
             latest_run_checkpoint_cursor: std::sync::Mutex::new(None),
             rebase_outcome_unknown: std::sync::Mutex::new(None),
             runtime_run: std::sync::Mutex::new(None),
+            service_turn: std::sync::Mutex::new(ServiceTurnSlot::Closed),
             run_suspension: std::sync::OnceLock::new(),
             rewrite_audit: None,
         };
@@ -35244,6 +35481,7 @@ mod tests {
             latest_run_checkpoint_cursor: std::sync::Mutex::new(None),
             rebase_outcome_unknown: std::sync::Mutex::new(None),
             runtime_run: std::sync::Mutex::new(None),
+            service_turn: std::sync::Mutex::new(ServiceTurnSlot::Closed),
             run_suspension: std::sync::OnceLock::new(),
             rewrite_audit: None,
         };
@@ -35517,6 +35755,7 @@ mod tests {
             latest_run_checkpoint_cursor: std::sync::Mutex::new(None),
             rebase_outcome_unknown: std::sync::Mutex::new(None),
             runtime_run: std::sync::Mutex::new(None),
+            service_turn: std::sync::Mutex::new(ServiceTurnSlot::Closed),
             run_suspension: std::sync::OnceLock::new(),
             rewrite_audit: None,
         };
@@ -35603,6 +35842,7 @@ mod tests {
             latest_run_checkpoint_cursor: std::sync::Mutex::new(None),
             rebase_outcome_unknown: std::sync::Mutex::new(None),
             runtime_run: std::sync::Mutex::new(None),
+            service_turn: std::sync::Mutex::new(ServiceTurnSlot::Closed),
             run_suspension: std::sync::OnceLock::new(),
             rewrite_audit: None,
         };
@@ -36244,6 +36484,7 @@ mod tests {
             latest_run_checkpoint_cursor: std::sync::Mutex::new(None),
             rebase_outcome_unknown: std::sync::Mutex::new(None),
             runtime_run: std::sync::Mutex::new(None),
+            service_turn: std::sync::Mutex::new(ServiceTurnSlot::Closed),
             run_suspension: std::sync::OnceLock::new(),
             rewrite_audit: None,
         };
@@ -36725,6 +36966,7 @@ mod tests {
             latest_run_checkpoint_cursor: std::sync::Mutex::new(None),
             rebase_outcome_unknown: std::sync::Mutex::new(None),
             runtime_run: std::sync::Mutex::new(None),
+            service_turn: std::sync::Mutex::new(ServiceTurnSlot::Closed),
             run_suspension: std::sync::OnceLock::new(),
             rewrite_audit: audit.map(|(event_store, projector)| RewriteAuditSink {
                 event_store,
@@ -37339,6 +37581,7 @@ mod tests {
             latest_run_checkpoint_cursor: std::sync::Mutex::new(None),
             rebase_outcome_unknown: std::sync::Mutex::new(None),
             runtime_run: std::sync::Mutex::new(None),
+            service_turn: std::sync::Mutex::new(ServiceTurnSlot::Closed),
             run_suspension: std::sync::OnceLock::new(),
             rewrite_audit: None,
         };
@@ -40889,6 +41132,7 @@ mod tests {
             latest_run_checkpoint_cursor: std::sync::Mutex::new(None),
             rebase_outcome_unknown: std::sync::Mutex::new(None),
             runtime_run: std::sync::Mutex::new(None),
+            service_turn: std::sync::Mutex::new(ServiceTurnSlot::Closed),
             run_suspension: std::sync::OnceLock::new(),
             rewrite_audit: None,
         }
@@ -48435,6 +48679,7 @@ mod tests {
             latest_run_checkpoint_cursor: std::sync::Mutex::new(None),
             rebase_outcome_unknown: std::sync::Mutex::new(None),
             runtime_run: std::sync::Mutex::new(None),
+            service_turn: std::sync::Mutex::new(ServiceTurnSlot::Closed),
             run_suspension: std::sync::OnceLock::new(),
             rewrite_audit: None,
         });
