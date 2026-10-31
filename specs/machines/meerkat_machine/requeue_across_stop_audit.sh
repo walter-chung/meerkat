@@ -26,12 +26,15 @@
 # overlaps Retain, a requeued wait-failure arm that writes state, is
 # guarded on the session or answers any failure, a suspend of a run whose
 # turn terminal is published, and a staged-row normalization that requeues
-# the suspended run's input. It then seeds three fence-gap defects (a
+# the suspended run's input. It then seeds seven fence-gap defects (a
 # fence-gap suspension that leaves the run's turn mid-flight, one that spends
-# a stage attempt, one that ignores the draining registration) and checks
-# each against its target invariant alone, with the generated invariants and
-# the audit's others left out of that run. An anchor this script expects but
-# cannot find fails the run.
+# a stage attempt, one that ignores the draining registration, one that
+# drops a cancel the run accepted before the gap, one that suspends a run
+# whose turn already ended, one that unbinds the run's input, and a resume
+# of a run whose stop was asked) and checks each against its target
+# invariant alone, with the generated invariants and the audit's others left
+# out of that run. An anchor this script expects but cannot find fails the
+# run.
 set -euo pipefail
 
 usage="usage: requeue_across_stop_audit.sh <max-steps> [--mutants] [extra tlc args...]"
@@ -139,7 +142,9 @@ INVARIANTS
   AuditRequeuedWaitResolvesInEveryPhase
   AuditFenceGapTurnResettable
   AuditFenceGapKeepsAttempts
-  AuditFenceGapNeverWhileDraining${extra}" "${cfg}"
+  AuditFenceGapNeverWhileDraining
+  AuditFenceGapKeepsStopIntent
+  AuditStoppedGapRunNeverResumes${extra}" "${cfg}"
   replace_exact_line "  CiStateConstraint" "  AuditStateConstraint" "${cfg}"
   printf 'CHECK_DEADLOCK FALSE\n' >> "${cfg}"
 }
@@ -210,7 +215,7 @@ fi
 
 for witness in RetainedRunsAfterGracefulStop RetainedRunsAfterCrash ExpiredSettled \
   StagedNotRetained StopAbandonsEligible PlainStopAbandons RequeuedWaitAnswered \
-  SuspendedRunResumes FenceGapRunResumes; do
+  SuspendedRunResumes FenceGapRunResumes IdleFenceGapRunResumes; do
   cfg="${work_dir}/witness-${witness}.cfg"
   write_cfg "${cfg}" TRUE "
   NotAuditWitness${witness}"
@@ -542,18 +547,38 @@ PY
   # state maps consistent: it changes one fact of the two fence-gap arms.
   export GAP_ARMS="SuspendRunForStopFenceGapRunningToIdle SuspendRunForStopFenceGapRunningToAttached"
   cat > "${work_dir}/gap_mutation.py" <<'PY'
-import os
+import os, re
+
+def edit_arm(text, arm, select, rewrite):
+    start = text.index("\n" + arm + "(") + 1
+    end = text.index("\n\n", start)
+    lines = text[start:end].split("\n")
+    hits = [i for i, line in enumerate(lines) if select(line)]
+    assert len(hits) == 1, f"expected one matching line in {arm}, found {len(hits)}"
+    lines[hits[0]] = rewrite(lines[hits[0]], text)
+    return text[:start] + "\n".join(lines) + text[end:]
 
 def edit_gap_arms(text, select, rewrite):
     for arm in os.environ["GAP_ARMS"].split():
-        start = text.index("\n" + arm + "(") + 1
-        end = text.index("\n\n", start)
-        lines = text[start:end].split("\n")
-        hits = [i for i, line in enumerate(lines) if select(line)]
-        assert len(hits) == 1, f"expected one matching line in {arm}, found {len(hits)}"
-        lines[hits[0]] = rewrite(lines[hits[0]], text)
-        text = text[:start] + "\n".join(lines) + text[end:]
+        text = edit_arm(text, arm, select, rewrite)
     return text
+
+def is_frame(line):
+    return re.fullmatch(r"    /\\ UnchangedFrame_[0-9a-f]+", line) is not None
+
+def frame_with(var, assignment):
+    """Rewrite an arm's frame line so that `var` takes `assignment` and the
+    frame keeps every other variable unchanged."""
+    def rewrite(line, model):
+        name = line.split()[-1]
+        definition = re.search(r"(?m)^" + name + r" == UNCHANGED << (.*) >>$", model)
+        assert definition, f"frame {name} not found"
+        listed = [v.strip() for v in definition.group(1).split(",")]
+        kept = [v for v in listed if v != var]
+        assert len(kept) + 1 == len(listed), f"{var} is not in the frame"
+        return (f"    /\\ {var}' = {assignment}\n"
+                "    /\\ UNCHANGED << " + ", ".join(kept) + " >>")
+    return rewrite
 PY
 
   # usage: mutate_target <name> <target invariant>; reads a python edit on
@@ -597,24 +622,34 @@ PY
   # The suspension spends a stage attempt of every tracked input, as a
   # release to the lanes and a new staging would.
   mutate_target gap_spends_an_attempt AuditFenceGapKeepsAttempts <<'PY'
-import os, re
-from gap_mutation import edit_gap_arms
+import os
+from gap_mutation import edit_gap_arms, frame_with, is_frame
 path = os.environ["MODEL"]
 text = open(path).read()
-
-def spend(line, model):
-    name = line.split()[-1]
-    definition = re.search(r"(?m)^" + name + r" == UNCHANGED << (.*) >>$", model)
-    assert definition, f"frame {name} not found"
-    kept = [v.strip() for v in definition.group(1).split(",") if v.strip() != "input_attempt_counts"]
-    assert len(kept) + 1 == len(definition.group(1).split(",")), "input_attempt_counts is not in the frame"
-    return ("    /\\ input_attempt_counts' = [i \\in DOMAIN input_attempt_counts |-> input_attempt_counts[i] + 1]\n"
-            "    /\\ UNCHANGED << " + ", ".join(kept) + " >>")
-
 text = edit_gap_arms(
     text,
-    lambda line: re.fullmatch(r"    /\\ UnchangedFrame_[0-9a-f]+", line) is not None,
-    spend,
+    is_frame,
+    frame_with(
+        "input_attempt_counts",
+        "[i \\in DOMAIN input_attempt_counts |-> input_attempt_counts[i] + 1]",
+    ),
+)
+open(path, "w").write(text)
+PY
+
+  # The suspension unbinds A from its run, as a release to the lanes would.
+  mutate_target gap_drops_run_association AuditFenceGapKeepsAttempts <<'PY'
+import os
+from gap_mutation import edit_gap_arms, frame_with, is_frame
+path = os.environ["MODEL"]
+text = open(path).read()
+text = edit_gap_arms(
+    text,
+    is_frame,
+    frame_with(
+        "input_run_associations",
+        '[i \\in (DOMAIN input_run_associations) \\ {"input_1"} |-> input_run_associations[i]]',
+    ),
 )
 open(path, "w").write(text)
 PY
@@ -629,6 +664,52 @@ text = edit_gap_arms(
     text,
     lambda line: line.startswith("    /\\ ") and 'cause = "FenceGap"' in line,
     lambda line, _: '    /\\ (cause = "FenceGap")',
+)
+open(path, "w").write(text)
+PY
+
+  # The suspension drops a cancel the run accepted before the gap: the
+  # resumed turn's start would then clear it.
+  mutate_target gap_drops_cancel_intent AuditFenceGapKeepsStopIntent <<'PY'
+import os
+from gap_mutation import edit_gap_arms
+path = os.environ["MODEL"]
+text = open(path).read()
+text = edit_gap_arms(
+    text,
+    lambda line: line.startswith("    /\\ run_stop_requested' = "),
+    lambda line, _: "    /\\ run_stop_requested' = run_stop_requested",
+)
+open(path, "w").write(text)
+PY
+
+  # The suspension ignores a turn that already ended: a run cancelled before
+  # the gap is marked resumable.
+  mutate_target gap_suspends_terminal_run AuditSuspendedRunNotTerminal <<'PY'
+import os
+from gap_mutation import edit_gap_arms
+path = os.environ["MODEL"]
+text = open(path).read()
+text = edit_gap_arms(
+    text,
+    lambda line: line == "    /\\ (turn_terminal_run_id # Some(run_id))",
+    lambda line, _: "    /\\ TRUE",
+)
+open(path, "w").write(text)
+PY
+
+  # The resume ignores the run's stop intent: a run stopped before or during
+  # the gap runs again.
+  mutate_target resume_ignores_stop AuditStoppedGapRunNeverResumes <<'PY'
+import os
+from gap_mutation import edit_arm
+path = os.environ["MODEL"]
+text = open(path).read()
+text = edit_arm(
+    text,
+    "ResumeRunRunning",
+    lambda line: line == "    /\\ (run_stop_requested # Some(run_id))",
+    lambda line, _: "    /\\ TRUE",
 )
 open(path, "w").write(text)
 PY

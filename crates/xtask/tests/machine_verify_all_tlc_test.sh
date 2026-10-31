@@ -283,15 +283,17 @@ fi
 # Requeue and only when eligible (never objective-bound), that exactly one
 # verdict arm answers each input, and that the requeued wait-failure arm has
 # no session guard and changes no state. A store fence gap suspends the
-# in-flight run of the first process instead, outside any stop: the audit
-# checks that the run's turn returns to a phase a turn start accepts, that
-# its input stays staged with its stage attempts, that no fence-gap
-# suspension comes while the registration drains, and that the same process
-# resumes the run and starts its turn again. It requires nine witnesses
-# reached, a graceful end and a crash among them; its --mutants mode (by
-# hand) refuses seventeen seeded defects against every invariant and three
-# fence-gap defects each against its target invariant alone. 32 steps reach
-# the deepest witness.
+# in-flight run of the first process instead, outside any stop, with an
+# executor attached or none: the audit checks that the run's turn returns to
+# Ready, that its input stays staged and bound with its stage attempts, that
+# no fence-gap suspension comes while the registration drains, that a cancel
+# or stop the run accepted before the gap stands as its stop intent, and
+# that a run whose stop was asked never resumes, while the same process
+# resumes any other suspended run and starts its turn again. It requires ten
+# witnesses reached, a graceful end and a crash among them; its --mutants
+# mode (by hand) refuses seventeen seeded defects against every invariant
+# and seven fence-gap defects each against its target invariant alone. 32
+# steps reach the deepest witness.
 requeue_across_stop_audit="${workspace_root}/specs/machines/meerkat_machine/requeue_across_stop_audit.sh"
 if [[ ! -x "${requeue_across_stop_audit}" ]]; then
   echo "error: requeue-across-stop audit runner is missing from workspace runfiles: ${requeue_across_stop_audit}" >&2

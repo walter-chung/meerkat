@@ -512,6 +512,8 @@ const MEERKAT_TRANSITION_ENUM_LATE_TAIL: &[&str] = &[
     "ReleaseInputControllerStopped",
     "SuspendRunForStopFenceGapRunningToIdle",
     "SuspendRunForStopFenceGapRunningToAttached",
+    "StopCurrentRunForRunResumableIdle",
+    "StopCurrentRunForRunResumableAttached",
 ];
 
 // Append-only emission tails for the other machines, whose public

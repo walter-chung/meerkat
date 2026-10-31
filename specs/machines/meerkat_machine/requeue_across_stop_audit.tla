@@ -86,25 +86,42 @@
 \* A store fence gap suspends A's run in process 1 instead, outside any stop
 \* (SuspendRunForStop with the FenceGap cause): the run's turn has started
 \* (and may have applied its primitive) when the gap comes, no unregister
-\* has begun, or one begins first. The same process then starts the marked
-\* run again (Prepare), resumes it (ResumeRun) and starts its turn again.
-\* Properties of that path (all invariants):
+\* has begun, or one begins first; before the gap the run may also have
+\* accepted a cancel at its next boundary or a stop, or ended its turn
+\* cancelled. A stop may also be asked of the suspended run. The same
+\* process then starts the marked run again (Prepare), resumes it
+\* (ResumeRun) and starts its turn again. The path runs twice: with an
+\* executor attached (the ToAttached arm) and, from a separate setup that
+\* starts the run with none attached and explores nothing else, without
+\* (the ToIdle arm). Properties of that path (all invariants):
 \*
 \*   AuditFenceGapTurnResettable: while the run a fence gap suspended is
-\*     marked resumable, its turn is in a phase a turn start accepts, so the
-\*     in-process resume can start it again.
-\*   AuditFenceGapKeepsAttempts: from the suspension on, A stays Staged and
-\*     keeps the stage attempts it had: no attempt is spent on a fence gap.
+\*     marked resumable, its turn is Ready, so the in-process resume can
+\*     start it again.
+\*   AuditFenceGapKeepsAttempts: from the suspension on, A stays Staged,
+\*     bound to its run, with the stage attempts it had: no attempt is
+\*     spent on a fence gap.
 \*   AuditFenceGapNeverWhileDraining: no fence-gap suspension happens while
 \*     the registration drains for an unregister; such a registration
 \*     suspends only for its stop.
+\*   AuditFenceGapKeepsStopIntent: a cancel or a stop the run accepted
+\*     before the gap stands as its stop intent while the run is marked
+\*     resumable (the resumed turn's start would clear the cancel).
+\*   AuditStoppedGapRunNeverResumes: a run whose stop was asked, before the
+\*     gap or while suspended, is never resumed.
+\*   AuditSuspendedRunNotTerminal (above) also covers the gap: a run whose
+\*     turn ended cancelled before the gap is not suspended.
+\*
+\* Scope: the runtime's settlement of a stopped suspended run, once its
+\* store takes writes again, is the shell's SettleResumableRun, which ends
+\* the mark; this path checks only that such a run never resumes.
 \*
 \* AuditWitness* operators are reachability goals the runner checks as
 \* expected violations, so the invariants are not vacuous. The runner's
 \* --mutants mode seeds seventeen defects, at least one per invariant, into a
 \* copy of the generated model (or, for the serve-before-settle control, the
 \* audit's settlement order) and requires TLC to refuse each with the
-\* invariant it breaks, and three fence-gap defects, each checked against
+\* invariant it breaks, and seven fence-gap defects, each checked against
 \* its target invariant alone.
 \*
 \* The TLC config is DERIVED from the generated ci.cfg on every run by
@@ -154,7 +171,11 @@ VARIABLES
     audit_gap_attempts,    \* A's stage attempts when the gap suspended its run
     audit_gap_resumed,     \* process 1 resumed the run the gap suspended
     audit_gap_restarted,   \* the resumed run's turn started again
-    audit_gap_while_draining \* a fence-gap suspension came while draining
+    audit_gap_while_draining, \* a fence-gap suspension came while draining
+    audit_gap_idle,        \* the setup started A's run with no executor attached
+    audit_gap_intent_at_suspend, \* a cancel or stop stood when the gap suspended the run
+    audit_gap_stopped,     \* a stop was asked of the suspended run
+    audit_gap_resumed_stopped \* ResumeRun resumed a run whose stop was asked
 
 setupVars == <<audit_facts, audit_disposition, audit_attempts>>
 regionVars == <<audit_pending, audit_pre_verdict, audit_post_verdict, audit_abandoned>>
@@ -162,8 +183,10 @@ historyVars == <<audit_retained, audit_replay_retained, audit_carriers, audit_st
                  audit_unregistered>>
 runVars == <<audit_staged_p1, audit_staged_p2, audit_runs>>
 restartVars == <<audit_rows, audit_recovery, audit_settled, audit_expired>>
-gapVars == <<audit_gap_suspended, audit_gap_attempts, audit_gap_resumed, audit_gap_restarted,
-             audit_gap_while_draining>>
+gapRunVars == <<audit_gap_suspended, audit_gap_attempts, audit_gap_resumed, audit_gap_restarted,
+                audit_gap_while_draining, audit_gap_intent_at_suspend, audit_gap_stopped,
+                audit_gap_resumed_stopped>>
+gapVars == <<audit_gap_idle, gapRunVars>>
 resumeVars == <<audit_suspended, audit_resumed, gapVars>>
 auditVars == <<audit_stage, setupVars, regionVars, historyVars, runVars, restartVars,
               audit_wait_answered, resumeVars>>
@@ -254,25 +277,40 @@ KeepAudit == UNCHANGED auditVars
 
 \* ---- process 1 ----
 
+\* The setup's step, counted as on the attached path: the idle path skips
+\* the executor attachment.
+SetupStep(n) == model_step_count + (IF audit_gap_idle THEN 1 ELSE 0) = n
+
 \* Scripted start: register, admit A, attach, run A, admit B behind the run.
+\* The idle path starts A's run with no executor attached instead (its fence
+\* gap takes the ToIdle arm) and, past the setup, explores only the gap path,
+\* with one admission of B.
 AuditSetup ==
     /\ audit_stage = "Setup"
     /\ \/ model_step_count = 0 /\ Initialize /\ KeepAudit
        \/ model_step_count = 1 /\ RegisterSessionIdle(AuditSession, None, {}) /\ KeepAudit
        \/ model_step_count = 2 /\ AdmitPlan(AuditA, "Prompt") /\ KeepAudit
        \/ model_step_count = 3 /\ QueueAcceptedIdle(AuditA) /\ KeepAudit
-       \/ model_step_count = 4 /\ EnsureSessionWithExecutorIdle(AuditSession) /\ KeepAudit
-       \/ model_step_count = 5 /\ PrepareAttached(AuditSession, AuditRun) /\ KeepAudit
-       \/ model_step_count = 6
+       \/ model_step_count = 4 /\ ~audit_gap_idle /\ EnsureSessionWithExecutorIdle(AuditSession) /\ KeepAudit
+       \/ /\ model_step_count = 4
+          /\ ~audit_gap_idle
+          /\ PrepareIdle(AuditSession, AuditRun)
+          /\ audit_gap_idle' = TRUE
+          /\ UNCHANGED <<audit_stage, setupVars, regionVars, historyVars, runVars, restartVars,
+                         audit_wait_answered, audit_suspended, audit_resumed, gapRunVars>>
+       \/ SetupStep(5) /\ PrepareAttached(AuditSession, AuditRun) /\ KeepAudit
+       \/ /\ SetupStep(6)
           /\ StageForRunRunning(AuditA, AuditRun)
           /\ audit_staged_p1' = {AuditA}
           /\ audit_runs' = [audit_runs EXCEPT ![AuditA] = @ + 1]
           /\ UNCHANGED <<audit_stage, setupVars, regionVars, historyVars, audit_staged_p2,
                          restartVars,
                    audit_wait_answered, resumeVars>>
-       \/ model_step_count = 7
-          /\ \E kind \in AuditKinds, d \in InputDurabilityKindValues, dir \in BOOLEAN,
-                obj \in BOOLEAN :
+       \/ /\ SetupStep(7)
+          /\ \E kind \in (IF audit_gap_idle THEN {"Prompt"} ELSE AuditKinds),
+                d \in (IF audit_gap_idle THEN {"Durable"} ELSE InputDurabilityKindValues),
+                dir \in (IF audit_gap_idle THEN {FALSE} ELSE BOOLEAN),
+                obj \in (IF audit_gap_idle THEN {FALSE} ELSE BOOLEAN) :
                 /\ AdmitPlan(AuditB, kind)
                 /\ audit_facts' = audit_facts @@ (AuditB :> [kind |-> kind, durability |-> d,
                                                              directed |-> dir,
@@ -280,7 +318,7 @@ AuditSetup ==
           /\ UNCHANGED <<audit_stage, audit_disposition, audit_attempts, regionVars,
                          historyVars, runVars, restartVars,
                    audit_wait_answered, resumeVars>>
-       \/ model_step_count = 8
+       \/ /\ SetupStep(8)
           /\ QueueAcceptedRunning(AuditB)
           /\ audit_stage' = "P1"
           /\ UNCHANGED <<setupVars, regionVars, historyVars, runVars, restartVars,
@@ -292,6 +330,7 @@ AuditSetup ==
 \* (materialization_rollback_keep_audit).
 AuditBeginUnregister ==
     /\ audit_stage \in {"P1", "P1Stopped"}
+    /\ ~audit_gap_idle
     /\ audit_disposition = "None"
     /\ \E disp \in {"Stop", "Requeue"} :
           /\ BeginUnregisterAny(disp, IF disp = "Requeue" THEN AuditMaxAgeMs ELSE 0)
@@ -304,6 +343,7 @@ AuditBeginUnregister ==
 \* Abandoned(Cancelled).
 AuditCancelRun ==
     /\ audit_stage = "P1"
+    /\ ~audit_gap_idle
     \* The generated RunCancelled may repeat; the run is cancelled once.
     /\ \/ terminal_outcome # Some("Cancelled") /\ RunCancelled(AuditRun)
        \/ CancelRunningToAttached(AuditRun)
@@ -319,8 +359,9 @@ AuditCancelRun ==
 \* and bound to it (ClassifyStopInputDispositionRetainResumable).
 AuditSuspendRun ==
     /\ audit_stage = "P1"
+    /\ ~audit_gap_idle
     /\ ~audit_suspended
-    /\ SuspendRunForStopRunningToAttached(AuditRun, TRUE)
+    /\ SuspendRunForStopRunningToAttached(AuditRun, TRUE, "RequeueStop")
     /\ audit_suspended' = TRUE
     /\ UNCHANGED <<audit_stage, setupVars, regionVars, historyVars, runVars, restartVars,
                    audit_resumed, audit_wait_answered, gapVars>>
@@ -328,6 +369,7 @@ AuditSuspendRun ==
 \* A stop transaction: the first stop of the runtime, or a replay of it from
 \* Stopped (once). The open step is the shell taking the driver lock.
 AuditOpenStop ==
+    /\ ~audit_gap_idle
     /\ \/ audit_stage = "P1" /\ phase \in {"Idle", "Attached", "Running", "Retired"}
        \/ audit_stage = "P1Stopped" /\ phase = "Stopped" /\ audit_attempts = 1
     /\ audit_stage' = "PreExit"
@@ -451,6 +493,29 @@ AuditGapApplyPrimitive ==
     /\ PrimitiveAppliedConversation(AuditRun)
     /\ KeepAudit
 
+\* Before the gap, the run may accept a cancel at its next boundary or a
+\* stop, or its turn may end cancelled (each once).
+AuditGapCancelIntent ==
+    /\ audit_stage = "Gap"
+    /\ ~audit_gap_suspended
+    /\ cancel_after_boundary = FALSE
+    /\ CancelAfterBoundaryForRunRunning(AuditRun, "audit")
+    /\ KeepAudit
+
+AuditGapStopIntent ==
+    /\ audit_stage = "Gap"
+    /\ ~audit_gap_suspended
+    /\ run_stop_requested # Some(AuditRun)
+    /\ StopCurrentRunForRunRunning(AuditRun)
+    /\ KeepAudit
+
+AuditGapTurnCancelled ==
+    /\ audit_stage = "Gap"
+    /\ ~audit_gap_suspended
+    /\ terminal_outcome # Some("Cancelled")
+    /\ RunCancelled(AuditRun)
+    /\ KeepAudit
+
 \* An unregister may begin before the gap suspends the run.
 AuditGapBeginUnregister ==
     /\ audit_stage = "Gap"
@@ -473,9 +538,26 @@ AuditGapSuspend ==
     /\ audit_gap_suspended' = TRUE
     /\ audit_gap_attempts' = Attempts(AuditA)
     /\ audit_gap_while_draining' = (registration_phase = "Draining")
+    /\ audit_gap_intent_at_suspend' = (cancel_after_boundary = TRUE \/ run_stop_requested = Some(AuditRun))
     /\ UNCHANGED <<audit_stage, setupVars, regionVars, historyVars, runVars, restartVars,
                    audit_wait_answered, audit_suspended, audit_resumed, audit_gap_resumed,
-                   audit_gap_restarted>>
+                   audit_gap_restarted, audit_gap_idle, audit_gap_stopped,
+                   audit_gap_resumed_stopped>>
+
+\* A stop (or an interrupt) asked of the suspended run, before it resumes.
+AuditGapStopSuspended ==
+    /\ audit_stage = "Gap"
+    /\ audit_gap_suspended
+    /\ ~audit_gap_resumed
+    /\ ~audit_gap_stopped
+    /\ \/ StopCurrentRunForRunResumableIdle(AuditRun)
+       \/ StopCurrentRunForRunResumableAttached(AuditRun)
+    /\ audit_gap_stopped' = TRUE
+    /\ UNCHANGED <<audit_stage, setupVars, regionVars, historyVars, runVars, restartVars,
+                   audit_wait_answered, audit_suspended, audit_resumed, audit_gap_suspended,
+                   audit_gap_attempts, audit_gap_resumed, audit_gap_restarted,
+                   audit_gap_while_draining, audit_gap_idle, audit_gap_intent_at_suspend,
+                   audit_gap_resumed_stopped>>
 
 \* Once the fence is back, the same process starts the marked run again,
 \* resumes it and starts its turn again.
@@ -489,10 +571,12 @@ AuditGapResume ==
        \/ /\ ~audit_gap_resumed
           /\ ResumeRunRunning(AuditRun)
           /\ audit_gap_resumed' = TRUE
+          /\ audit_gap_resumed_stopped' = (run_stop_requested = Some(AuditRun))
           /\ UNCHANGED <<audit_stage, setupVars, regionVars, historyVars, runVars, restartVars,
                          audit_wait_answered, audit_suspended, audit_resumed,
                          audit_gap_suspended, audit_gap_attempts, audit_gap_restarted,
-                         audit_gap_while_draining>>
+                         audit_gap_while_draining, audit_gap_idle, audit_gap_intent_at_suspend,
+                         audit_gap_stopped>>
        \/ /\ audit_gap_resumed
           /\ ~audit_gap_restarted
           /\ ConversationTurnStart
@@ -500,7 +584,8 @@ AuditGapResume ==
           /\ UNCHANGED <<audit_stage, setupVars, regionVars, historyVars, runVars, restartVars,
                          audit_wait_answered, audit_suspended, audit_resumed,
                          audit_gap_suspended, audit_gap_attempts, audit_gap_resumed,
-                         audit_gap_while_draining>>
+                         audit_gap_while_draining, audit_gap_idle, audit_gap_intent_at_suspend,
+                         audit_gap_stopped, audit_gap_resumed_stopped>>
 
 \* ---- the restart: a new process ----
 
@@ -704,8 +789,12 @@ AuditNext ==
     \/ AuditServe
     \/ AuditGapStartTurn
     \/ AuditGapApplyPrimitive
+    \/ AuditGapCancelIntent
+    \/ AuditGapStopIntent
+    \/ AuditGapTurnCancelled
     \/ AuditGapBeginUnregister
     \/ AuditGapSuspend
+    \/ AuditGapStopSuspended
     \/ AuditGapResume
 
 AuditInit ==
@@ -739,6 +828,10 @@ AuditInit ==
     /\ audit_gap_resumed = FALSE
     /\ audit_gap_restarted = FALSE
     /\ audit_gap_while_draining = FALSE
+    /\ audit_gap_idle = FALSE
+    /\ audit_gap_intent_at_suspend = FALSE
+    /\ audit_gap_stopped = FALSE
+    /\ audit_gap_resumed_stopped = FALSE
 
 AuditSpec == AuditInit /\ [][AuditNext]_<<vars, auditVars>>
 
@@ -809,15 +902,22 @@ AuditRequeuedWaitResolvesInEveryPhase ==
 AuditRequeuedWaitAnswerChangesNothing ==
     [][(~audit_wait_answered /\ audit_wait_answered') => UNCHANGED AuditStateButStep]_<<vars, auditVars>>
 
-TurnStartPhases == {"Ready", "Completed", "Failed", "Cancelled"}
-
 AuditFenceGapTurnResettable ==
-    (audit_gap_suspended /\ resumable_run_id = Some(AuditRun)) => turn_phase \in TurnStartPhases
+    (audit_gap_suspended /\ resumable_run_id = Some(AuditRun)) => turn_phase = "Ready"
 
 AuditFenceGapKeepsAttempts ==
-    audit_gap_suspended => (PhaseOf(AuditA) = "Staged" /\ Attempts(AuditA) = audit_gap_attempts)
+    audit_gap_suspended =>
+        /\ PhaseOf(AuditA) = "Staged"
+        /\ Lookup(input_run_associations, AuditA, "None") = AuditRun
+        /\ Attempts(AuditA) = audit_gap_attempts
 
 AuditFenceGapNeverWhileDraining == ~audit_gap_while_draining
+
+AuditFenceGapKeepsStopIntent ==
+    (audit_gap_intent_at_suspend /\ resumable_run_id = Some(AuditRun))
+        => run_stop_requested = Some(AuditRun)
+
+AuditStoppedGapRunNeverResumes == ~audit_gap_resumed_stopped
 
 \* ---- reachability goals, each checked as an expected violation ----
 
@@ -883,6 +983,13 @@ AuditWitnessFenceGapRunResumes ==
     /\ PhaseOf(AuditA) = "Staged"
     /\ Attempts(AuditA) = audit_gap_attempts
 
+\* The same with no executor attached when the run started: the gap takes
+\* the ToIdle arm, and the run resumes from Idle.
+AuditWitnessIdleFenceGapRunResumes ==
+    /\ audit_gap_idle
+    /\ AuditWitnessFenceGapRunResumes
+
 NotAuditWitnessSuspendedRunResumes == ~AuditWitnessSuspendedRunResumes
 NotAuditWitnessFenceGapRunResumes == ~AuditWitnessFenceGapRunResumes
+NotAuditWitnessIdleFenceGapRunResumes == ~AuditWitnessIdleFenceGapRunResumes
 ====

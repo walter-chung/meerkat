@@ -9519,11 +9519,30 @@ mod tests {
         use crate::meerkat_machine::driver::{DriverEntry, machine_suspend_run_for_stop};
         let fence_gap = mm_dsl::RunSuspensionCause::FenceGap;
 
-        let (driver, _durable_id, _ephemeral_id, staged_id) =
+        let (mut driver, _durable_id, _ephemeral_id, staged_id) =
             stop_classification_fixture("fence-gap-suspension").await;
         let run_id = driver
             .current_run_id()
             .expect("the fixture's run is current");
+        // The gap comes once the run's turn is under way.
+        driver
+            .dsl_apply(
+                mm_dsl::MeerkatMachineInput::StartConversationRun {
+                    run_id: mm_dsl::RunId::from_domain(&run_id),
+                    primitive_kind: mm_dsl::TurnPrimitiveKind::ConversationTurn,
+                    admitted_content_shape: mm_dsl::ContentShape::Conversation,
+                    vision_enabled: false,
+                    image_tool_results_enabled: false,
+                    max_extraction_retries: 0,
+                },
+                "StartConversationRun",
+            )
+            .expect("the run's turn starts");
+        assert_eq!(
+            driver.with_dsl_state(|state| state.turn_phase),
+            mm_dsl::TurnPhase::ApplyingPrimitive,
+            "the run's turn is under way when the gap comes"
+        );
         let attempts_before = driver.with_dsl_state(|state| state.input_attempt_counts.clone());
         let mut entry = DriverEntry::Ephemeral(driver);
         assert!(

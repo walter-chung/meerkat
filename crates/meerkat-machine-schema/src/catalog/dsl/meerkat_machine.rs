@@ -11659,6 +11659,10 @@ macro_rules! meerkat_catalog_machine_dsl {
             on input ResumeRun { run_id }
             guard "run_is_current" { self.current_run_id == Some(run_id) }
             guard "run_is_resumable" { self.resumable_run_id == Some(run_id) }
+            // A run whose stop was asked (before a store fence gap suspended
+            // it, or while it was suspended) never resumes: the runtime
+            // settles it instead (the resumed-run plan refuses it too).
+            guard "run_not_stopped" { self.run_stop_requested != Some(run_id) }
             // A run whose kept input still waits for its controller client
             // does not resume (the resumed-run plan refuses it too).
             guard "run_inputs_not_controller_held" {
@@ -15544,6 +15548,29 @@ macro_rules! meerkat_catalog_machine_dsl {
             to Retired
             emit WakeInterrupt
             emit RequestCancellationAtBoundary
+        }
+
+        // A stop (or an interrupt) of a run a store fence gap suspended: the
+        // run is marked resumable and no run is current, so there is no turn
+        // to interrupt. The stop intent is recorded on that run as on a
+        // current one: the run never resumes (`ResumeRun` refuses it), and
+        // the runtime settles it, its bound inputs abandoned as `Cancelled`,
+        // once its store takes writes again. A registration draining for its
+        // unregister keeps its resumable run for the next start, whose fresh
+        // machine a stop of this registration does not reach: such a stop is
+        // refused here.
+        transition StopCurrentRunForRunResumable {
+            per_phase [Idle, Attached]
+            on input StopCurrentRunForRun { run_id }
+            guard "no_current_run" { self.current_run_id == None }
+            guard "run_is_resumable" { self.resumable_run_id == Some(run_id) }
+            guard "registration_not_draining" {
+                self.registration_phase != RegistrationPhase::Draining
+            }
+            update {
+                self.run_stop_requested = Some(run_id);
+            }
+            to Idle
         }
 
         // ResolveUserInterruptPublicResult: generated public-result authority
@@ -25212,11 +25239,16 @@ macro_rules! meerkat_catalog_machine_dsl {
         // (`ResumeRun`) once the store's fence is restored. The resume
         // starts the run's turn again, so its turn returns to `Ready`; the
         // requeue arms above leave the turn to the next start, whose machine
-        // is fresh. A registration draining for its unregister suspends only
-        // for its stop, through the arms above, and a run whose turn terminal
-        // is published, a session without per-round commits, or a run with a
-        // published live-boundary join is not suspended: the shell ends it as
-        // before.
+        // is fresh. A cancel the run accepted before the gap (its turn's
+        // `cancel_after_boundary`, which that turn start would clear)
+        // survives as the run's stop intent (`run_stop_requested`), as a stop
+        // asked of the run does: such a run never resumes, and the runtime
+        // settles it once the fence is restored, since ending it now would
+        // need a write the gap refuses. A registration draining for its
+        // unregister suspends only for its stop, through the arms above, and
+        // a run whose turn terminal is published, a session without
+        // per-round commits, or a run with a published live-boundary join is
+        // not suspended: the shell ends it as before.
         transition SuspendRunForStopFenceGapRunningToIdle {
             on input SuspendRunForStop { run_id, durable_session, cause }
             guard { self.lifecycle_phase == Phase::Running }
@@ -25244,6 +25276,9 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.pre_run_phase = None;
                 self.resumable_run_id = Some(run_id);
                 self.turn_phase = TurnPhase::Ready;
+                if self.cancel_after_boundary == true {
+                    self.run_stop_requested = Some(run_id);
+                }
             }
             to Idle
             emit RunSuspendedForStop { run_id: run_id }
@@ -25275,6 +25310,9 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.pre_run_phase = None;
                 self.resumable_run_id = Some(run_id);
                 self.turn_phase = TurnPhase::Ready;
+                if self.cancel_after_boundary == true {
+                    self.run_stop_requested = Some(run_id);
+                }
             }
             to Attached
             emit RunSuspendedForStop { run_id: run_id }
@@ -40275,17 +40313,22 @@ macro_rules! meerkat_catalog_machine_dsl {
                 /// The marked run and exactly the inputs bound to it (staged
                 /// or applied, associated with the run), in admission order.
                 /// `None` unless `run_id` is the marked resumable run, no run
-                /// is current, at least one input is bound to it, no input
-                /// bound to it is held for its controller (mirrors the
-                /// `ResumeRun` guard `run_inputs_not_controller_held`), and
-                /// its destination is attached
-                /// (`resumed_run_destination_attached`).
+                /// is current, no stop of the run was asked (mirrors the
+                /// `ResumeRun` guard `run_not_stopped`), at least one input
+                /// is bound to it, no input bound to it is held for its
+                /// controller (mirrors the `ResumeRun` guard
+                /// `run_inputs_not_controller_held`), and its destination is
+                /// attached (`resumed_run_destination_attached`).
                 #[must_use]
                 pub fn authorize_resumed_run_from_state(
                     state: &MeerkatMachineState,
                     run_id: &RunId,
                 ) -> Option<ResumedRunPlan> {
                     if state.resumable_run_id.as_ref() != Some(run_id) || state.current_run_id.is_some() {
+                        return None;
+                    }
+                    // Mirrors the `ResumeRun` guard `run_not_stopped`.
+                    if state.run_stop_requested.as_ref() == Some(run_id) {
                         return None;
                     }
                     if state
