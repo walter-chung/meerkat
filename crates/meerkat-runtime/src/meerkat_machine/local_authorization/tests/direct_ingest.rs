@@ -322,11 +322,19 @@ pub(super) async fn install_credential(
         account_id: None,
         metadata: serde_json::Value::Null,
     };
-    let transition = meerkat_core::publish_token_lifecycle_acquired_for_identity(
+    // Publication only tries the machine's controller custody (the session
+    // map, each session's mutation gate and driver lock) and answers the typed
+    // Busy refusal instead of waiting. An attached session's runtime loop takes
+    // its driver on every pass, and attach and bind steps return before that
+    // pass. Core's bounded publication retries exactly that refusal until the
+    // deadline, as a product login does.
+    let transition = meerkat_core::publish_token_lifecycle_acquired_for_identity_within(
         &machine.generated_auth_lease_handle(),
         credential,
         &tokens,
+        tokio::time::Instant::now() + BOUND,
     )
+    .await
     .expect("actual AuthMachine acquisition");
     let marked =
         meerkat_core::mark_tokens_lifecycle_published_for_transition(&key, &tokens, &transition)
