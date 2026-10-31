@@ -10201,6 +10201,33 @@ async fn process_queue(
                                     %error,
                                     "failed to persist runtime terminalization"
                                 );
+                                // Nothing else answers the run's waiters on this
+                                // path: the stop below tears the session down,
+                                // and the unregister that would answer them waits
+                                // on a gate the degraded session keeps. Answer them
+                                // now with the run's failure, through the
+                                // machine's process-local completion authority,
+                                // which writes nothing; the inputs stay as the
+                                // store holds them, for the reload.
+                                if let Some(completions) = completions {
+                                    let driver_guard = driver.lock().await;
+                                    let mut registry = completions.lock().await;
+                                    if let Err(wait_error) =
+                                        resolve_process_local_failed_run_waiters(
+                                            &driver_guard,
+                                            &mut registry,
+                                            input_ids.clone(),
+                                            &run_id,
+                                            completion_detail.clone(),
+                                        )
+                                    {
+                                        fail_completion_waiters(
+                                            &mut registry,
+                                            &input_ids,
+                                            wait_error.to_string(),
+                                        );
+                                    }
+                                }
                                 drop(terminal_authority_guard);
                                 return stop_runtime_loop_executor_from_dsl_effect(
                                     driver,
