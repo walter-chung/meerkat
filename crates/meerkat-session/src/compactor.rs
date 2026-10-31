@@ -1246,6 +1246,40 @@ mod tests {
         );
     }
 
+    /// The floor rule of a history crossing holds for a projection crossing
+    /// too: when the last rewrite left the history at or above the threshold,
+    /// compacting again cannot get under it, so a crossing the growth made
+    /// waits for the cadence instead of paying for a summary at every
+    /// boundary. A rewrite that got under the threshold keeps the bypass.
+    #[test]
+    fn projection_crossing_waits_for_the_cadence_when_the_last_rewrite_left_the_history_over() {
+        let c = DefaultCompactor::new(make_config());
+        let floor_over = CompactionContext {
+            last_rewrite_history_tokens: Some(100_000),
+            ..projected_context(90_000, 15_000, 6)
+        };
+        assert!(
+            !c.should_compact(&floor_over),
+            "one boundary after a rewrite that left the history over the threshold the cadence holds"
+        );
+        let after_cadence = CompactionContext {
+            session_boundary_index: 8,
+            ..floor_over
+        };
+        assert!(
+            c.should_compact(&after_cadence),
+            "once the cadence allows it the projection fires"
+        );
+        let floor_under = CompactionContext {
+            last_rewrite_history_tokens: Some(99_999),
+            ..projected_context(90_000, 15_000, 6)
+        };
+        assert!(
+            c.should_compact(&floor_under),
+            "a rewrite that got under the threshold keeps the bypass"
+        );
+    }
+
     /// Without an anchor (before the first answered request, after a
     /// rewrite, after a model or provider change, or for a session last
     /// written before the anchor existed) the existing triggers decide alone.
