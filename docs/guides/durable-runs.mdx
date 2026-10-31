@@ -640,7 +640,10 @@ Before you run a host store in production, run the host store chapter of the
   finds no running turn and is refused; interrupt or stop the run instead.
   A stop that races the gap's own suspension of the run can fail with an
   internal error naming an input whose wait was answered
-  `requeued_across_stop`; read the inputs' outcome later.
+  `requeued_across_stop`; read the inputs' outcome later. A cancel at the
+  next boundary accepted just before that suspension can likewise fail when
+  its dispatch to the dropped turn fails, while the run is still settled as
+  cancelled once the fence is back.
 - A closing save still refused after its one wait (a gap that outlasts
   the wait after a run's final answer) keeps the teardown class: the turn
   fails and the live session is torn down. The turn's terminal is recorded

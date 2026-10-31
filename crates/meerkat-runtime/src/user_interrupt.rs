@@ -288,7 +288,9 @@ impl MeerkatMachine {
     /// run; no run terminal is published for it. A stop that races the gap's
     /// own suspension of the run may fail
     /// with an internal error naming a contributor whose wait was answered
-    /// `RequeuedAcrossStop`.
+    /// `RequeuedAcrossStop`. A cancel at the next boundary accepted just
+    /// before that suspension can likewise fail when its dispatch to the
+    /// dropped turn fails, while the run is still settled as cancelled.
     ///
     /// At a store fence gap the stop falls back to the hard interrupt in
     /// three cases: the surface cannot suspend a run

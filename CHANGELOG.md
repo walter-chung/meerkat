@@ -641,7 +641,10 @@ them.
   A cancel at the next boundary asked while the run is suspended is refused
   (interrupt or stop the run instead), and a stop that races the gap's own
   suspension of the run can fail with an internal error naming a
-  contributor whose wait was answered `RequeuedAcrossStop`. A gap met while
+  contributor whose wait was answered `RequeuedAcrossStop`. A cancel at the
+  next boundary accepted just before that suspension can likewise fail
+  when its dispatch to the dropped turn fails, while the run is still
+  settled as cancelled once the fence is back. A gap met while
   a run re-bases its session is not suspended: the re-base's outcome is
   unknown, and the session reloads as before. A closing save still
   refused after its one wait (a gap that outlasts the wait after a run's
