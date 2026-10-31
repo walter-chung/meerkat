@@ -422,6 +422,8 @@ printf '%s\n' \
   'echo "Error: Invariant NotAuditWitnessSuspendedRunResumes is violated."' \
   'echo "Error: Invariant NotAuditWitnessFenceGapRunResumes is violated."' \
   'echo "Error: Invariant NotAuditWitnessIdleFenceGapRunResumes is violated."' \
+  'echo "Error: Invariant NotAuditWitnessStoppedSuspendedRunEnds is violated."' \
+  'echo "Error: Invariant NotAuditWitnessStoppedGapRunSettled is violated."' \
   'echo "Error: Invariant NotAuditWitnessKeptQueuedInputRuns is violated."' \
   'echo "Error: Invariant NotAuditWitnessKeptRequeuedInputRuns is violated."' \
   'echo "Error: Invariant NotAuditWitnessAdmittedInputStoppedUnderKeep is violated."' \

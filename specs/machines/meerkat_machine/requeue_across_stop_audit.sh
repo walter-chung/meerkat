@@ -26,15 +26,16 @@
 # overlaps Retain, a requeued wait-failure arm that writes state, is
 # guarded on the session or answers any failure, a suspend of a run whose
 # turn terminal is published, and a staged-row normalization that requeues
-# the suspended run's input. It then seeds seven fence-gap defects (a
-# fence-gap suspension that leaves the run's turn mid-flight, one that spends
-# a stage attempt, one that ignores the draining registration, one that
-# drops a cancel the run accepted before the gap, one that suspends a run
-# whose turn already ended, one that unbinds the run's input, and a resume
-# of a run whose stop was asked) and checks each against its target
-# invariant alone, with the generated invariants and the audit's others left
-# out of that run. An anchor this script expects but cannot find fails the
-# run.
+# the suspended run's input. It then seeds nine stop-intent and fence-gap
+# defects (a fence-gap suspension that leaves the run's turn mid-flight, one
+# that spends a stage attempt, one that ignores the draining registration,
+# one that drops a cancel the run accepted before the gap, one that suspends
+# a run whose turn already ended, one that unbinds the run's input, a resume
+# of a run whose stop was asked, a requeue stop that keeps the input of a
+# resumable run whose stop was asked, and a settlement of a stopped run as a
+# refused resume) and checks each against its target invariant alone, with
+# the generated invariants and the audit's others left out of that run. An
+# anchor this script expects but cannot find fails the run.
 set -euo pipefail
 
 usage="usage: requeue_across_stop_audit.sh <max-steps> [--mutants] [extra tlc args...]"
@@ -144,7 +145,9 @@ INVARIANTS
   AuditFenceGapKeepsAttempts
   AuditFenceGapNeverWhileDraining
   AuditFenceGapKeepsStopIntent
-  AuditStoppedGapRunNeverResumes${extra}" "${cfg}"
+  AuditStoppedGapRunNeverResumes
+  AuditStoppedRunInputNotRetained
+  AuditStoppedGapRunSettledCancelled${extra}" "${cfg}"
   replace_exact_line "  CiStateConstraint" "  AuditStateConstraint" "${cfg}"
   printf 'CHECK_DEADLOCK FALSE\n' >> "${cfg}"
 }
@@ -215,7 +218,8 @@ fi
 
 for witness in RetainedRunsAfterGracefulStop RetainedRunsAfterCrash ExpiredSettled \
   StagedNotRetained StopAbandonsEligible PlainStopAbandons RequeuedWaitAnswered \
-  SuspendedRunResumes FenceGapRunResumes IdleFenceGapRunResumes; do
+  SuspendedRunResumes FenceGapRunResumes IdleFenceGapRunResumes \
+  StoppedSuspendedRunEnds StoppedGapRunSettled; do
   cfg="${work_dir}/witness-${witness}.cfg"
   write_cfg "${cfg}" TRUE "
   NotAuditWitness${witness}"
@@ -711,6 +715,40 @@ text = edit_arm(
     lambda line: line == "    /\\ (run_stop_requested # Some(run_id))",
     lambda line, _: "    /\\ TRUE",
 )
+open(path, "w").write(text)
+PY
+
+  # A requeue stop keeps the input of a resumable run whose stop was asked:
+  # the next start would resume the stopped run.
+  mutate_target retain_ignores_stop AuditStoppedRunInputNotRetained <<'PY'
+import os
+from gap_mutation import edit_arm
+path = os.environ["MODEL"]
+text = open(path).read()
+conjunct = "(run_stop_requested # resumable_run_id)"
+for phase in ("Initializing", "Idle", "Attached", "Running", "Retired", "Stopped"):
+    text = edit_arm(
+        text,
+        "ClassifyStopInputDispositionRetainResumable" + phase,
+        lambda line: line.startswith("    /\\ ") and conjunct in line,
+        lambda line, _: line.replace(conjunct, "TRUE"),
+    )
+open(path, "w").write(text)
+PY
+
+  # A suspended run whose stop was asked is settled as a refused resume.
+  mutate_target settle_ignores_stop AuditStoppedGapRunSettledCancelled <<'PY'
+import os
+from gap_mutation import edit_arm
+path = os.environ["MODEL"]
+text = open(path).read()
+for arm in ("SettleResumableRunIdle", "SettleResumableRunAttached"):
+    text = edit_arm(
+        text,
+        arm,
+        lambda line: line.startswith("    /\\ ") and '"ResumeRefused"' in line,
+        lambda line, _: "    /\\ TRUE",
+    )
 open(path, "w").write(text)
 PY
 fi

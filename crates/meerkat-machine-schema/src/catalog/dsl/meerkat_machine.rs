@@ -11741,11 +11741,16 @@ macro_rules! meerkat_catalog_machine_dsl {
         // `reason` (a settle, which also discards the run's provisional
         // tail), or leaves them to the lifecycle path's own sweep (retire,
         // destroy, reset). A graceful requeue stop does not settle: it keeps
-        // the run resumable.
+        // the run resumable. A run whose stop was asked ends under that stop:
+        // it is never settled as a refused resume.
         transition SettleResumableRun {
             per_phase [Initializing, Idle, Attached, Retired, Stopped]
             on input SettleResumableRun { run_id, reason }
             guard "run_is_resumable" { self.resumable_run_id == Some(run_id) }
+            guard "stopped_run_not_settled_as_refused" {
+                self.run_stop_requested != Some(run_id)
+                || reason != InputAbandonReason::ResumeRefused
+            }
             update {
                 self.resumable_run_id = None;
                 self.turn_terminal_run_id = Some(run_id);
@@ -15550,15 +15555,16 @@ macro_rules! meerkat_catalog_machine_dsl {
             emit RequestCancellationAtBoundary
         }
 
-        // A stop (or an interrupt) of a run a store fence gap suspended: the
-        // run is marked resumable and no run is current, so there is no turn
-        // to interrupt. The stop intent is recorded on that run as on a
-        // current one: the run never resumes (`ResumeRun` refuses it), and
-        // the runtime settles it, its bound inputs abandoned as `Cancelled`,
-        // once its store takes writes again. A registration draining for its
-        // unregister keeps its resumable run for the next start, whose fresh
-        // machine a stop of this registration does not reach: such a stop is
-        // refused here.
+        // A stop (or an interrupt) of a run marked resumable (a store fence
+        // gap's, or a restart's that has not resumed yet): no run is current,
+        // so there is no turn to interrupt. The stop intent is recorded on
+        // that run as on a current one: the run never resumes (`ResumeRun`
+        // refuses it), a requeue stop keeps none of its inputs, and the
+        // runtime settles it, its bound inputs abandoned as `Cancelled`, once
+        // its store takes writes again (the shell wakes its loop). A
+        // registration draining for its unregister keeps its resumable run
+        // for the next start, whose fresh machine a stop of this registration
+        // does not reach: such a stop is refused here.
         transition StopCurrentRunForRunResumable {
             per_phase [Idle, Attached]
             on input StopCurrentRunForRun { run_id }
@@ -39978,7 +39984,9 @@ macro_rules! meerkat_catalog_machine_dsl {
         // a run left open by a restart and not resumed yet, or the
         // in-flight run the stop just suspended. They keep their Staged
         // or Applied phase and their run, and the stored cursor marks the run
-        // again at the next registration.
+        // again at the next registration. A run whose stop was asked keeps
+        // nothing: its inputs end under the stop (the Abandon arm below), so
+        // the next start never resumes it.
         transition ClassifyStopInputDispositionRetainResumable {
             per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
             on input ClassifyStopInputDisposition { input_id, durability, directed, objective_bound }
@@ -39992,6 +40000,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                     || self.input_phases.get(input_id).get("value")
                         == InputPhase::AppliedPendingConsumption)
                 && self.registration_phase == RegistrationPhase::Draining
+                && self.run_stop_requested != self.resumable_run_id
             }
             update {}
             to Idle
@@ -40025,7 +40034,8 @@ macro_rules! meerkat_catalog_machine_dsl {
                         || self.input_phases.get(input_id).get("value") == InputPhase::Applied
                         || self.input_phases.get(input_id).get("value")
                             == InputPhase::AppliedPendingConsumption)
-                    && self.registration_phase == RegistrationPhase::Draining)
+                    && self.registration_phase == RegistrationPhase::Draining
+                    && self.run_stop_requested != self.resumable_run_id)
             }
             guard "not_kept_recovered_input" {
                 !(self.registration_phase == RegistrationPhase::Draining
