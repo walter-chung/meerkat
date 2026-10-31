@@ -8543,11 +8543,13 @@ where
     /// ([`crate::compact::SessionCompactionCadence::last_answered_request`]):
     /// its presented tokens, the transcript rows it was composed from (its
     /// response is not in the transcript yet) and the provider and model that
-    /// counted them. A request that carried the open run's own tool results
-    /// shortened (`request_bounded`) anchors nothing: it presented less than
-    /// the transcript holds, so the anchor stays on the request before it.
-    /// Only a compactor reads the cadence, so an agent without one records
-    /// nothing.
+    /// counted them. An answered request that carried every result whole also
+    /// ends the fact that the transcript held content a request could not
+    /// carry: the transcript fits. A request that carried the open run's own
+    /// tool results shortened (`request_bounded`) does neither: it presented
+    /// less than the transcript holds, so the anchor stays on the request
+    /// before it and the fact its bound recorded stays. Only a compactor reads
+    /// the cadence, so an agent without one records nothing.
     fn record_answered_request(
         &mut self,
         presented_tokens: u64,
@@ -8565,6 +8567,7 @@ where
                 provider: provider.as_str().to_string(),
                 model: model.to_string(),
             });
+        self.compaction_cadence.last_context_refusal_boundary_index = None;
         self.persist_compaction_cadence_or_warn();
     }
 

@@ -26,7 +26,9 @@ pub struct SessionCompactionCadence {
     /// Boundary index of the last main model request that did not fit: the
     /// provider refused it because it did not fit the model's context, or it
     /// carried the open run's own tool results shortened for that request
-    /// only. Kept until a compaction of the whole transcript is attempted.
+    /// only. Kept until a compaction of the whole transcript is attempted, or
+    /// until a request that carried every result whole is answered (the
+    /// transcript then fits); the answer to a shortened request keeps it.
     ///
     /// Either way the transcript holds content a request could not carry: a
     /// refused request reports no usage, so no measure moves, and a shortened
@@ -198,7 +200,7 @@ pub struct CompactionContext {
     /// Boundary index of the last main request that did not fit, refused by
     /// the provider for the model's context or sent with the open run's own
     /// tool results shortened, until a compaction of the whole transcript is
-    /// attempted
+    /// attempted or a request sent with every result whole is answered
     /// ([`SessionCompactionCadence::last_context_refusal_boundary_index`]).
     /// Set only at a check whose compaction covers the whole transcript (a
     /// run's first check): inside a run a compaction keeps the run's request
