@@ -139,7 +139,7 @@
 \* --mutants mode seeds seventeen defects, at least one per invariant, into a
 \* copy of the generated model (or, for the serve-before-settle control, the
 \* audit's settlement order) and requires TLC to refuse each with the
-\* invariant it breaks, and nine stop-intent and fence-gap defects, each
+\* invariant it breaks, and ten stop-intent and fence-gap defects, each
 \* checked against its target invariant alone.
 \*
 \* The TLC config is DERIVED from the generated ci.cfg on every run by

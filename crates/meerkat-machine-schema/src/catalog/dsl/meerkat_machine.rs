@@ -25247,7 +25247,9 @@ macro_rules! meerkat_catalog_machine_dsl {
         // starts the run's turn again, so its turn returns to `Ready`; the
         // requeue arms above leave the turn to the next start, whose machine
         // is fresh. A cancel the run accepted before the gap (its turn's
-        // `cancel_after_boundary`, which that turn start would clear)
+        // `cancel_after_boundary`, which that turn start would clear, or an
+        // ambient cancel whose boundary dispatch is still outstanding,
+        // `boundary_cancel_dispatch_pending`, which sets no turn flag)
         // survives as the run's stop intent (`run_stop_requested`), as a stop
         // asked of the run does: such a run never resumes, and the runtime
         // settles it once the fence is restored, since ending it now would
@@ -25283,7 +25285,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.pre_run_phase = None;
                 self.resumable_run_id = Some(run_id);
                 self.turn_phase = TurnPhase::Ready;
-                if self.cancel_after_boundary == true {
+                if self.cancel_after_boundary == true || self.boundary_cancel_dispatch_pending == true {
                     self.run_stop_requested = Some(run_id);
                 }
             }
@@ -25317,7 +25319,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.pre_run_phase = None;
                 self.resumable_run_id = Some(run_id);
                 self.turn_phase = TurnPhase::Ready;
-                if self.cancel_after_boundary == true {
+                if self.cancel_after_boundary == true || self.boundary_cancel_dispatch_pending == true {
                     self.run_stop_requested = Some(run_id);
                 }
             }

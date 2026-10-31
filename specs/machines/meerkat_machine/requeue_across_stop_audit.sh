@@ -26,10 +26,11 @@
 # overlaps Retain, a requeued wait-failure arm that writes state, is
 # guarded on the session or answers any failure, a suspend of a run whose
 # turn terminal is published, and a staged-row normalization that requeues
-# the suspended run's input. It then seeds nine stop-intent and fence-gap
+# the suspended run's input. It then seeds ten stop-intent and fence-gap
 # defects (a fence-gap suspension that leaves the run's turn mid-flight, one
 # that spends a stage attempt, one that ignores the draining registration,
-# one that drops a cancel the run accepted before the gap, one that suspends
+# one that drops a cancel the run accepted before the gap, one that drops
+# only an ambient cancel accepted before the gap, one that suspends
 # a run whose turn already ended, one that unbinds the run's input, a resume
 # of a run whose stop was asked, a requeue stop that keeps the input of a
 # resumable run whose stop was asked, and a settlement of a stopped run as a
@@ -696,6 +697,28 @@ text = edit_gap_arms(
     text,
     lambda line: line.startswith("    /\\ run_stop_requested' = "),
     lambda line, _: "    /\\ run_stop_requested' = run_stop_requested",
+)
+open(path, "w").write(text)
+PY
+
+  # The suspension carries only the turn's own cancel flag: an ambient
+  # cancel accepted before the gap (its boundary dispatch outstanding) is
+  # dropped, and the run resumes under its own id.
+  mutate_target gap_drops_ambient_cancel AuditFenceGapKeepsStopIntent <<'PY'
+import os
+from gap_mutation import edit_gap_arms
+path = os.environ["MODEL"]
+text = open(path).read()
+needle = "boundary_cancel_dispatch_pending = TRUE"
+
+def drop_ambient(line, _):
+    assert line.count(needle) == 1, f"expected one '{needle}' in: {line}"
+    return line.replace(needle, "FALSE")
+
+text = edit_gap_arms(
+    text,
+    lambda line: line.startswith("    /\\ run_stop_requested' = ") and needle in line,
+    drop_ambient,
 )
 open(path, "w").write(text)
 PY

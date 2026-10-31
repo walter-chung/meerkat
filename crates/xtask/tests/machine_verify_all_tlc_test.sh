@@ -295,7 +295,7 @@ fi
 # suspended run and starts its turn again. It requires thirteen witnesses
 # reached, a graceful end and a crash
 # among them; its --mutants mode (by hand) refuses seventeen seeded defects
-# against every invariant but the two stop-intent ones and nine stop-intent
+# against every invariant but the two stop-intent ones and ten stop-intent
 # and fence-gap defects each against its target invariant alone. 32 steps
 # reach the deepest witness.
 requeue_across_stop_audit="${workspace_root}/specs/machines/meerkat_machine/requeue_across_stop_audit.sh"
