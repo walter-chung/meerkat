@@ -195,6 +195,44 @@ them.
   `NotCurrent` for it). This supersedes the 0.9.4 note that the discard
   waits for an attached loop's handoff.
 
+- Behaviour-only (not measured by the gate): `meerkat-schedule`: the
+  replies of the schedule tools, for agents and for every generic call path
+  that runs them through `handle_schedule_tools_call` (RPC `schedule/call`,
+  REST `POST /schedule/call`, the MCP server's `meerkat_schedule_*` tools,
+  the Python SDK's `call_schedule_tool` and the TypeScript SDK's
+  `callScheduleTool`):
+  - `meerkat_schedule_list` returns one page of summaries,
+    `{"schedules": [...], "page": {"returned", "has_more", "next_cursor"}}`,
+    in creation order (creation time, then schedule id): 50 schedules unless
+    `limit` asks for another size, at most 200, and `cursor` takes
+    `page.next_cursor` to continue. A summary carries `schedule_id`, `name`
+    (its first 200 characters), `phase`, `revision`, `trigger`, the target's
+    kind and ids (`target`), `action_head` (the first 160 characters of the
+    action text: a prompt, the content a member is sent, a helper's prompt
+    or an event's type) with `action_chars` (that text's full length),
+    `created_at_utc` and `updated_at_utc`. It returned every live schedule,
+    unpaged, in the persistence shape, whose machine state repeated the
+    trigger, the whole target and every revision's superseded acks, so a
+    realm of a few dozen long-prompt schedules filled much of a context
+    window in one reply. A `limit` outside 1-200 or a cursor this listing
+    did not write is refused as invalid arguments.
+  - Every tool that returns one schedule (`meerkat_schedule_get`,
+    `meerkat_schedule_create`, `meerkat_schedule_update`,
+    `meerkat_schedule_pause`, `meerkat_schedule_resume` and
+    `meerkat_schedule_delete`) returns it in the public shape of
+    `schedule/get` (`meerkat_contracts::wire::Schedule`): the same fields,
+    without `machine_state`.
+  - `meerkat_schedule_occurrences` pages every list reply: 50 occurrences
+    unless `limit` asks for another size, at most 200 (500 before, and with
+    only `schedule_id` it returned every occurrence unpaged). Its full rows
+    (`view: "full"`, the default, and an `occurrence_id` read) are the
+    public shape of `schedule/occurrences`, without `machine_state` and
+    `claim_token`.
+
+  The host listings do not move: RPC `schedule/list` and `schedule/get`,
+  REST `GET /schedules`, the Python SDK's `list_schedules` and the
+  TypeScript SDK's `listSchedules` return every schedule whole, as before.
+
 ### Added
 
 - `meerkat-runtime`: `PromptInput::detached_job_completed_with_handling`
@@ -504,6 +542,17 @@ them.
   take once it is unset. The host binaries' own workers and main future keep
   the 8 MiB budget. The added size is virtual address space; pages are
   committed only when touched.
+
+### Upgrade notes
+
+- A client of the generic schedule tool calls (`schedule/call`,
+  `POST /schedule/call`, the MCP server's schedule tools,
+  `call_schedule_tool`, `callScheduleTool`) that read whole schedules from
+  `meerkat_schedule_list` reads one with `meerkat_schedule_get`, or every
+  schedule whole with the host listing (`schedule/list`, `GET /schedules`);
+  one that read `machine_state` from a schedule tool reply reads the public
+  fields beside it; one that read a schedule's whole occurrence history
+  with only `schedule_id` follows `page.next_cursor`. See Breaking.
 
 ### Known limitations
 

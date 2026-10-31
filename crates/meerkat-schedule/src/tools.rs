@@ -1,8 +1,10 @@
 use crate::{
-    CreateScheduleRequest, DeliveryReceipt, Occurrence, OccurrenceFilter, OccurrenceId,
-    OccurrencePhase, ScheduleDomainError, ScheduleId, ScheduleService, ScheduleStoreError,
-    ScheduledSessionAction, SessionTargetBinding, TargetBinding, TriggerSpec,
-    UpdateScheduleRequest,
+    CreateScheduleRequest, DeliveryReceipt, MisfirePolicy, MissingTargetPolicy, MobTargetBinding,
+    Occurrence, OccurrenceFailureClass, OccurrenceFilter, OccurrenceId, OccurrenceOrdinal,
+    OccurrencePhase, OverlapPolicy, RuntimeDeliveryOutcome, Schedule, ScheduleConfig,
+    ScheduleDomainError, ScheduleId, SchedulePhase, ScheduleRevision, ScheduleService,
+    ScheduleStoreError, ScheduledMobAction, ScheduledSessionAction, SessionTargetBinding,
+    TargetBinding, TriggerSpec, UpdateScheduleRequest,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -13,6 +15,7 @@ use meerkat_core::{AgentToolDispatcher, ToolDispatchOutcome, ToolUnavailableReas
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 pub const INVALID_ARGUMENTS: i32 = -32602;
@@ -46,8 +49,14 @@ impl ScheduleToolError {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct EmptyArgs {}
+/// Arguments of `meerkat_schedule_list`: one page of schedule summaries.
+#[derive(Debug, Deserialize)]
+struct ListArgs {
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    cursor: Option<String>,
+}
 
 #[derive(Debug, Deserialize)]
 struct ScheduleIdArgs {
@@ -55,8 +64,8 @@ struct ScheduleIdArgs {
 }
 
 /// Arguments of `meerkat_schedule_occurrences`. Only `schedule_id` is
-/// required; with nothing else set the tool returns every occurrence in full,
-/// exactly as before the bounded options existed.
+/// required; with nothing else set the tool returns the first page of the
+/// schedule's occurrences in full.
 #[derive(Debug, Deserialize)]
 struct OccurrencesArgs {
     schedule_id: String,
@@ -80,18 +89,6 @@ impl OccurrencesArgs {
     fn view(&self) -> OccurrencesView {
         self.view.unwrap_or_default()
     }
-
-    /// No option beyond `schedule_id`, or only `view: "full"`: the legacy
-    /// full, unpaged reply.
-    fn is_unbounded(&self) -> bool {
-        self.occurrence_id.is_none()
-            && self.due_after_utc.is_none()
-            && self.due_before_utc.is_none()
-            && self.phase.is_none()
-            && self.limit.is_none()
-            && self.cursor.is_none()
-            && self.view() == OccurrencesView::Full
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -102,13 +99,19 @@ enum OccurrencesView {
     Summary,
 }
 
-/// The page size `meerkat_schedule_occurrences` uses once any bounded option
-/// is given without `limit`.
-const DEFAULT_OCCURRENCE_PAGE: usize = 100;
-/// The largest page `meerkat_schedule_occurrences` returns in one call.
-const MAX_OCCURRENCE_PAGE: usize = 500;
-/// Version tag of the opaque page cursor.
+/// The page size of `meerkat_schedule_list` and of every
+/// `meerkat_schedule_occurrences` list reply without `limit`.
+const DEFAULT_PAGE: usize = 50;
+/// The largest page either tool returns in one call.
+const MAX_PAGE: usize = 200;
+/// Version tag of the opaque occurrence page cursor.
 const OCCURRENCE_CURSOR_PREFIX: &str = "c1";
+/// Version tag of the opaque schedule page cursor.
+const SCHEDULE_CURSOR_PREFIX: &str = "s1";
+/// Characters of a schedule's action text a list summary carries.
+const ACTION_HEAD_CHARS: usize = 160;
+/// Characters of a schedule's name a list summary carries.
+const SUMMARY_NAME_CHARS: usize = 200;
 /// The target fields a summary keeps: what kind of target it is and which
 /// session, identity, mob, member, flow or host runnable it names. Everything
 /// else (the action, prompt, helper options, materialization spec, flow and
@@ -161,13 +164,23 @@ pub fn schedule_tools_list() -> Vec<Value> {
         ),
         tool_descriptor(
             "meerkat_schedule_get",
-            "Fetch a single schedule by schedule_id. Returns the full schedule object including its current phase (active/paused/deleted), trigger, target, policies, revision number, and timestamps. Use this to inspect a schedule after creation or to confirm an update took effect.",
+            "Fetch a single schedule by schedule_id. Returns the full schedule object including its current phase (active/paused/deleted), trigger, target with its whole action, policies, revision number, and timestamps. Use this to inspect a schedule after creation, to confirm an update took effect, or to read the action a meerkat_schedule_list summary shortens.",
             schedule_id_schema("The schedule_id to fetch."),
         ),
         tool_descriptor(
             "meerkat_schedule_list",
-            "List the schedules in the active realm. Returns an array of schedule objects for active and paused schedules; deleted schedules are not listed (their occurrence history stays readable with meerkat_schedule_occurrences). Use this to discover existing schedules before creating duplicates.",
-            empty_schema(),
+            concat!(
+                "List the schedules in the active realm, one page at a time: active and paused ",
+                "schedules in creation order; deleted schedules are not listed (their occurrence ",
+                "history stays readable with meerkat_schedule_occurrences). Use this to discover ",
+                "existing schedules before creating duplicates. Each row is a summary: schedule_id, ",
+                "name, phase, revision, trigger, the target's kind and ids, the first 160 characters ",
+                "of the action text (action_head; action_chars is the text's full length) and the ",
+                "created and updated times. Read a schedule's full action, policies and options with ",
+                "meerkat_schedule_get. limit sets the page size (default 50, maximum 200); pass the ",
+                "reply's opaque page.next_cursor as cursor to continue after its last row.",
+            ),
+            list_schema(),
         ),
         tool_descriptor(
             "meerkat_schedule_update",
@@ -196,14 +209,13 @@ pub fn schedule_tools_list() -> Vec<Value> {
                 "pending (not yet due), claimed (picked up by driver), dispatching (delivery in progress), ",
                 "awaiting_completion, completed, skipped, misfired, superseded, or delivery_failed. Use this ",
                 "to verify a schedule is firing correctly, diagnose misfires, or check delivery history. ",
-                "With only schedule_id it returns every occurrence in full, which can be large for a ",
-                "long-running schedule. To read less: occurrence_id returns that one occurrence with all ",
-                "of its delivery receipts (not found if it belongs to another schedule); due_after_utc / ",
-                "due_before_utc (inclusive, RFC 3339 with any offset) and phase filter the rows; limit pages ",
-                "them in due order (default 100 once any of these options or view=summary is given, ",
-                "maximum 500; view=full alone keeps the full unpaged reply) and the reply's opaque ",
-                "page.next_cursor continues after the last row; view=summary drops the trigger, the ",
-                "target action and prompt and the machine state. A receipt with stage ",
+                "Every list reply is one page in due order: limit sets its size (default 50, maximum ",
+                "200) and the reply's opaque page.next_cursor continues after its last row. To read ",
+                "less: occurrence_id returns that one occurrence with all of its delivery receipts (not ",
+                "found if it belongs to another schedule); due_after_utc / due_before_utc (inclusive, ",
+                "RFC 3339 with any offset) and phase filter the rows; view=summary drops the trigger and ",
+                "the target action and prompt (view=full, the default, returns each occurrence with its ",
+                "trigger and target once). A receipt with stage ",
                 "completed records that delivery finished, not the outcome of the work the target did; a ",
                 "missing or null materialized_session_id means the runtime session is unknown.",
             ),
@@ -742,50 +754,45 @@ pub(crate) async fn run_schedule_tools_call(
         "meerkat_schedule_create" => {
             let request: CreateScheduleRequest = parse_args(name, arguments)?;
             let schedule = service.create(request).await?;
-            Ok(encode(name, schedule)?)
+            Ok(encode(name, ScheduleDetail::of(&schedule))?)
         }
         "meerkat_schedule_get" => {
             let args: ScheduleIdArgs = parse_args(name, arguments)?;
             let schedule_id = parse_schedule_id(&args.schedule_id)?;
             let schedule = service.get(&schedule_id).await?;
-            Ok(encode(name, schedule)?)
+            Ok(encode(name, ScheduleDetail::of(&schedule))?)
         }
         "meerkat_schedule_list" => {
-            let _: EmptyArgs = parse_args(name, arguments)?;
-            let schedules = service.list().await?;
-            Ok(encode(name, json!({ "schedules": schedules }))?)
+            let args: ListArgs = parse_args(name, arguments)?;
+            list_schedule_summaries(service, &args).await
         }
         "meerkat_schedule_update" => {
             let args: UpdateScheduleArgs = parse_args(name, arguments)?;
             let schedule_id = parse_schedule_id(&args.schedule_id)?;
             let schedule = service.update(&schedule_id, args.update).await?;
-            Ok(encode(name, schedule)?)
+            Ok(encode(name, ScheduleDetail::of(&schedule))?)
         }
         "meerkat_schedule_pause" => {
             let args: ScheduleIdArgs = parse_args(name, arguments)?;
             let schedule_id = parse_schedule_id(&args.schedule_id)?;
             let schedule = service.pause(&schedule_id).await?;
-            Ok(encode(name, schedule)?)
+            Ok(encode(name, ScheduleDetail::of(&schedule))?)
         }
         "meerkat_schedule_resume" => {
             let args: ScheduleIdArgs = parse_args(name, arguments)?;
             let schedule_id = parse_schedule_id(&args.schedule_id)?;
             let schedule = service.resume(&schedule_id).await?;
-            Ok(encode(name, schedule)?)
+            Ok(encode(name, ScheduleDetail::of(&schedule))?)
         }
         "meerkat_schedule_delete" => {
             let args: ScheduleIdArgs = parse_args(name, arguments)?;
             let schedule_id = parse_schedule_id(&args.schedule_id)?;
             let schedule = service.delete(&schedule_id).await?;
-            Ok(encode(name, schedule)?)
+            Ok(encode(name, ScheduleDetail::of(&schedule))?)
         }
         "meerkat_schedule_occurrences" => {
             let args: OccurrencesArgs = parse_args(name, arguments)?;
             let schedule_id = parse_schedule_id(&args.schedule_id)?;
-            if args.is_unbounded() {
-                let occurrences = service.list_occurrences(&schedule_id).await?;
-                return Ok(encode_occurrences(occurrences)?);
-            }
             bounded_occurrences(service, &schedule_id, &args).await
         }
         other => Err(ScheduleToolError::invalid_arguments(format!(
@@ -816,19 +823,329 @@ fn encode(name: &str, value: impl Serialize) -> Result<Value, ScheduleToolError>
     })
 }
 
-fn encode_occurrences(occurrences: Vec<Occurrence>) -> Result<Value, ScheduleToolError> {
-    encode(
-        "meerkat_schedule_occurrences",
-        json!({ "occurrences": occurrences }),
-    )
+/// The page size a `limit` option asks for: `DEFAULT_PAGE` without one, and
+/// refused outside `1..=MAX_PAGE`.
+fn page_limit(limit: Option<usize>) -> Result<usize, ScheduleToolError> {
+    match limit {
+        Some(0) => Err(ScheduleToolError::invalid_arguments(
+            "limit must be at least 1",
+        )),
+        Some(limit) if limit > MAX_PAGE => Err(ScheduleToolError::invalid_arguments(format!(
+            "limit must be at most {MAX_PAGE}"
+        ))),
+        Some(limit) => Ok(limit),
+        None => Ok(DEFAULT_PAGE),
+    }
 }
 
-/// `meerkat_schedule_occurrences` with any bounded option set. Phase and due
-/// bounds go to the store as an [`OccurrenceFilter`], which applies them in
-/// its query; the cursor and page cut are applied here on the store's
-/// `(due_at, schedule_revision, occurrence_ordinal)` order. Every list reply
-/// in this mode is paged, `DEFAULT_OCCURRENCE_PAGE` rows unless `limit` says
-/// otherwise.
+/// An opaque page cursor: `prefix` and the hex of `body`.
+fn encode_cursor(prefix: &str, body: &str) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut cursor = String::with_capacity(prefix.len() + body.len() * 2);
+    cursor.push_str(prefix);
+    for byte in body.bytes() {
+        cursor.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        cursor.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    cursor
+}
+
+/// The body of a cursor [`encode_cursor`] wrote with `prefix`, or `None` for
+/// anything else.
+fn decode_cursor(prefix: &str, raw: &str) -> Option<String> {
+    let hex = raw.strip_prefix(prefix)?;
+    if !hex.len().is_multiple_of(2) || !hex.is_ascii() {
+        return None;
+    }
+    let bytes = (0..hex.len())
+        .step_by(2)
+        .map(|at| {
+            hex.get(at..at + 2)
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+        })
+        .collect::<Option<Vec<u8>>>()?;
+    String::from_utf8(bytes).ok()
+}
+
+/// The public shape of one schedule in a tool reply: the fields of the
+/// `schedule/*` RPC projection (`meerkat_contracts::wire::Schedule`, which a
+/// contracts row keeps equal to it). The persistence serializer also writes
+/// the machine state, which repeats the trigger, the whole target and the
+/// superseded acks as escaped keys; that is the store's, not the caller's.
+#[derive(Serialize)]
+struct ScheduleDetail<'a> {
+    schedule_id: &'a ScheduleId,
+    phase: SchedulePhase,
+    revision: ScheduleRevision,
+    trigger: &'a TriggerSpec,
+    target: &'a TargetBinding,
+    misfire_policy: &'a MisfirePolicy,
+    overlap_policy: &'a OverlapPolicy,
+    missing_target_policy: &'a MissingTargetPolicy,
+    next_occurrence_ordinal: OccurrenceOrdinal,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    planning_cursor_utc: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    superseded_ack_ids: Option<&'a BTreeSet<OccurrenceId>>,
+    #[serde(flatten)]
+    config: &'a ScheduleConfig,
+}
+
+impl<'a> ScheduleDetail<'a> {
+    fn of(schedule: &'a Schedule) -> Self {
+        Self {
+            schedule_id: &schedule.schedule_id,
+            phase: schedule.phase,
+            revision: schedule.revision,
+            trigger: &schedule.trigger,
+            target: &schedule.target,
+            misfire_policy: &schedule.misfire_policy,
+            overlap_policy: &schedule.overlap_policy,
+            missing_target_policy: &schedule.missing_target_policy,
+            next_occurrence_ordinal: schedule.next_occurrence_ordinal,
+            planning_cursor_utc: schedule.planning_cursor_utc,
+            superseded_ack_ids: (!schedule.superseded_ack_ids.is_empty())
+                .then_some(&schedule.superseded_ack_ids),
+            config: &schedule.config,
+        }
+    }
+}
+
+/// The public shape of one occurrence in a full tool reply: the fields of
+/// the `schedule/occurrences` RPC projection. The persistence serializer also
+/// writes the machine state, which repeats the trigger and the whole target
+/// as escaped keys, and the claim token; neither is the caller's.
+#[derive(Serialize)]
+struct OccurrenceDetail<'a> {
+    occurrence_id: &'a OccurrenceId,
+    schedule_id: &'a ScheduleId,
+    schedule_revision: ScheduleRevision,
+    occurrence_ordinal: OccurrenceOrdinal,
+    phase: OccurrencePhase,
+    due_at_utc: DateTime<Utc>,
+    trigger_snapshot: &'a TriggerSpec,
+    target_snapshot: &'a TargetBinding,
+    misfire_policy: &'a MisfirePolicy,
+    overlap_policy: &'a OverlapPolicy,
+    missing_target_policy: &'a MissingTargetPolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claimed_by: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lease_expires_at_utc: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delivery_correlation_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_receipt: Option<&'a DeliveryReceipt>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_class: Option<OccurrenceFailureClass>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime_outcome: Option<&'a RuntimeDeliveryOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_detail: Option<&'a str>,
+    attempt_count: u32,
+    created_at_utc: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claimed_at_utc: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dispatched_at_utc: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completed_at_utc: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    superseded_by_revision: Option<ScheduleRevision>,
+}
+
+impl<'a> OccurrenceDetail<'a> {
+    fn of(occurrence: &'a Occurrence) -> Self {
+        Self {
+            occurrence_id: &occurrence.occurrence_id,
+            schedule_id: &occurrence.schedule_id,
+            schedule_revision: occurrence.schedule_revision,
+            occurrence_ordinal: occurrence.occurrence_ordinal,
+            phase: occurrence.phase,
+            due_at_utc: occurrence.due_at_utc,
+            trigger_snapshot: &occurrence.trigger_snapshot,
+            target_snapshot: &occurrence.target_snapshot,
+            misfire_policy: &occurrence.misfire_policy,
+            overlap_policy: &occurrence.overlap_policy,
+            missing_target_policy: &occurrence.missing_target_policy,
+            claimed_by: occurrence.claimed_by.as_deref(),
+            lease_expires_at_utc: occurrence.lease_expires_at_utc,
+            delivery_correlation_id: occurrence.delivery_correlation_id.as_deref(),
+            last_receipt: occurrence.last_receipt.as_ref(),
+            failure_class: occurrence.failure_class,
+            runtime_outcome: occurrence.runtime_outcome.as_ref(),
+            failure_detail: occurrence.failure_detail.as_deref(),
+            attempt_count: occurrence.attempt_count,
+            created_at_utc: occurrence.created_at_utc,
+            claimed_at_utc: occurrence.claimed_at_utc,
+            dispatched_at_utc: occurrence.dispatched_at_utc,
+            completed_at_utc: occurrence.completed_at_utc,
+            superseded_by_revision: occurrence.superseded_by_revision,
+        }
+    }
+}
+
+/// `meerkat_schedule_list`: one page of schedule summaries in creation order.
+/// The store returns every live schedule; the order, the cursor and the page
+/// cut are applied here, so the reply stays bounded whatever the realm holds
+/// and whatever order a host-injected store returns.
+async fn list_schedule_summaries(
+    service: &ScheduleService,
+    args: &ListArgs,
+) -> Result<Value, ScheduleToolFailure> {
+    let limit = page_limit(args.limit)?;
+    let after_key = args
+        .cursor
+        .as_deref()
+        .map(SchedulePageKey::decode)
+        .transpose()?;
+    let mut schedules = service.list().await?;
+    schedules.sort_by_cached_key(SchedulePageKey::of);
+    if let Some(after) = &after_key {
+        schedules.retain(|schedule| SchedulePageKey::of(schedule) > *after);
+    }
+    let has_more = schedules.len() > limit;
+    schedules.truncate(limit);
+    let next_cursor = if has_more {
+        schedules
+            .last()
+            .map(|last| SchedulePageKey::of(last).encode())
+    } else {
+        None
+    };
+    let returned = schedules.len();
+    let rows = schedules
+        .iter()
+        .map(schedule_summary)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(encode(
+        "meerkat_schedule_list",
+        json!({
+            "schedules": rows,
+            "page": {
+                "returned": returned,
+                "has_more": has_more,
+                "next_cursor": next_cursor,
+            },
+        }),
+    )?)
+}
+
+/// The order `meerkat_schedule_list` pages in, and the position a page cursor
+/// names: creation time, then schedule id. Callers see the cursor only as an
+/// opaque string.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SchedulePageKey {
+    created_at_utc: DateTime<Utc>,
+    schedule_id: ScheduleId,
+}
+
+impl SchedulePageKey {
+    fn of(schedule: &Schedule) -> Self {
+        Self {
+            created_at_utc: schedule.config.created_at_utc,
+            schedule_id: schedule.schedule_id.clone(),
+        }
+    }
+
+    fn encode(&self) -> String {
+        encode_cursor(
+            SCHEDULE_CURSOR_PREFIX,
+            &format!(
+                "{}.{}.{}",
+                self.created_at_utc.timestamp(),
+                self.created_at_utc.timestamp_subsec_nanos(),
+                self.schedule_id
+            ),
+        )
+    }
+
+    fn decode(raw: &str) -> Result<Self, ScheduleToolError> {
+        let invalid = || ScheduleToolError::invalid_arguments("invalid cursor");
+        let body = decode_cursor(SCHEDULE_CURSOR_PREFIX, raw).ok_or_else(invalid)?;
+        let mut parts = body.split('.');
+        let (Some(seconds), Some(nanos), Some(schedule_id), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(invalid());
+        };
+        let created_at_utc = DateTime::<Utc>::from_timestamp(
+            seconds.parse().map_err(|_| invalid())?,
+            nanos.parse().map_err(|_| invalid())?,
+        )
+        .ok_or_else(invalid)?;
+        Ok(Self {
+            created_at_utc,
+            schedule_id: ScheduleId::parse(schedule_id).map_err(|_| invalid())?,
+        })
+    }
+}
+
+/// One row of a `meerkat_schedule_list` page: which schedule it is, its
+/// phase and revision, when it fires, which target it names, and a bounded
+/// head of its action text, enough to find a schedule and to avoid creating
+/// a duplicate. Its action, policies, materialization spec, helper options
+/// and params are `meerkat_schedule_get`'s.
+fn schedule_summary(schedule: &Schedule) -> Result<Value, ScheduleToolError> {
+    let target = summary_target(&encode("meerkat_schedule_list", &schedule.target)?);
+    let mut row = json!({
+        "schedule_id": schedule.schedule_id,
+        "phase": schedule.phase,
+        "revision": schedule.revision,
+        "trigger": schedule.trigger,
+        "target": target,
+        "created_at_utc": schedule.config.created_at_utc,
+        "updated_at_utc": schedule.config.updated_at_utc,
+    });
+    if let Some(name) = &schedule.config.name {
+        row["name"] = json!(bounded_head(name, SUMMARY_NAME_CHARS));
+    }
+    if let Some(text) = action_text(&schedule.target) {
+        row["action_head"] = json!(bounded_head(&text, ACTION_HEAD_CHARS));
+        row["action_chars"] = json!(text.chars().count());
+    }
+    Ok(row)
+}
+
+/// The text a target's action carries: a session or identity prompt, the
+/// content a member is sent, the prompt a helper is spawned or forked with,
+/// or an event's type. A flow or host runnable target carries params instead
+/// and has none.
+fn action_text(target: &TargetBinding) -> Option<String> {
+    let session_action = |action: &ScheduledSessionAction| match action {
+        ScheduledSessionAction::Prompt { prompt, .. } => prompt.text_content(),
+        ScheduledSessionAction::Event { event_type, .. } => event_type.clone(),
+    };
+    match target {
+        TargetBinding::Session(binding) => Some(session_action(binding.action())),
+        TargetBinding::Identity(binding) => Some(session_action(binding.action())),
+        TargetBinding::Mob(binding) => match binding.as_ref() {
+            MobTargetBinding::Member {
+                action: ScheduledMobAction::Send { content, .. },
+                ..
+            } => Some(content.text_content()),
+            MobTargetBinding::SpawnHelper { prompt, .. }
+            | MobTargetBinding::ForkHelper { prompt, .. } => Some(prompt.clone()),
+            MobTargetBinding::Flow { .. } => None,
+        },
+        TargetBinding::HostRunnable(_) => None,
+    }
+}
+
+/// `text` whole when it has at most `limit` characters, else its first
+/// `limit` characters and "...".
+fn bounded_head(text: &str, limit: usize) -> String {
+    match text.char_indices().nth(limit) {
+        Some((cut, _)) => format!("{}...", &text[..cut]),
+        None => text.to_string(),
+    }
+}
+
+/// `meerkat_schedule_occurrences`. Phase and due bounds go to the store as an
+/// [`OccurrenceFilter`], which applies them in its query; the cursor and page
+/// cut are applied here on the store's
+/// `(due_at, schedule_revision, occurrence_ordinal)` order. Every list reply is
+/// paged, `DEFAULT_PAGE` rows unless `limit` says otherwise.
 async fn bounded_occurrences(
     service: &ScheduleService,
     schedule_id: &ScheduleId,
@@ -885,19 +1202,7 @@ async fn bounded_occurrences(
         )
         .into());
     }
-    let limit = match args.limit {
-        Some(0) => {
-            return Err(ScheduleToolError::invalid_arguments("limit must be at least 1").into());
-        }
-        Some(limit) if limit > MAX_OCCURRENCE_PAGE => {
-            return Err(ScheduleToolError::invalid_arguments(format!(
-                "limit must be at most {MAX_OCCURRENCE_PAGE}"
-            ))
-            .into());
-        }
-        Some(limit) => limit,
-        None => DEFAULT_OCCURRENCE_PAGE,
-    };
+    let limit = page_limit(args.limit)?;
     let after_key = args
         .cursor
         .as_deref()
@@ -1006,37 +1311,18 @@ impl OccurrencePageKey {
     }
 
     fn encode(&self) -> String {
-        let body = format!(
-            "{}.{}.{}",
-            self.due_at_ms, self.schedule_revision, self.occurrence_ordinal
-        );
-        const DIGITS: &[u8; 16] = b"0123456789abcdef";
-        let mut cursor = String::with_capacity(OCCURRENCE_CURSOR_PREFIX.len() + body.len() * 2);
-        cursor.push_str(OCCURRENCE_CURSOR_PREFIX);
-        for byte in body.bytes() {
-            cursor.push(char::from(DIGITS[usize::from(byte >> 4)]));
-            cursor.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
-        }
-        cursor
+        encode_cursor(
+            OCCURRENCE_CURSOR_PREFIX,
+            &format!(
+                "{}.{}.{}",
+                self.due_at_ms, self.schedule_revision, self.occurrence_ordinal
+            ),
+        )
     }
 
     fn decode(raw: &str) -> Result<Self, ScheduleToolError> {
         let invalid = || ScheduleToolError::invalid_arguments("invalid cursor");
-        let hex = raw
-            .strip_prefix(OCCURRENCE_CURSOR_PREFIX)
-            .ok_or_else(invalid)?;
-        if !hex.len().is_multiple_of(2) || !hex.is_ascii() {
-            return Err(invalid());
-        }
-        let bytes = (0..hex.len())
-            .step_by(2)
-            .map(|at| {
-                hex.get(at..at + 2)
-                    .and_then(|pair| u8::from_str_radix(pair, 16).ok())
-            })
-            .collect::<Option<Vec<u8>>>()
-            .ok_or_else(invalid)?;
-        let body = String::from_utf8(bytes).map_err(|_| invalid())?;
+        let body = decode_cursor(OCCURRENCE_CURSOR_PREFIX, raw).ok_or_else(invalid)?;
         let mut parts = body.split('.');
         let (Some(due), Some(revision), Some(ordinal), None) =
             (parts.next(), parts.next(), parts.next(), parts.next())
@@ -1062,7 +1348,10 @@ fn render_occurrence(
     view: OccurrencesView,
 ) -> Result<Value, ScheduleToolError> {
     match view {
-        OccurrencesView::Full => encode("meerkat_schedule_occurrences", occurrence),
+        OccurrencesView::Full => encode(
+            "meerkat_schedule_occurrences",
+            OccurrenceDetail::of(occurrence),
+        ),
         OccurrencesView::Summary => occurrence_summary(occurrence),
     }
 }
@@ -1321,10 +1610,21 @@ fn rewrite_current_session_target_object(
     Ok(())
 }
 
-fn empty_schema() -> Value {
+fn list_schema() -> Value {
     json!({
         "type": "object",
-        "properties": {},
+        "properties": {
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": MAX_PAGE,
+                "description": "Return at most this many schedules in creation order: default 50, maximum 200. Every reply carries page.returned (rows in this page), page.has_more and page.next_cursor.",
+            },
+            "cursor": {
+                "type": "string",
+                "description": "page.next_cursor from the previous reply, to continue after its last schedule. Opaque: pass it back unchanged.",
+            },
+        },
         "additionalProperties": false,
     })
 }
@@ -1358,8 +1658,8 @@ fn occurrences_schema() -> Value {
             "limit": {
                 "type": "integer",
                 "minimum": 1,
-                "maximum": MAX_OCCURRENCE_PAGE,
-                "description": "Return at most this many occurrences in due order: default 100 once a filter, cursor, limit or view=summary is given, maximum 500. Paged replies carry page.returned (rows in this page), page.has_more and page.next_cursor. With only schedule_id, or only view=full, the reply is the full unpaged list.",
+                "maximum": MAX_PAGE,
+                "description": "Return at most this many occurrences in due order: default 50, maximum 200. Every list reply is paged and carries page.returned (rows in this page), page.has_more and page.next_cursor.",
             },
             "cursor": {
                 "type": "string",
@@ -1368,7 +1668,7 @@ fn occurrences_schema() -> Value {
             "view": {
                 "type": "string",
                 "enum": ["full", "summary"],
-                "description": "full (default) returns whole occurrence objects; summary returns ids, phase, due time in UTC and in the trigger's timezone, attempts, the last receipt, the runtime outcome and which target it names, without the trigger, the target action or prompt, or machine state. Applies to the list and to an occurrence_id read alike; in a summary occurrence_id read the receipts are summarized too (no detail, correlation id or runtime outcome).",
+                "description": "full (default) returns whole occurrence objects, each with its trigger and target once; summary returns ids, phase, due time in UTC and in the trigger's timezone, attempts, the last receipt, the runtime outcome and which target it names, without the trigger or the target action or prompt. Applies to the list and to an occurrence_id read alike; in a summary occurrence_id read the receipts are summarized too (no detail, correlation id or runtime outcome).",
             },
         },
         "required": ["schedule_id"],
