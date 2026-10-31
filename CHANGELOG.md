@@ -52,7 +52,13 @@ them.
   as `ResumeRefused`, and `ClassifyStopInputDisposition` keeps none of the
   inputs bound to it (Staged, Applied or AppliedPendingConsumption), under
   `Requeue` or under `Keep` (they are answered `Abandon`); a queued input
-  that only still names the run is answered as any other input.
+  that only still names the run is answered as any other input. A
+  suspension (`SuspendRunForStop`, either cause) carries a cancel the run
+  accepted before it (its turn's cancel after the boundary, or an ambient
+  `CancelAfterBoundary` whose boundary dispatch is outstanding) as the
+  run's stop intent, and an ambient `CancelAfterBoundary` of an attached
+  session that holds a run marked resumable, with no run current and no
+  unregister draining, records the stop intent on that run.
 
 - Behaviour-only (not measured by the gate): a host store meets obligation
   5 (fencing) at commit: it refuses a batch whose token is below one
@@ -638,14 +644,16 @@ them.
   ends first loses it and the next start resumes the run, another writer
   that takes the session over runs its inputs, and a host runtime that
   stops under the session (whose registration then reloads) loses it too.
-  A cancel at the next boundary asked while the run is suspended is refused
-  (interrupt or stop the run instead), and a stop that races the gap's own
-  suspension of the run can fail with an internal error naming a
-  contributor whose wait was answered `RequeuedAcrossStop`. A cancel at the
-  next boundary accepted just before that suspension can likewise fail
-  when its dispatch to the dropped turn fails, while the run is still
-  settled as cancelled once the fence is back. A gap met while
-  a run re-bases its session is not suspended: the re-base's outcome is
+  A cancel at the next boundary asked while the run is suspended stands as
+  its stop intent when the session's executor is attached, as a stop does;
+  with none attached it is refused (interrupt or stop the run instead), and
+  a stop that races the gap's own suspension of the run can fail with an
+  internal error naming a contributor whose wait was answered
+  `RequeuedAcrossStop`. A cancel at the next boundary accepted just before
+  that suspension can likewise fail when its dispatch to the dropped turn
+  fails, while the run is still settled as cancelled once the fence is
+  back. A gap met while a run re-bases its session is not suspended: the
+  re-base's outcome is
   unknown, and the session reloads as before. A closing save still
   refused after its one wait (a gap that outlasts the wait after a run's
   final answer) keeps the teardown class, and the turn fails: the turn's

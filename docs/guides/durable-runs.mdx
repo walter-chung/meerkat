@@ -636,8 +636,11 @@ Before you run a host store in production, run the host store chapter of the
   and the next start resumes the run; another process that takes the
   session over runs its inputs; and a host runtime that stops under the
   session, whose registration then reloads, loses it too. A cancel at the
-  next boundary (`cancel_after_boundary`) asked while the run is suspended
-  finds no running turn and is refused; interrupt or stop the run instead.
+  next boundary (`cancel_after_boundary`) asked while the run is suspended,
+  with the session's executor attached, stands as the run's stop intent, as
+  a stop does: the run never resumes and is settled as cancelled once the
+  fence is back. With no executor attached it finds no running turn and is
+  refused; interrupt or stop the run instead.
   A stop that races the gap's own suspension of the run can fail with an
   internal error naming an input whose wait was answered
   `requeued_across_stop`; read the inputs' outcome later. A cancel at the

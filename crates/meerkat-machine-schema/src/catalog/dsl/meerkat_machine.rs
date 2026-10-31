@@ -9538,6 +9538,12 @@ macro_rules! meerkat_catalog_machine_dsl {
                 previous_view_image_visible != next_view_image_visible)
         }
 
+        // An owned copy of a run id: a field read on an assignment's right side
+        // lowers as a move, which a non-Copy run id cannot take.
+        helper owned_run_id(run: Option<RunId>) -> Option<RunId> {
+            run
+        }
+
         // =====================================================================
         // Invariants
         // =====================================================================
@@ -15686,6 +15692,14 @@ macro_rules! meerkat_catalog_machine_dsl {
         // cancels take the AlreadyPending no-op arms below — this is what
         // bounds an embedder boundary handle that (wrongly) re-enters
         // MeerkatMachine::cancel_after_boundary to exactly one extra lap.
+        // With the executor attached and no run current, the session may
+        // still hold a run marked resumable (a store fence gap's, or a
+        // restart's not resumed yet): the ambient cancel then records the
+        // stop intent on that run, as `StopCurrentRunForRunResumable` does
+        // (never while the registration drains for its unregister, whose
+        // resumable run is the next start's), so the run is settled as
+        // cancelled instead of resuming. With no resumable run it records
+        // nothing on any run, as before.
         transition CancelAfterBoundaryAttached {
             on input CancelAfterBoundary { reason }
             guard { self.lifecycle_phase == Phase::Attached }
@@ -15693,6 +15707,12 @@ macro_rules! meerkat_catalog_machine_dsl {
             update {
                 self.boundary_cancel_dispatch_pending = true;
                 self.boundary_cancel_dispatch_generation = self.boundary_cancel_dispatch_generation + 1;
+                if self.current_run_id == None
+                    && self.resumable_run_id != None
+                    && self.registration_phase != RegistrationPhase::Draining
+                {
+                    self.run_stop_requested = owned_run_id(self.resumable_run_id);
+                }
             }
             to Attached
             emit RequestCancellationAtBoundary
