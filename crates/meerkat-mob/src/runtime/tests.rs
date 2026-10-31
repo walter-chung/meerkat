@@ -88543,9 +88543,10 @@ struct MobRuntimeParityInvocationReport {
     outcome_kind: MobRuntimeParityOutcomeKind,
     result_summary: String,
     after: Option<MobRuntimeParitySnapshotSummary>,
-    /// The probed call did not answer within the probe timeout. Its outcome
-    /// is recorded as `Err`, but a hang is never a parity answer: the kernel
-    /// verdict fails the row.
+    /// The probed call did not answer within the probe timeout, or the
+    /// runtime answered with one of its own typed timeouts (`*_timed_out`).
+    /// Its outcome is recorded as `Err`, but a hang is never a parity answer:
+    /// the kernel verdict fails the row.
     timed_out: bool,
 }
 
@@ -91965,16 +91966,22 @@ async fn execute_mob_runtime_parity_probe_inner(
     let after = mob_runtime_parity_snapshot_summary(&fixture.handle).await;
     fixture.cleanup().await;
 
-    let timed_out = result.is_err();
-    let (outcome_kind, result_summary) = match result {
-        Ok(Ok(summary)) => (MobRuntimeParityOutcomeKind::Ok, summary),
-        Ok(Err(error)) => (
-            MobRuntimeParityOutcomeKind::Err,
-            summarize_mob_runtime_error(&error),
-        ),
+    // A deadline the runtime enforces itself is no refusal either:
+    // `summarize_mob_runtime_error` names every typed timeout `*_timed_out`
+    // (`actor_command_timed_out`, `kickoff_wait_timed_out`,
+    // `flow_turn_timed_out`, a wake refused as `wake_timed_out`, ...), and
+    // such a row fails like the probe timeout.
+    let (outcome_kind, result_summary, timed_out) = match result {
+        Ok(Ok(summary)) => (MobRuntimeParityOutcomeKind::Ok, summary, false),
+        Ok(Err(error)) => {
+            let summary = summarize_mob_runtime_error(&error);
+            let timed_out = summary.ends_with("_timed_out");
+            (MobRuntimeParityOutcomeKind::Err, summary, timed_out)
+        }
         Err(_) => (
             MobRuntimeParityOutcomeKind::Err,
             format!("probe_timeout:{probe:?}"),
+            true,
         ),
     };
 
@@ -94000,7 +94007,8 @@ struct MobParityObservation {
     phase: MobRuntimeParityPhase,
     input: SchemaMobMachineInputVariant,
     runtime: MobRuntimeParityOutcomeKind,
-    /// The probed call hung past the probe timeout: never a parity answer.
+    /// The probed call hung past a deadline, the probe's or one the runtime
+    /// enforces itself: never a parity answer.
     runtime_timed_out: bool,
     kernel: MobKernelOutcome,
     differing_keys: Vec<String>,
@@ -94285,8 +94293,10 @@ const MOB_PARITY_MISSING_MEMBER_GAP: &str = "projection gap: identity_to_runtime
      (KERNEL_UNIMPLEMENTED_NATIVE_HELPERS) on member_session_bindings, which is not projected";
 const MOB_PARITY_SESSION_BOUND_GAP: &str = "kernel gap: every arm's session_bound_runtimes_match \
      guard calls mob_machine_session_bound_live_runtime_ids_match \
-     (KERNEL_UNIMPLEMENTED_NATIVE_HELPERS); behind it, the external-member guards pass on the \
-     probe's empty external_members, and no other guard blocks the projected pre-state";
+     (KERNEL_UNIMPLEMENTED_NATIVE_HELPERS), whose own inputs identity_to_runtime and \
+     member_session_bindings are not projected, so once it is implemented Running and Stopped stay \
+     blocked on them and only Completed, with no live member, can fire; behind it, the \
+     external-member guards pass on the probe's empty external_members";
 const MOB_PARITY_RESUME_GAP: &str = "projection gap: ResumeStopped's placed_completion_stop_intent \
      guard needs the Stop intent the public stop records in placed_completion_lifecycle_intent, \
      which the snapshot does not project; no other guard blocks";
