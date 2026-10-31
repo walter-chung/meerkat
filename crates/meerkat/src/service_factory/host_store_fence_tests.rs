@@ -48,9 +48,11 @@ use std::sync::{Mutex as StdMutex, OnceLock, Weak};
 use std::time::Duration;
 use tempfile::TempDir;
 
-/// A turn's deadline, under paused time: a row whose re-acquire lists for
-/// 30 s waits that long for the run's cleanup writes, at no wall clock cost.
-const PAUSED_DEADLINE: Duration = Duration::from_secs(600);
+/// A turn's deadline. The rows run on real time: the machine works on its own
+/// runtimes, which a paused test clock does not cover. Four store fence gaps
+/// are about twice what the slowest row needs (a resumed run's gap and its
+/// resume), and short of a hung-test kill, so a row that hangs fails here.
+const TURN_DEADLINE: Duration = Duration::from_secs(FENCE_GAP.as_secs() * 4);
 
 /// How long a row waits for the writer to stop.
 const STOP_DEADLINE: Duration = Duration::from_secs(30);
@@ -1101,7 +1103,7 @@ impl FenceRow {
     /// before.
     async fn assert_settled_as_cancelled(&self, site: &str, requests: usize) {
         let phases = self
-            .wait_for_input_phases(&[InputLifecycleState::Abandoned], PAUSED_DEADLINE)
+            .wait_for_input_phases(&[InputLifecycleState::Abandoned], TURN_DEADLINE)
             .await;
         assert_eq!(
             phases,
@@ -1276,7 +1278,7 @@ async fn run_with_window_closing_during(closes_during: ClosesDuring) -> FencedRu
 /// `closes_during` names.
 async fn run_with_stop(closes_during: ClosesDuring, stop: Stop, turn: Turn) -> FencedRun {
     let mut row = FenceRow::open(closes_during, stop, turn).await;
-    let answer = row.run_turn(PAUSED_DEADLINE).await;
+    let answer = row.run_turn(TURN_DEADLINE).await;
     let input_phases = row.input_phases().await;
     FencedRun {
         answer,
@@ -1428,7 +1430,7 @@ async fn assert_suspended_through_the_gap(
 /// so the writer never gets its window back. No other writer is found, so
 /// the direct turn fails with a retryable store error once its dispatch
 /// wait passes, not with the teardown class.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn a_writer_past_its_fence_window_makes_no_model_call_and_dispatches_no_tool() {
     let first = run_with_window_closing_during(ClosesDuring::FirstCommit).await;
     assert!(!first.lease_live_after, "the window closed");
@@ -1459,7 +1461,7 @@ async fn a_writer_past_its_fence_window_makes_no_model_call_and_dispatches_no_to
 /// refused at once and the turn failed with the teardown class
 /// (`DurableProjectionAuthorityUnknown`, "self-fence window closed ...
 /// renew failed: true").
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn a_model_call_after_a_timed_out_renew_waits_for_the_reacquire() {
     let run = run_with_stop(
         ClosesDuring::SecondCommit,
@@ -1474,7 +1476,7 @@ async fn a_model_call_after_a_timed_out_renew_waits_for_the_reacquire() {
 /// was in flight waits, before it admits the round's call, for the
 /// re-acquire; the call then runs once and the turn completes. Before the
 /// fix the round was refused at once and the turn failed.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn a_tool_round_after_a_timed_out_renew_waits_for_the_reacquire() {
     let run = run_with_stop(
         ClosesDuring::FirstCommit,
@@ -1490,7 +1492,7 @@ async fn a_tool_round_after_a_timed_out_renew_waits_for_the_reacquire() {
 /// starts, for the re-acquire; the second call then runs once and the turn
 /// completes. Before the fix the second call was refused ("this writer's
 /// self-fence window closed before the call started") and the turn failed.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn a_tool_call_after_a_timed_out_renew_waits_for_the_reacquire() {
     let run = run_with_stop(
         ClosesDuring::FirstCall,
@@ -1507,7 +1509,7 @@ async fn a_tool_call_after_a_timed_out_renew_waits_for_the_reacquire() {
 /// other writer was found: the writer stays stopped, the realm is not
 /// poisoned, and the turn is not the teardown class. Before, the turn was
 /// refused at once with the teardown class.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn a_direct_turn_whose_reacquire_keeps_failing_fails_retryably() {
     let run = run_with_stop(
         ClosesDuring::SecondCommit,
@@ -1525,7 +1527,7 @@ async fn a_direct_turn_whose_reacquire_keeps_failing_fails_retryably() {
 /// A re-acquire whose listing shows a batch another writer committed while
 /// this one was stopped poisons the realm: the waiting model call is
 /// refused with the teardown class, and nothing more is dispatched.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn a_foreign_batch_at_the_reacquire_refuses_the_dispatch() {
     let run = run_with_stop(
         ClosesDuring::SecondCommit,
@@ -1542,7 +1544,7 @@ async fn a_foreign_batch_at_the_reacquire_refuses_the_dispatch() {
 /// 13 s dispatch wait bound, so the direct turn fails with a retryable store
 /// error. The re-acquire itself goes on and resumes the writer once its
 /// listing answers; only the dispatch gave up.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn a_direct_turn_fails_retryably_when_its_reacquire_outlasts_the_bound() {
     let run = run_with_stop(
         ClosesDuring::SecondCommit,
@@ -1571,7 +1573,7 @@ async fn a_direct_turn_fails_retryably_when_its_reacquire_outlasts_the_bound() {
 /// the input is consumed once and the prompt is in the transcript once.
 /// Before, the retry was refused with the teardown class and the teardown
 /// ended the input stopped.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn an_ordinary_runs_fence_gap_before_its_first_commit_suspends_it_and_it_runs_once_the_fence_is_back()
  {
     let mut row = FenceRow::open(
@@ -1582,7 +1584,7 @@ async fn an_ordinary_runs_fence_gap_before_its_first_commit_suspends_it_and_it_r
     .await;
     assert_suspended_through_the_gap(&mut row, "before the first commit", 1, 0).await;
     let phases = row
-        .wait_for_input_phases(&[InputLifecycleState::Consumed], PAUSED_DEADLINE)
+        .wait_for_input_phases(&[InputLifecycleState::Consumed], TURN_DEADLINE)
         .await;
     assert_eq!(
         phases,
@@ -1608,7 +1610,7 @@ async fn an_ordinary_runs_fence_gap_before_its_first_commit_suspends_it_and_it_r
 /// stays pending through the gap. Once the fence is back the run resumes from
 /// that commit: its tool round is kept, the call does not run again, and the
 /// next model call completes the run with its input consumed once.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn an_ordinary_runs_fence_gap_after_a_round_suspends_it_and_it_resumes_once_the_fence_is_back()
  {
     let mut row = FenceRow::open(
@@ -1619,7 +1621,7 @@ async fn an_ordinary_runs_fence_gap_after_a_round_suspends_it_and_it_resumes_onc
     .await;
     assert_suspended_through_the_gap(&mut row, "after the round", 1, 1).await;
     let phases = row
-        .wait_for_input_phases(&[InputLifecycleState::Consumed], PAUSED_DEADLINE)
+        .wait_for_input_phases(&[InputLifecycleState::Consumed], TURN_DEADLINE)
         .await;
     assert_eq!(
         phases,
@@ -1650,7 +1652,7 @@ async fn an_ordinary_runs_fence_gap_after_a_round_suspends_it_and_it_resumes_onc
 /// is suspended in its turn, keeps its round, and resumes again once the
 /// fence is back, without running its call again. Before, a resumed run's
 /// failure stopped the runtime and ended its input stopped.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn a_resumed_run_suspended_for_a_fence_gap_keeps_its_round_and_resumes_again() {
     let mut row = FenceRow::open_scripted(
         ClosesDuring::SecondCommit,
@@ -1663,7 +1665,7 @@ async fn a_resumed_run_suspended_for_a_fence_gap_keeps_its_round_and_resumes_aga
     // The run resumes once the first gap ends; its model call stops the
     // writer again.
     let resumed = tokio::time::Instant::now();
-    while row.model_requests() < 2 && resumed.elapsed() < PAUSED_DEADLINE {
+    while row.model_requests() < 2 && resumed.elapsed() < TURN_DEADLINE {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert_eq!(row.model_requests(), 2, "the resumed run asked the model");
@@ -1679,7 +1681,7 @@ async fn a_resumed_run_suspended_for_a_fence_gap_keeps_its_round_and_resumes_aga
         "no model call while the second gap lasts"
     );
     let phases = row
-        .wait_for_input_phases(&[InputLifecycleState::Consumed], PAUSED_DEADLINE)
+        .wait_for_input_phases(&[InputLifecycleState::Consumed], TURN_DEADLINE)
         .await;
     assert_eq!(
         phases,
@@ -1710,7 +1712,7 @@ async fn a_resumed_run_suspended_for_a_fence_gap_keeps_its_round_and_resumes_aga
 /// instead of abandoned, because the store, which refuses every write of
 /// this writer from then on, keeps the input pending for the new owner, as
 /// the new owner reads it.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn a_foreign_batch_tells_the_waiter_its_input_stays_queued_for_the_new_owner() {
     let mut row = FenceRow::open(
         ClosesDuring::SecondCommit,
@@ -1749,7 +1751,7 @@ async fn a_foreign_batch_tells_the_waiter_its_input_stays_queued_for_the_new_own
 /// its input (the refused round was never committed) and completes once.
 /// Before, the refused commit failed the run, which spent a stage attempt on
 /// each retry through the gap.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn a_round_commit_that_meets_a_fence_gap_suspends_the_run_and_it_runs_once_the_fence_is_back()
 {
     let mut row = FenceRow::open(
@@ -1760,7 +1762,7 @@ async fn a_round_commit_that_meets_a_fence_gap_suspends_the_run_and_it_runs_once
     .await;
     assert_suspended_through_the_gap(&mut row, "the round's first commit", 1, 0).await;
     let phases = row
-        .wait_for_input_phases(&[InputLifecycleState::Consumed], PAUSED_DEADLINE)
+        .wait_for_input_phases(&[InputLifecycleState::Consumed], TURN_DEADLINE)
         .await;
     assert_eq!(
         phases,
@@ -1794,7 +1796,7 @@ async fn a_round_commit_that_meets_a_fence_gap_suspends_the_run_and_it_runs_once
 /// as the new owner reads it. Before, the failed commit was an ordinary run
 /// failure: the run was retried in this process and the waiter got another
 /// answer.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn a_takeover_first_met_at_a_commit_tells_the_waiter_its_input_stays_queued_for_the_new_owner()
  {
     let mut row = FenceRow::open(ClosesDuring::OnlyCall, Stop::TakenOver, Turn::Queued).await;
@@ -1832,7 +1834,7 @@ async fn a_takeover_first_met_at_a_commit_tells_the_waiter_its_input_stays_queue
 /// round 3 the suspension dropped the cancel (the resumed turn's start
 /// cleared it), and the run resumed and completed; before round 4 the
 /// waiter waited for the fence to come back, or for the whole outage.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn a_cancel_accepted_before_a_fence_gap_survives_it_and_the_run_does_not_come_back() {
     let row = FenceRow::open(
         ClosesDuring::FirstModelCall,
@@ -1852,7 +1854,7 @@ async fn a_cancel_accepted_before_a_fence_gap_survives_it_and_the_run_does_not_c
         .cancel_after_boundary(&row.session_id)
         .await
         .expect("the cancel is accepted while the run waits at the fence");
-    let answer = tokio::time::timeout(PAUSED_DEADLINE, completion.wait())
+    let answer = tokio::time::timeout(TURN_DEADLINE, completion.wait())
         .await
         .expect("the input's waiter is answered");
     assert!(
@@ -1875,7 +1877,7 @@ async fn a_cancel_accepted_before_a_fence_gap_survives_it_and_the_run_does_not_c
 /// is back its input ends abandoned. Before, the interrupt found no current
 /// run and was refused, and the run resumed and completed once the fence was
 /// back.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn an_interrupt_settles_a_run_a_fence_gap_suspended_and_it_does_not_come_back() {
     let mut row = FenceRow::open(
         ClosesDuring::FirstModelCall,
@@ -1905,7 +1907,7 @@ async fn an_interrupt_settles_a_run_a_fence_gap_suspended_and_it_does_not_come_b
 /// lost, and the loop tears the session down as a dispatch-time takeover
 /// does: the runtime loop ends, the run never resumes, and the new owner
 /// finds the input pending. Before, the loop stayed attached and idle.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn a_takeover_met_while_a_suspended_run_waits_tears_the_session_down() {
     let mut row = FenceRow::open(
         ClosesDuring::FirstModelCall,
@@ -1923,7 +1925,7 @@ async fn a_takeover_met_while_a_suspended_run_waits_tears_the_session_down() {
     );
     row.assert_answered_within_one_wait("a takeover while suspended");
     let started = tokio::time::Instant::now();
-    while row.realm.realm_poisoned().is_none() && started.elapsed() < PAUSED_DEADLINE {
+    while row.realm.realm_poisoned().is_none() && started.elapsed() < TURN_DEADLINE {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(
@@ -1931,7 +1933,7 @@ async fn a_takeover_met_while_a_suspended_run_waits_tears_the_session_down() {
         "the re-acquire after the gap finds another writer's batch"
     );
     assert!(
-        row.wait_for_the_runtime_loop_to_end(PAUSED_DEADLINE).await,
+        row.wait_for_the_runtime_loop_to_end(TURN_DEADLINE).await,
         "the session's runtime loop ends, as for a takeover met at a dispatch"
     );
     assert_eq!(row.model_requests(), 1, "the run never resumes");
@@ -1949,7 +1951,7 @@ async fn a_takeover_met_while_a_suspended_run_waits_tears_the_session_down() {
 /// is its first write after the stop. The turn completes once, its input
 /// consumed. Before, the refused closing save failed the turn at once, after
 /// its final answer, with the teardown class.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn a_closing_save_refused_in_a_short_gap_is_written_again_and_the_turn_completes_once() {
     let run = run_with_stop(
         ClosesDuring::TextModelCall,
@@ -1986,7 +1988,7 @@ async fn a_closing_save_refused_in_a_short_gap_is_written_again_and_the_turn_com
 /// the turn fails, its waiter is not told that its input stays queued, and
 /// the model is not asked again in this process. The wait and its one retry
 /// are the protection (the short-gap row above).
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn a_closing_save_whose_gap_outlasts_its_wait_still_fails_the_turn() {
     let run = run_with_stop(
         ClosesDuring::TextModelCall,
@@ -2019,7 +2021,7 @@ async fn a_closing_save_whose_gap_outlasts_its_wait_still_fails_the_turn() {
 /// abandoned as cancelled. Before, the hard interrupt cancelled the run only
 /// in memory: the gap refused the cancel's writes, the session had to reload,
 /// and the reload resumed the stopped run from the store.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn an_interrupt_of_a_run_waiting_at_the_fence_suspends_it_and_it_does_not_come_back() {
     let row = FenceRow::open(
         ClosesDuring::FirstModelCall,
@@ -2055,7 +2057,7 @@ async fn an_interrupt_of_a_run_waiting_at_the_fence_suspends_it_and_it_does_not_
 /// is settled, its input abandoned as cancelled. Before, the stop's hard
 /// interrupt cancelled the run only in memory, the contributor waits failed
 /// with the reload that followed, and the reload resumed the stopped run.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn a_stop_of_a_run_waiting_at_the_fence_returns_at_once_and_the_run_does_not_come_back() {
     let row = FenceRow::open(
         ClosesDuring::FirstModelCall,
@@ -2107,7 +2109,7 @@ async fn a_stop_of_a_run_waiting_at_the_fence_returns_at_once_and_the_run_does_n
 /// call follows, the live session is torn down, and the waiter is told the
 /// input stays queued for the new owner, which reads it pending. Without
 /// that check the retry would ask the model on a realm another writer holds.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn a_takeover_met_by_a_dispatch_whose_window_reads_open_refuses_it() {
     let mut row = FenceRow::open(ClosesDuring::FirstModelCall, Stop::TakenOver, Turn::Queued).await;
     let answer = row.run_turn(ANSWER_DEADLINE).await;
@@ -2139,7 +2141,7 @@ async fn a_takeover_met_by_a_dispatch_whose_window_reads_open_refuses_it() {
 /// first model call stops the writer (acquires fail for 4 s) and answers
 /// with the round's call, the round's first commit is refused, waits, and is
 /// written again. The round's call runs once and the run completes once.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn a_round_commit_refused_in_a_short_gap_is_written_again_and_the_run_completes_once() {
     // The round's call, then the answer: no second round.
     let mut row = FenceRow::open_scripted(
@@ -2149,7 +2151,7 @@ async fn a_round_commit_refused_in_a_short_gap_is_written_again_and_the_run_comp
         vec![ModelStep::StopThenTools],
     )
     .await;
-    let answer = row.run_turn(PAUSED_DEADLINE).await;
+    let answer = row.run_turn(TURN_DEADLINE).await;
     assert!(
         matches!(
             answer,
@@ -2193,7 +2195,7 @@ async fn a_round_commit_refused_in_a_short_gap_is_written_again_and_the_run_comp
 /// fence gap here: the writer is never stopped. Before round 4 the facade's
 /// executor could not suspend, so the stop cancelled the run and ended its
 /// input stopped.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn a_requeue_stop_suspends_a_facade_run_in_flight_for_the_next_start() {
     let row = FenceRow::open_scripted(
         ClosesDuring::Never,
@@ -2204,7 +2206,7 @@ async fn a_requeue_stop_suspends_a_facade_run_in_flight_for_the_next_start() {
     .await;
     let completion = row.accept_prompt().await;
     let started = tokio::time::Instant::now();
-    while row.model_requests() < 2 && started.elapsed() < PAUSED_DEADLINE {
+    while row.model_requests() < 2 && started.elapsed() < TURN_DEADLINE {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert_eq!(
