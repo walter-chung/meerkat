@@ -124,6 +124,8 @@ enum ClosesDuring {
     /// The run's one model call, which stops the writer and answers with
     /// text: the run's closing save is its first write after the stop.
     TextModelCall,
+    /// Never: the writer is not stopped.
+    Never,
 }
 
 /// How the row stops the writer.
@@ -592,6 +594,8 @@ enum ModelStep {
     /// Stop the writer, the way the row's stop names, then answer with text:
     /// the run's closing save meets the stopped writer.
     StopThenText,
+    /// Never answer: the request waits until its run is dropped.
+    Hold,
     /// Answer with text.
     Text,
 }
@@ -631,6 +635,11 @@ impl LlmClient for FenceModel {
                 control.stop_the_writer().await;
                 Err(LlmError::ServerOverloaded)
             }));
+        }
+        if step == ModelStep::Hold {
+            return Box::pin(stream::once(std::future::pending::<
+                Result<LlmEvent, LlmError>,
+            >()));
         }
         if step == ModelStep::StopThenText {
             let control = Arc::clone(&self.control);
@@ -749,7 +758,8 @@ impl AgentToolDispatcher for FenceTools {
             | ClosesDuring::FirstModelCall
             | ClosesDuring::RoundModelCall
             | ClosesDuring::OnlyCall
-            | ClosesDuring::TextModelCall => {}
+            | ClosesDuring::TextModelCall
+            | ClosesDuring::Never => {}
         }
         Ok(ToolDispatchOutcome::sync_result(ToolResult::new(
             call.id.into(),
@@ -844,7 +854,8 @@ impl FenceRow {
             ClosesDuring::FirstCommit
             | ClosesDuring::SecondCommit
             | ClosesDuring::FirstCall
-            | ClosesDuring::OnlyCall => vec![ModelStep::Tools],
+            | ClosesDuring::OnlyCall
+            | ClosesDuring::Never => vec![ModelStep::Tools],
         };
         Self::open_scripted(closes_during, stop, turn, script).await
     }
@@ -2164,5 +2175,70 @@ async fn a_round_commit_refused_in_a_short_gap_is_written_again_and_the_run_comp
             "assistant probed".to_string(),
         ],
         "the prompt and the round are in the transcript once"
+    );
+}
+
+/// A graceful requeue stop of a facade session whose durable run is in
+/// flight suspends the run instead of cancelling it, as on the other runtime
+/// surfaces: the facade's default executor suspends a run. The run's second
+/// model call is in flight after its committed tool round; the stop keeps
+/// the run's input staged and bound to the run, its waiter told the input
+/// stays queued, for the next start to resume the run from that round. No
+/// fence gap here: the writer is never stopped. Before round 4 the facade's
+/// executor could not suspend, so the stop cancelled the run and ended its
+/// input stopped.
+#[tokio::test(start_paused = true)]
+async fn a_requeue_stop_suspends_a_facade_run_in_flight_for_the_next_start() {
+    let row = FenceRow::open_scripted(
+        ClosesDuring::Never,
+        Stop::default(),
+        Turn::Queued,
+        vec![ModelStep::Tools, ModelStep::Hold],
+    )
+    .await;
+    let completion = row.accept_prompt().await;
+    let started = tokio::time::Instant::now();
+    while row.model_requests() < 2 && started.elapsed() < PAUSED_DEADLINE {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        row.model_requests(),
+        2,
+        "the run's second model call is in flight"
+    );
+    assert_eq!(row.dispatched(), 1, "its tool round ran");
+    let registration = row
+        .machine
+        .current_session_registration_witness(&row.session_id)
+        .await
+        .expect("the session is registered");
+    assert!(
+        row.machine
+            .unregister_session_registration_until_terminal_with_queued_inputs_if_current(
+                &registration,
+                meerkat_runtime::UnregisterQueuedInputs::Requeue {
+                    max_age: Duration::from_secs(600),
+                },
+            )
+            .await
+            .expect("the requeue stop completes"),
+        "the exact registration is torn down"
+    );
+    let answer = tokio::time::timeout(ANSWER_DEADLINE, completion.wait())
+        .await
+        .expect("the input's waiter is answered");
+    assert!(
+        matches!(answer, Err(CompletionWaitError::RequeuedAcrossStop { .. })),
+        "the suspended run's waiter is told its input stays queued: {answer:?}"
+    );
+    assert_eq!(
+        row.input_phases().await,
+        Some(vec![Some(InputLifecycleState::Staged)]),
+        "the run's input stays staged, bound to the suspended run, for the next start"
+    );
+    assert_eq!(
+        row.model_requests(),
+        2,
+        "the suspended run asks the model no more in this process"
     );
 }

@@ -5309,6 +5309,68 @@ async fn a_kept_runs_resume_waits_for_its_destination_and_then_reads_under_it() 
     hold.notify_waiters();
 }
 
+/// A stop of a run marked resumable whose loop is parked (a kept run's
+/// resume that waits for its destination) wakes the loop, and the loop
+/// settles the stopped run at once: its resume ends abandoned as cancelled
+/// and the run's mark clears, with no bind and no other wake, and the run
+/// never resumes. Before round 4 the stop was recorded, but the parked loop
+/// slept until its next wake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_of_a_parked_resumable_run_wakes_its_loop_and_settles_it() {
+    let (owners, template, domain) = reading_host();
+    let store = InMemoryRuntimeStore::new();
+    let blobs = Arc::new(MemoryBlobStore::new());
+    let session = SessionId::new();
+    let (_destination, resume_id, run_id) =
+        keep_resume_in_open_run(&store, &blobs, &owners, &session, &template).await;
+
+    let machine = open(&store, &blobs, &owners).await;
+    machine
+        .register_session(session.clone())
+        .await
+        .expect("the registration marks the kept run resumable");
+    machine
+        .prepare_bindings(session.clone())
+        .await
+        .expect("actual runtime binding");
+    let hold = Arc::new(tokio::sync::Notify::new());
+    let (effects, mut applied) = attach_registered_reading(
+        &machine,
+        &session,
+        "resumed run",
+        Arc::clone(&hold),
+        &domain,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        machine.resumable_run_id(&session).await,
+        Some(run_id.clone()),
+        "the run waits, marked, for its destination"
+    );
+
+    machine
+        .hard_cancel_current_run(&session, "the user stops the parked run")
+        .await
+        .expect("the stop of the run marked resumable is accepted");
+    let row = terminal_row(&machine, &session, &resume_id).await;
+    assert_eq!(
+        row.seed.terminal_outcome,
+        Some(crate::input_state::InputTerminalOutcome::Abandoned {
+            reason: crate::input_state::InputAbandonReason::Cancelled,
+        }),
+        "the stopped run's resume ends abandoned as cancelled"
+    );
+    assert_eq!(
+        machine.resumable_run_id(&session).await,
+        None,
+        "the stopped run's mark is cleared"
+    );
+    assert!(applied.try_recv().is_err(), "the stopped run never resumed");
+    assert_eq!(effects.load(Ordering::SeqCst), 0, "nothing was applied");
+    hold.notify_waiters();
+}
+
 /// The governed end to end of a consent notice that a graceful requeue stop
 /// keeps. Consent of the original run's retained work, approved and parked
 /// at that run's close, owes its approved notice; the notice is admitted to
