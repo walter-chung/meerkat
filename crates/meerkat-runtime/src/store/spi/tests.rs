@@ -1401,6 +1401,9 @@ fn the_dispatch_wait_bound_covers_the_reacquire_at_every_advised_timing() {
         (10, 10, 17, 40, 53),
         (15, 15, 22, 60, 83),
         (10, 10, 10, 30, 50),
+        // A host's own timing: a 5 s interval on a 30 s lease with a 12 s
+        // margin.
+        (5, 5, 12, 30, 33),
     ] {
         let timing = FenceTiming::try_with_margin(secs(interval), secs(lease), secs(margin))
             .expect("an advised timing is valid");

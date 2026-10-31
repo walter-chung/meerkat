@@ -26,6 +26,10 @@ mod governed;
 )]
 #[path = "session_runtime/committed_reads_tests.rs"]
 mod committed_reads_tests;
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::large_futures)]
+#[path = "session_runtime/fence_gap_tests.rs"]
+mod fence_gap_tests;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
