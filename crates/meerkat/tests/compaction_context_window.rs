@@ -49,6 +49,17 @@ mod tests {
     const LIST_PROMPT: &str = "list every record";
     /// What the double's compaction summary says.
     const SUMMARY: &str = "summary of the earlier work";
+    /// The model the rows run on, unless a row declares its own.
+    const MODEL: &str = "gpt-5.4";
+    /// The custom model the bound row declares, with a context window a
+    /// listing of [`BOUND_LISTING_BYTES`] is past by itself.
+    const DECLARED_MODEL: &str = "declared-window-model";
+    /// [`DECLARED_MODEL`]'s context window, in tokens.
+    const DECLARED_WINDOW: u32 = 40_000;
+    /// The bound row's listing: 50k tokens to the transcript estimator, past
+    /// [`DECLARED_WINDOW`] by itself, and 100k to the double, within its
+    /// window.
+    const BOUND_LISTING_BYTES: usize = 200_000;
 
     /// One request the double served.
     #[derive(Debug, Clone)]
@@ -278,6 +289,19 @@ mod tests {
         Arc<PersistentSessionService<FactoryAgentBuilder>>,
         Arc<MeerkatMachine>,
     ) {
+        build_service_declaring(root, model, &[])
+    }
+
+    /// [`build_service`], with the custom OpenAI `models` (each a name and
+    /// its context window) declared in the config.
+    fn build_service_declaring(
+        root: &std::path::Path,
+        model: &Arc<WindowedModel>,
+        models: &[(&str, u32)],
+    ) -> (
+        Arc<PersistentSessionService<FactoryAgentBuilder>>,
+        Arc<MeerkatMachine>,
+    ) {
         let sqlite_path = root.join("sessions.sqlite3");
         let session_store: Arc<dyn SessionStore> = Arc::new(
             meerkat::SqliteSessionStore::open(sqlite_path.clone()).expect("open session sqlite"),
@@ -294,6 +318,21 @@ mod tests {
         let mut config = Config::default();
         config.compaction.auto_compact_threshold = THRESHOLD;
         config.compaction.auto_compact_threshold_explicit = true;
+        for &(name, context_window) in models {
+            config.models.custom.insert(
+                name.to_string(),
+                meerkat_core::config::CustomModelConfig {
+                    provider: meerkat_core::Provider::OpenAI,
+                    display_name: None,
+                    context_window: Some(context_window),
+                    max_input_tokens: None,
+                    max_output_tokens: Some(16_384),
+                    vision: Some(false),
+                    web_search: Some(false),
+                    call_timeout_secs: None,
+                },
+            );
+        }
         let client: Arc<dyn LlmClient> = model.clone();
         let mut builder =
             FactoryAgentBuilder::new(AgentFactory::new(root.join("sessions")), config);
@@ -325,7 +364,7 @@ mod tests {
             .expect("shut the lifetime's session service down");
     }
 
-    fn create_request(tool: &Arc<ListingTool>) -> CreateSessionRequest {
+    fn create_request(tool: &Arc<ListingTool>, model_id: &str) -> CreateSessionRequest {
         let tools: Arc<dyn meerkat_core::AgentToolDispatcher> = tool.clone();
         let build = SessionBuildOptions {
             external_tools: Some(tools),
@@ -334,7 +373,7 @@ mod tests {
         };
         CreateSessionRequest {
             injected_context: Vec::new(),
-            model: "gpt-5.4".to_string(),
+            model: model_id.to_string(),
             prompt: meerkat_core::ContentInput::Text(String::new()),
             system_prompt: meerkat::SystemPromptOverride::Set(
                 "compaction against the context window".to_string(),
@@ -354,13 +393,24 @@ mod tests {
         session: Session,
         tool: &Arc<ListingTool>,
     ) {
+        materialize_on(service, adapter, session, tool, MODEL).await;
+    }
+
+    /// [`materialize`], on the model `model_id`.
+    async fn materialize_on(
+        service: &Arc<PersistentSessionService<FactoryAgentBuilder>>,
+        adapter: &Arc<MeerkatMachine>,
+        session: Session,
+        tool: &Arc<ListingTool>,
+        model_id: &str,
+    ) {
         let service_for_executor = Arc::clone(service);
         let adapter_for_executor = Arc::clone(adapter);
         Box::pin(materialize_session(
             service,
             adapter,
             session,
-            create_request(tool),
+            create_request(tool, model_id),
             move |session_id| {
                 default_persistent_executor(service_for_executor, adapter_for_executor, session_id)
             },
@@ -580,12 +630,13 @@ mod tests {
         session_id
     }
 
-    /// The run after the refusal, `continue`, and one more: the run compacts
-    /// the whole transcript before its first request, the oversize content
+    /// The run after a request that did not fit (refused, or bounded for
+    /// itself), `continue`, and one more: the run compacts the whole
+    /// transcript before its first request, the oversize content
     /// (`still_carries` finds it) folds into the summary, and the run
-    /// completes. Its summary request carries that content too and is
-    /// refused, so the summary is the mechanical one. The next run compacts
-    /// no more.
+    /// completes. Where its summary request carries that content too and is
+    /// refused, the summary is the mechanical one. The next run compacts no
+    /// more.
     async fn assert_the_next_run_heals(
         service: &Arc<PersistentSessionService<FactoryAgentBuilder>>,
         adapter: &Arc<MeerkatMachine>,
@@ -663,6 +714,73 @@ mod tests {
         let (service, adapter) = build_service(temp.path(), &model);
         let resume_source = committed(&service, &session_id).await;
         materialize(&service, &adapter, resume_source, &tool).await;
+        assert_the_next_run_heals(&service, &adapter, &model, &session_id, carries_listing).await;
+    }
+
+    /// The wedge a bound leaves, across a restart. The run's own listing is
+    /// past the declared model's context window by itself, so the request
+    /// that carries it is bounded for that request: the run completes, and
+    /// the bound records that the transcript holds content a request could
+    /// not carry. The fact rides the session's durable compaction cadence,
+    /// so the agent a successor host rebuilds from the store compacts the
+    /// whole transcript at its next run's first check and folds the listing.
+    /// Nothing else compacts there: the history, the forecast and the
+    /// projection stay under the threshold, and the double's window would
+    /// take the listing whole. Without the stored fact, every later request
+    /// carried the listing whole past the declared window.
+    #[tokio::test]
+    async fn a_new_agent_built_from_the_store_compacts_first_after_a_bounded_request() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let model = WindowedModel::new(WINDOW);
+        let tool = ListingTool::new();
+        let declared = [(DECLARED_MODEL, DECLARED_WINDOW)];
+        let session_id = {
+            let (service, adapter) = build_service_declaring(temp.path(), &model, &declared);
+            let session = Session::new();
+            let session_id = session.id().clone();
+            materialize_on(&service, &adapter, session, &tool, DECLARED_MODEL).await;
+            tool.set_listing(BOUND_LISTING_BYTES);
+
+            let bounded = run_prompt(&adapter, &session_id, LIST_PROMPT).await;
+            let seen = model.seen();
+            assert!(
+                completed(&bounded),
+                "test setup: the run completes: {bounded:?}; requests: {seen:?}"
+            );
+            assert!(
+                seen.iter().any(|seen| seen
+                    .listing
+                    .is_some_and(|carried| carried < BOUND_LISTING_BYTES)),
+                "test setup: a request carries the listing bounded: {seen:?}"
+            );
+            assert!(
+                !seen.iter().any(|seen| seen.summary || seen.refused),
+                "test setup: nothing compacted and nothing was refused: {seen:?}"
+            );
+            let stored = committed(&service, &session_id).await;
+            assert!(
+                compaction_cadence(&stored)
+                    .last_context_refusal_boundary_index
+                    .is_some(),
+                "test setup: the bound's fact is stored"
+            );
+            assert!(
+                stored.messages().iter().any(|message| matches!(
+                    message,
+                    Message::ToolResults { results, .. }
+                        if results
+                            .iter()
+                            .any(|result| result.text_content().len() == BOUND_LISTING_BYTES)
+                )),
+                "test setup: the stored transcript keeps the listing whole"
+            );
+            stand_down(&service, &adapter).await;
+            session_id
+        };
+
+        let (service, adapter) = build_service_declaring(temp.path(), &model, &declared);
+        let resume_source = committed(&service, &session_id).await;
+        materialize_on(&service, &adapter, resume_source, &tool, DECLARED_MODEL).await;
         assert_the_next_run_heals(&service, &adapter, &model, &session_id, carries_listing).await;
     }
 

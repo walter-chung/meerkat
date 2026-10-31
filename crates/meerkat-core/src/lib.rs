@@ -292,15 +292,15 @@ pub use digest_observability::{
 };
 pub use error::{AgentError, ToolError};
 pub use event::{
-    AgentErrorClass, AgentErrorReport, AgentEvent, AssistantImageEvent, BudgetType,
-    CompactionFailureReason, CompactionFitByteEvidence, CompactionFitTokenEvidence,
+    AgentErrorClass, AgentErrorReport, AgentEvent, AssistantImageEvent, BoundedToolResult,
+    BudgetType, CompactionFailureReason, CompactionFitByteEvidence, CompactionFitTokenEvidence,
     CompactionPreservedHistoryFit, EventEnvelope, EventSourceIdentity, ExternalToolDelta,
     ExternalToolDeltaPhase, InteractionFailureReason, LiveChannelCloseReason, RunResumePointKind,
     ScopedAgentEvent, SkillResolutionFailureReason, StreamScopeFrame, StreamTruncationReason,
     StructuredOutputOrigin, ToolCallArguments, ToolCallArgumentsError, ToolConfigChangeOperation,
-    ToolConfigChangeStatus, ToolConfigChangedPayload, ToolConfigLifecycleBit, TurnErrorMetadata,
-    VerboseEventConfig, agent_event_type, compare_event_envelopes, format_verbose_event,
-    format_verbose_event_with_config, turn_usage_summary, usage_summary,
+    ToolConfigChangeStatus, ToolConfigChangedPayload, ToolConfigLifecycleBit, ToolResultBoundAxis,
+    TurnErrorMetadata, VerboseEventConfig, agent_event_type, compare_event_envelopes,
+    format_verbose_event, format_verbose_event_with_config, turn_usage_summary, usage_summary,
 };
 pub use event_injector::{EventInjector, EventInjectorError};
 pub use event_tap::{

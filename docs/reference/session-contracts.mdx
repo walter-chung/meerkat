@@ -558,8 +558,13 @@ Compaction is optional. Ordinary recoverable failures preserve uncompacted
 history and normally report `CompactionFailed`, allowing the run to continue.
 
 - Triggered by token thresholds and turn guards, by the projected input of
-  the next request, and once after a request the provider refused for not
-  fitting the model's context.
+  the next request, and once after a request that did not fit: one the
+  provider refused for not fitting the model's context, or one that carried
+  the open run's own tool results shortened.
+- A request still over the provider's request-body cap or the model's input
+  budget after the compaction check carries the open run's own oversized
+  tool results shortened for that request only, and publishes
+  `tool_results_bounded_for_request`; the stored transcript keeps them whole.
 - A typed provider `PolicyStop` from the summary call terminates the run.
 - Unresolved durable compaction-stage authority or cleanup errors, such as
   `SessionDurableProjectionAuthorityUnknown`, also terminate fail-closed.

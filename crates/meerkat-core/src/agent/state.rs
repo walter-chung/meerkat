@@ -88,6 +88,14 @@ struct LlmRetryRequest<'a> {
     /// retry loop so ordinary calls do not deep-clone the accumulated
     /// transcript merely to obtain a mutable fallback/retry buffer.
     messages: Arc<Vec<Message>>,
+    /// The open run's tool results `messages` carries shortened, each with
+    /// the whole result it was cut from, so a bound against a model
+    /// fallback's limits cuts from the whole results again.
+    bounded_whole: Vec<(crate::types::ToolResult, crate::types::ToolResult)>,
+    /// The first row of the request the provider answers that carries one of
+    /// the open run's tool results shortened (`None` when it carries every
+    /// result whole); a bound against a model fallback's limits sets it anew.
+    request_shortened_from: &'a mut Option<usize>,
     tools: Arc<[Arc<ToolDef>]>,
     max_tokens: u32,
     temperature: Option<f32>,
@@ -100,6 +108,18 @@ struct LlmRetryRequest<'a> {
     extraction_output_schema: Option<crate::types::OutputSchema>,
     allow_empty_success: bool,
     durable_visibility_parent: &'a mut Option<crate::SessionToolVisibilityState>,
+}
+
+/// One model request as composed, before the open run's own tool results
+/// were bounded for it: its measurements are the true pressure the parked
+/// compaction check sees.
+struct UnboundedRequest {
+    /// The provider-lowered body pressure of the request as composed.
+    pressure: Option<crate::ProviderRequestPressure>,
+    /// Its whole-request token budget, when it could be measured.
+    budget: Option<crate::ContextBudgetFact>,
+    /// What the bound did to the request.
+    bound: crate::agent::compact::RequestBound,
 }
 
 enum LlmRetryOutcome {
@@ -257,10 +277,17 @@ type TurnEffectsFuture<'a> =
 /// This is the commit-time binding rule applied one door earlier: a mismatch
 /// here can only mean a lying or confused adapter, and no shape of it implies
 /// the committed transcript is corrupt.
+///
+/// `shortened_from` is the first row of the request that carried one of the
+/// open run's tool results shortened for that request only. A claim past it
+/// anchors a prefix the transcript never held (the transcript keeps the
+/// results whole), so it is dropped unreported: it can never bind, and its
+/// discard would describe a fault that does not exist.
 fn promote_cache_breakpoint_claims(
     claims: &[crate::ProviderCacheBreakpointClaim],
     active_provider: crate::Provider,
     active_model: &str,
+    shortened_from: Option<usize>,
 ) -> (
     Vec<crate::AuthoredCacheBreakpoint>,
     Vec<crate::DiscardedCacheBreakpoint>,
@@ -282,6 +309,11 @@ fn promote_cache_breakpoint_claims(
                 &breakpoint,
                 crate::CacheBreakpointDiscardReason::EvidenceUnusable { detail },
             ));
+            continue;
+        }
+        if shortened_from.is_some_and(|row| {
+            breakpoint.boundary().message_count() > u64::try_from(row).unwrap_or(u64::MAX)
+        }) {
             continue;
         }
         authored.push(breakpoint);
@@ -821,6 +853,13 @@ struct CallingLlmTurnCtx<'a> {
     responding_operation_id: &'a mut Option<crate::OperationId>,
     model_operation_sequence: &'a mut u64,
     deferred_tool_failure: &'a mut Option<crate::session::DeferredToolBatchFailure>,
+    /// The first row of the model request this boundary sent that carried
+    /// one of the open run's own tool results shortened for it only, or
+    /// `None` when it carried every result whole. The answer to a shortened
+    /// request anchors no input projection, and a provider cache breakpoint
+    /// past that row is not promoted. Set when the request is sent, and again
+    /// when a retry sends it bounded anew.
+    request_shortened_from: Option<usize>,
     turn_count: u32,
     tool_call_count: u32,
 }
@@ -3296,6 +3335,8 @@ where
             assistant_message_id,
             event_tx,
             messages,
+            mut bounded_whole,
+            request_shortened_from,
             tools,
             max_tokens,
             temperature,
@@ -3317,10 +3358,16 @@ where
         let mut attempt = 0u32;
         let mut retry_request_pressure_recheck = false;
         // Once per call: after a model fallback, the open run's oversized
-        // tool results give way against the fallback's cap as they do
-        // against the primary's at the boundary. The unbounded measurement
-        // is kept for the compaction check, as at the boundary.
-        let mut fallback_unbounded_request_pressure = None;
+        // tool results give way against the fallback's cap and input budget
+        // as they do against the primary's at the boundary, cut from the whole
+        // results. The measurements of the request this bound was given (as
+        // composed, or as the boundary already bounded it) are kept for the
+        // compaction check, and the bound is announced before the request is
+        // sent, as at the boundary. A fallback whose limits take the request
+        // as carried keeps the boundary's cut: the request is not measured
+        // again with its results whole.
+        let mut fallback_unbounded_request: Option<Box<UnboundedRequest>> = None;
+        let mut fallback_bound_notice: Option<Box<AgentEvent>> = None;
         let mut next_request_attempt = Some(prepared_attempt);
         let mut authorization_reprepared = false;
         // One bounded wait state per model call: its wall-clock deadline and
@@ -3467,24 +3514,41 @@ where
                         return Err(error);
                     }
                 };
-                if fallback_unbounded_request_pressure.is_none()
-                    && let Some(pressure) = request_pressure
-                    && let Some(max_bytes) = self
-                        .compactor
-                        .as_ref()
-                        .and_then(|compactor| compactor.request_byte_cap(pressure))
-                        .or(pressure.max_bytes)
-                    && let Some(run_id) = self.runtime_started_run_id.as_ref()
-                    && let Some(bounded) =
-                        crate::agent::compact::bound_open_run_tool_results_for_request(
-                            &current_messages,
-                            run_id,
-                            pressure.encoded_bytes,
-                            max_bytes,
-                        )
+                let profile = self.request_model_profile(*controller_feedback);
+                let request_context_budget = self.context_budget_fact_for_profile(
+                    &current_messages,
+                    &current_tools,
+                    current_max_tokens,
+                    request_pressure,
+                    profile.as_ref(),
+                );
+                let bounded = if fallback_unbounded_request.is_none() {
+                    self.bound_open_run_request(
+                        &current_messages,
+                        request_pressure,
+                        request_context_budget
+                            .as_ref()
+                            .ok()
+                            .and_then(Option::as_ref),
+                        &bounded_whole,
+                    )
+                } else {
+                    None
+                };
+                if let Some(crate::agent::compact::BoundedRunRequest {
+                    messages: bounded_messages,
+                    mut bound,
+                }) = bounded
                 {
-                    fallback_unbounded_request_pressure = Some(pressure);
-                    current_messages = Arc::new(bounded);
+                    fallback_bound_notice = bound.notice().map(Box::new);
+                    *request_shortened_from = bound.first_shortened_row;
+                    bounded_whole = std::mem::take(&mut bound.whole);
+                    fallback_unbounded_request = Some(Box::new(UnboundedRequest {
+                        pressure: request_pressure,
+                        budget: request_context_budget.ok().flatten(),
+                        bound,
+                    }));
+                    current_messages = Arc::new(bounded_messages);
                     retry_request_pressure_recheck = true;
                     continue;
                 }
@@ -3504,14 +3568,7 @@ where
                         None
                     }
                 });
-                let profile = self.request_model_profile(*controller_feedback);
-                let request_context_budget = self.context_budget_fact_for_profile(
-                    &current_messages,
-                    &current_tools,
-                    current_max_tokens,
-                    request_pressure,
-                    profile.as_ref(),
-                )?;
+                let request_context_budget = request_context_budget?;
                 let context_budget_error =
                     self.context_budget_refusal_error(request_context_budget.as_ref());
                 let preflight_error = request_byte_error.or(context_budget_error);
@@ -3527,9 +3584,13 @@ where
                     {
                         let prior_completed_boundary =
                             self.compaction_cadence.last_compaction_boundary_index;
-                        self.pending_compaction_request_pressure =
-                            fallback_unbounded_request_pressure.or(request_pressure);
-                        self.pending_compaction_request_budget = request_context_budget.clone();
+                        let (compaction_pressure, compaction_budget) =
+                            match fallback_unbounded_request.as_deref() {
+                                Some(unbounded) => (unbounded.pressure, unbounded.budget.clone()),
+                                None => (request_pressure, request_context_budget.clone()),
+                            };
+                        self.pending_compaction_request_pressure = compaction_pressure;
+                        self.pending_compaction_request_budget = compaction_budget;
                         let transition = TurnExecutionTransition {
                             prev_phase: TurnPhase::CallingLlm,
                             next_phase: TurnPhase::CallingLlm,
@@ -3547,6 +3608,19 @@ where
                         return Err(error);
                     }
                 }
+            }
+
+            // A bound against a model fallback's limits goes out with this
+            // attempt: announce it and record it, as at the boundary. Boxed,
+            // so the retry loop's own frame carries no event.
+            if let Some(notice) = fallback_bound_notice.take() {
+                self.record_transcript_did_not_fit();
+                let _ = Box::pin(crate::event_tap::tap_emit(
+                    &self.event_tap,
+                    event_tx.as_ref(),
+                    *notice,
+                ))
+                .await;
             }
 
             // 4. Determine whether to wrap the call and select timeout source
@@ -4532,8 +4606,25 @@ where
                     );
                     ctx.last_rewrite_history_tokens =
                         self.compaction_cadence.last_rewrite_history_tokens;
-                    ctx.last_context_refusal_boundary_index =
-                        self.compaction_cadence.last_context_refusal_boundary_index;
+                    // The transcript holds content a request could not carry
+                    // (a context refusal, or a request that carried the open
+                    // run's own results shortened). Only a compaction of the
+                    // whole transcript folds it: inside a run a compaction
+                    // keeps the run's request and newest round, so the fact
+                    // waits for a check whose scope is the whole transcript,
+                    // a run's first.
+                    ctx.last_context_refusal_boundary_index = self
+                        .compaction_cadence
+                        .last_context_refusal_boundary_index
+                        .filter(|_| {
+                            matches!(
+                                crate::agent::compact::compaction_scope(
+                                    self.session.messages(),
+                                    self.runtime_started_run_id.as_ref(),
+                                ),
+                                Some(crate::agent::compact::CompactionScope::Whole)
+                            )
+                        });
                     if compactor.should_compact(&ctx) {
                         // A writer past its self-fence window sends no
                         // summarization request either.
@@ -4555,9 +4646,10 @@ where
                             self.compaction_cadence
                                 .last_compaction_attempt_boundary_index =
                                 Some(current_boundary_index);
-                            // An attempt clears a context refusal whatever it
-                            // finds, so a refusal costs one attempt.
-                            self.compaction_cadence.last_context_refusal_boundary_index = None;
+                            // A skipped attempt is inside a run, whose request
+                            // and newest round it keeps: a fact that the
+                            // transcript holds content a request could not
+                            // carry waits for the next run's first check.
                             let cadence = self.compaction_cadence.clone();
                             crate::agent::compact::persist_compaction_cadence(
                                 &mut self.session,
@@ -4594,11 +4686,18 @@ where
                         // which is how a cleared refusal self-heals.
                         self.compaction_cadence
                             .last_compaction_attempt_boundary_index = Some(current_boundary_index);
-                        // The attempt also answers a context refusal, whether
-                        // it commits or not: it is recorded with the attempt
+                        // A compaction of the whole transcript also answers
+                        // the fact that it holds content a request could not
+                        // carry (a context refusal, or a request that carried
+                        // the open run's results shortened), whether it
+                        // commits or not: it is recorded with the attempt
                         // index and no failure branch restores it, so one
-                        // refusal costs one attempt and cannot loop.
-                        self.compaction_cadence.last_context_refusal_boundary_index = None;
+                        // refusal or bound costs one attempt and cannot loop.
+                        // An attempt inside a run keeps the run's request and
+                        // newest round, so there the fact waits.
+                        if matches!(scope, crate::agent::compact::CompactionScope::Whole) {
+                            self.compaction_cadence.last_context_refusal_boundary_index = None;
+                        }
                         // The accumulator serves the parent revision in
                         // O(delta); it is contractually byte-identical to
                         // `transcript_messages_digest(self.session.messages())`
@@ -6641,6 +6740,7 @@ where
                         responding_operation_id: &mut responding_operation_id,
                         model_operation_sequence: &mut model_operation_sequence,
                         deferred_tool_failure: &mut deferred_tool_failure,
+                        request_shortened_from: None,
                         turn_count,
                         tool_call_count,
                     };
@@ -8071,13 +8171,28 @@ where
         let mut route_stabilization_attempt = 0_u8;
         // At most once per request: the open run's own oversized tool results
         // give way (bounded for this request only) when they push the request
-        // past the provider cap, because no compaction folds the run's newest
-        // round. The unbounded measurement is kept: it is the true pressure
-        // the compaction trigger and its post-compaction baseline see, so a
+        // past the provider cap, or its composed input past the model's input
+        // budget (the context window less the output reserve, or the input
+        // ceiling), because no compaction folds the run's newest round. The
+        // unbounded measurements are kept: they are the true pressure the
+        // compaction trigger and its post-compaction baseline see, so a
         // compaction gets the first chance and the bounded request is only
         // what is sent when none commits.
-        let mut unbounded_request_pressure = None;
-        let (prepared_attempt, request_pressure) = loop {
+        //
+        // One measurement of each composed request serves the bound, the
+        // parked compaction check and the pre-dispatch refusal below. A
+        // committed rewrite returns `Repoll` and recomposes everything, so the
+        // fact can never outlive the request it describes.
+        //
+        // A measurement failure is deliberately not raised here. It stays owned
+        // by the refusal site further down, which is where it terminalized
+        // before the compaction check needed the same measurement: an
+        // unserializable tool definition must not preempt the byte-cap terminal
+        // and replace its typed `RequestTooLarge` cause with an internal error.
+        // The trigger sees an absent budget for that boundary and falls back to
+        // its other measures, and the bound sees no token overage.
+        let mut unbounded_request: Option<Box<UnboundedRequest>> = None;
+        let (prepared_attempt, request_pressure, request_context_budget_result) = loop {
             let attempt = match self.prepare_authorized_model_attempt(
                 Arc::clone(&request_messages),
                 Arc::clone(&call_tool_defs),
@@ -8113,27 +8228,34 @@ where
             };
             match attempt.request_pressure() {
                 Ok(pressure) => {
-                    if unbounded_request_pressure.is_none()
-                        && let Some(measured) = pressure
-                        && let Some(max_bytes) = self
-                            .compactor
-                            .as_ref()
-                            .and_then(|compactor| compactor.request_byte_cap(measured))
-                            .or(measured.max_bytes)
-                        && let Some(run_id) = self.runtime_started_run_id.as_ref()
-                        && let Some(bounded) =
-                            crate::agent::compact::bound_open_run_tool_results_for_request(
-                                &request_messages,
-                                run_id,
-                                measured.encoded_bytes,
-                                max_bytes,
-                            )
-                    {
-                        unbounded_request_pressure = Some(measured);
-                        request_messages = Arc::new(bounded);
+                    let profile = self.request_model_profile(*ctx.controller_feedback);
+                    let budget = self.context_budget_fact_for_profile(
+                        &request_messages,
+                        &call_tool_defs,
+                        prepared.effective_max_tokens,
+                        pressure,
+                        profile.as_ref(),
+                    );
+                    let bounded = if unbounded_request.is_none() {
+                        self.bound_open_run_request(
+                            &request_messages,
+                            pressure,
+                            budget.as_ref().ok().and_then(Option::as_ref),
+                            &[],
+                        )
+                    } else {
+                        None
+                    };
+                    if let Some(bounded) = bounded {
+                        unbounded_request = Some(Box::new(UnboundedRequest {
+                            pressure,
+                            budget: budget.ok().flatten(),
+                            bound: bounded.bound,
+                        }));
+                        request_messages = Arc::new(bounded.messages);
                         continue;
                     }
-                    break (attempt, pressure);
+                    break (attempt, pressure, budget);
                 }
                 Err(error)
                     if agent_error_is_authorization_route_changed(&error)
@@ -8194,37 +8316,24 @@ where
             }
         }
 
-        // One measurement of this exact composed request serves both the parked
-        // compaction check and the pre-dispatch refusal below. A committed
-        // rewrite returns `Repoll` and recomposes everything, so the fact can
-        // never outlive the request it describes.
-        //
-        // A measurement failure is deliberately not raised here. It stays owned
-        // by the refusal site further down, which is where it terminalized
-        // before the compaction check needed the same measurement: an
-        // unserializable tool definition must not preempt the byte-cap terminal
-        // and replace its typed `RequestTooLarge` cause with an internal error.
-        // The trigger sees an absent budget for that boundary and falls back to
-        // its other measures.
-        let profile = self.request_model_profile(*ctx.controller_feedback);
-        let request_context_budget_result = self.context_budget_fact_for_profile(
-            &request_messages,
-            &call_tool_defs,
-            prepared.effective_max_tokens,
-            request_pressure,
-            profile.as_ref(),
-        );
-
         if self.pending_compaction_boundary_index.is_some() {
             let prior_completed_boundary = self.compaction_cadence.last_compaction_boundary_index;
             let prior_message_count = self.session.messages().len();
-            self.pending_compaction_request_pressure =
-                unbounded_request_pressure.or(request_pressure);
-            self.pending_compaction_request_budget = request_context_budget_result
-                .as_ref()
-                .ok()
-                .cloned()
-                .flatten();
+            // The check measures the request as composed, before a bound
+            // shortened it for this request only.
+            let (compaction_pressure, compaction_budget) = match unbounded_request.as_deref() {
+                Some(unbounded) => (unbounded.pressure, unbounded.budget.clone()),
+                None => (
+                    request_pressure,
+                    request_context_budget_result
+                        .as_ref()
+                        .ok()
+                        .cloned()
+                        .flatten(),
+                ),
+            };
+            self.pending_compaction_request_pressure = compaction_pressure;
+            self.pending_compaction_request_budget = compaction_budget;
             let transition = TurnExecutionTransition {
                 prev_phase: TurnPhase::CallingLlm,
                 next_phase: TurnPhase::CallingLlm,
@@ -8288,6 +8397,23 @@ where
                 .complete_calling_llm_request_failure(ctx, prepared.in_extraction, error)
                 .await;
         }
+        // The request goes out bounded: announce the bound, record that the
+        // transcript holds content a request could not carry (the next run's
+        // first request would carry it whole again), keep the answer from
+        // anchoring the input projection, since its count understates the
+        // transcript, and keep the cache breakpoints past its first shortened
+        // row from being promoted, since the transcript never held their
+        // prefix.
+        let bound = unbounded_request.map(|unbounded| unbounded.bound);
+        ctx.request_shortened_from = bound.as_ref().and_then(|bound| bound.first_shortened_row);
+        if let Some(notice) = bound
+            .as_ref()
+            .and_then(crate::agent::compact::RequestBound::notice)
+        {
+            self.record_transcript_did_not_fit();
+            emit_phase_event!(self, ctx, notice);
+        }
+        let bounded_whole = bound.map(|bound| bound.whole).unwrap_or_default();
         let result = match self
             .call_llm_with_retry(LlmRetryRequest {
                 run_id: ctx.run_id,
@@ -8295,6 +8421,8 @@ where
                 assistant_message_id: prepared.assistant_message_id,
                 event_tx: ctx.event_tx,
                 messages: request_messages,
+                bounded_whole,
+                request_shortened_from: &mut ctx.request_shortened_from,
                 tools: call_tool_defs,
                 max_tokens: prepared.effective_max_tokens,
                 temperature: prepared.effective_temperature,
@@ -8432,15 +8560,21 @@ where
     /// ([`crate::compact::SessionCompactionCadence::last_answered_request`]):
     /// its presented tokens, the transcript rows it was composed from (its
     /// response is not in the transcript yet) and the provider and model that
-    /// counted them. An answered request also ends a context refusal. Only a
-    /// compactor reads the cadence, so an agent without one records nothing.
+    /// counted them. An answered request that carried every result whole also
+    /// ends the fact that the transcript held content a request could not
+    /// carry: the transcript fits. A request that carried the open run's own
+    /// tool results shortened (`request_bounded`) does neither: it presented
+    /// less than the transcript holds, so the anchor stays on the request
+    /// before it and the fact its bound recorded stays. Only a compactor reads
+    /// the cadence, so an agent without one records nothing.
     fn record_answered_request(
         &mut self,
         presented_tokens: u64,
         provider: crate::Provider,
         model: &str,
+        request_bounded: bool,
     ) {
-        if self.compactor.is_none() {
+        if self.compactor.is_none() || request_bounded {
             return;
         }
         self.compaction_cadence.last_answered_request =
@@ -8455,11 +8589,10 @@ where
     }
 
     /// Record a main request the provider refused for not fitting the
-    /// model's context
-    /// ([`crate::compact::SessionCompactionCadence::last_context_refusal_boundary_index`]):
-    /// the refused request reported no usage, so without the fact the next
-    /// check would see what this one saw and send the same request again. The
-    /// refused run's own failure is unchanged.
+    /// model's context: the refused request reported no usage, so without the
+    /// fact the next check would see what this one saw and send the same
+    /// request again ([`Self::record_transcript_did_not_fit`]). The refused
+    /// run's own failure is unchanged.
     fn record_context_refusal(&mut self, error: &AgentError) {
         let refused_for_context = matches!(
             error,
@@ -8468,10 +8601,25 @@ where
                 ..
             }
         );
-        if self.compactor.is_none() || !refused_for_context {
+        if refused_for_context {
+            self.record_transcript_did_not_fit();
+        }
+    }
+
+    /// Record that the transcript holds content the main model request of
+    /// this boundary could not carry
+    /// ([`crate::compact::SessionCompactionCadence::last_context_refusal_boundary_index`]):
+    /// the provider refused the request for the model's context, or the
+    /// request carried the open run's own tool results shortened for it only.
+    /// Either way the next run's first request would carry the same content
+    /// again, so the next check whose compaction covers the whole transcript
+    /// compacts once. Only a compactor reads the cadence, so an agent without
+    /// one records nothing.
+    fn record_transcript_did_not_fit(&mut self) {
+        if self.compactor.is_none() {
             return;
         }
-        // The refused request's boundary: its check moved the index past it.
+        // The request's boundary: its check moved the index past it.
         self.compaction_cadence.last_context_refusal_boundary_index = Some(
             self.compaction_cadence
                 .session_boundary_index
@@ -8629,6 +8777,39 @@ where
         )
     }
 
+    /// The request `messages` with the open run's own tool results bounded
+    /// for it only, when the request is over the effective request byte cap
+    /// (`pressure`) or its forecast is over the model's input budget
+    /// (`budget`) and the run's results can give way
+    /// ([`crate::agent::compact::bound_open_run_tool_results_for_request`]).
+    /// `whole` pairs results the request already carries shortened with the
+    /// whole results they were cut from.
+    fn bound_open_run_request(
+        &self,
+        messages: &[Message],
+        pressure: Option<crate::ProviderRequestPressure>,
+        budget: Option<&crate::ContextBudgetFact>,
+        whole: &[(crate::types::ToolResult, crate::types::ToolResult)],
+    ) -> Option<crate::agent::compact::BoundedRunRequest> {
+        let run_id = self.runtime_started_run_id.as_ref()?;
+        let request_bytes = pressure.and_then(|measured| {
+            self.compactor
+                .as_ref()
+                .and_then(|compactor| compactor.request_byte_cap(measured))
+                .or(measured.max_bytes)
+                .map(|max_bytes| (measured.encoded_bytes, max_bytes))
+        });
+        crate::agent::compact::bound_open_run_tool_results_for_request(
+            messages,
+            run_id,
+            crate::agent::compact::RequestOverage {
+                request_bytes,
+                context_tokens: budget.map(|budget| budget.overage_tokens),
+            },
+            whole,
+        )
+    }
+
     fn context_budget_fact_for_profile(
         &self,
         messages: &[Message],
@@ -8731,7 +8912,10 @@ where
         // so a breakpoint the provider authored over it is evidence about that
         // request only. It can never bind to the transcript, and reporting it
         // as a discarded anchor on every turn would describe a fault that does
-        // not exist. Such claims are therefore not promoted at all.
+        // not exist. Such claims are therefore not promoted at all. A request
+        // that carried the open run's results shortened differs from the
+        // transcript only from its first shortened row: the claims past it
+        // are dropped the same way, and the ones before it bind as usual.
         let turn_cache_breakpoint_claims = if self.requests_carry_output_schema_projection() {
             &[][..]
         } else {
@@ -8742,6 +8926,7 @@ where
                 turn_cache_breakpoint_claims,
                 response_provider,
                 &response_model,
+                ctx.request_shortened_from,
             );
         // A FAULT MAY ONLY TERMINALIZE WHAT IT ACTUALLY INVALIDATES.
         //
@@ -8889,11 +9074,15 @@ where
         // limit an earlier measured turn already crossed.
         if let Some(turn_usage) = turn_usage.as_ref() {
             self.budget.record_turn_usage(turn_usage);
+            // A bounded request's count is kept too, although it reads low:
+            // the history estimate, the anchored projection and the fact the
+            // bound recorded all see the whole results.
             self.last_input_tokens = turn_usage.presented_tokens();
             self.record_answered_request(
                 turn_usage.presented_tokens(),
                 response_provider,
                 &response_model,
+                ctx.request_shortened_from.is_some(),
             );
             self.session.record_turn_usage(turn_usage);
             self.run_request_usage.push(turn_usage.clone());
@@ -11288,8 +11477,12 @@ mod tests {
         // A lying adapter yields untrustworthy EVIDENCE, not a corrupt
         // transcript: the claim is discarded and the turn's content still
         // commits. The proof is never promoted into durable evidence.
-        let (authored, discarded) =
-            promote_cache_breakpoint_claims(&[claim], crate::Provider::OpenAI, "active-model");
+        let (authored, discarded) = promote_cache_breakpoint_claims(
+            &[claim],
+            crate::Provider::OpenAI,
+            "active-model",
+            None,
+        );
         assert!(
             authored.is_empty(),
             "a mismatched claim must never be promoted into durable evidence"
@@ -15953,14 +16146,22 @@ mod tests {
     /// after the other (ids `tc_1`, `tc_2`, ...) and answers "done". It
     /// writes the compaction summary when asked, and records every other
     /// request it serves. With `cap`, it measures each request as its JSON
-    /// size against that provider cap.
+    /// size against that provider cap. With `window`, it refuses every other
+    /// request over that context window, as a provider does. With cache
+    /// claims, it places provider cache breakpoints on each request it
+    /// records.
     struct RoundsClient {
         rounds: usize,
         first_answer_bytes: usize,
         cap: Option<u64>,
+        window: Option<u64>,
+        provider: crate::provider::Provider,
+        model: &'static str,
         requests: Mutex<Vec<Vec<Message>>>,
+        refused: Mutex<usize>,
         summary_requests: Mutex<Vec<Vec<Message>>>,
         tool_calls: Mutex<usize>,
+        claims_cache_breakpoints: bool,
     }
 
     impl RoundsClient {
@@ -15969,9 +16170,14 @@ mod tests {
                 rounds,
                 first_answer_bytes: 12,
                 cap: None,
+                window: None,
+                provider: crate::provider::Provider::Other,
+                model: "mock-model",
                 requests: Mutex::new(Vec::new()),
+                refused: Mutex::new(0),
                 summary_requests: Mutex::new(Vec::new()),
                 tool_calls: Mutex::new(0),
+                claims_cache_breakpoints: false,
             }
         }
 
@@ -15985,12 +16191,70 @@ mod tests {
             self
         }
 
+        /// Refuse with a context-length error every request other than a
+        /// compaction summary whose tokens (two request bytes a token, twice
+        /// as dense as the transcript estimator's four, as JSON listings
+        /// are) and output reserve exceed `window`, and answer as the model
+        /// `primary` that [`summary_window_test_registry`] declares with that
+        /// window.
+        fn with_window(mut self, window: u64) -> Self {
+            self.window = Some(window);
+            self.provider = crate::provider::Provider::OpenAI;
+            self.model = "primary";
+            self
+        }
+
         fn requests(&self) -> Vec<Vec<Message>> {
             self.requests.lock().unwrap().clone()
         }
 
+        fn refused(&self) -> usize {
+            *self.refused.lock().unwrap()
+        }
+
         fn summary_requests(&self) -> usize {
             self.summary_requests.lock().unwrap().len()
+        }
+
+        /// Place a provider cache breakpoint at the end of every request it
+        /// answers other than a compaction summary, and one before the
+        /// request's first tool results, as the OpenAI model
+        /// [`Self::with_window`] answers as.
+        fn with_cache_claims(mut self) -> Self {
+            self.claims_cache_breakpoints = true;
+            self
+        }
+
+        /// The cache breakpoints its lowering of `messages` places.
+        fn cache_breakpoint_claims(
+            &self,
+            messages: &[Message],
+        ) -> Vec<crate::ProviderCacheBreakpointClaim> {
+            if !self.claims_cache_breakpoints {
+                return Vec::new();
+            }
+            std::iter::once(messages.len())
+                .chain(messages.iter().position(is_tool_results))
+                .filter(|message_count| *message_count > 0)
+                .map(|message_count| {
+                    crate::provider_cache_breakpoint_claim(
+                        crate::ProviderCacheBreakpointClaimRequest {
+                            provider: self.provider,
+                            model: self.model,
+                            messages,
+                            boundary: crate::CacheBreakpointBoundary::TranscriptAfter {
+                                message_count: u64::try_from(message_count).unwrap(),
+                            },
+                            ttl: crate::ProviderCacheTtl::ProviderDefault,
+                            rendered_prefix: br#"{"renderer_mode":"rounds-test"}"#,
+                            lowered_request_encoding:
+                                crate::LoweredRequestEncoding::OpenAiResponsesJson,
+                            lowered_request_body: br#"{"model":"primary"}"#,
+                        },
+                    )
+                    .expect("rounds test claim shape")
+                })
+                .collect()
         }
     }
 
@@ -16017,7 +16281,7 @@ mod tests {
             &self,
             messages: &[Message],
             _tools: &[Arc<ToolDef>],
-            _max_tokens: u32,
+            max_tokens: u32,
             _temperature: Option<f32>,
             _provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
         ) -> Result<super::LlmStreamResult, AgentError> {
@@ -16043,13 +16307,32 @@ mod tests {
                     .push(messages.to_vec());
                 return Ok(text("summary".to_string()));
             }
+            if let Some(window) = self.window {
+                let requested = serde_json::to_vec(messages).map_or(u64::MAX, |encoded| {
+                    u64::try_from(encoded.len()).unwrap_or(u64::MAX)
+                }) / 2;
+                if requested.saturating_add(u64::from(max_tokens)) > window {
+                    *self.refused.lock().unwrap() += 1;
+                    return Err(AgentError::Llm {
+                        provider: "mock",
+                        reason: LlmFailureReason::ContextExceeded {
+                            max: u32::try_from(window).unwrap_or(u32::MAX),
+                            requested: u32::try_from(requested).unwrap_or(u32::MAX),
+                        },
+                        message: "context length exceeded".to_string(),
+                    });
+                }
+            }
             self.requests.lock().unwrap().push(messages.to_vec());
+            let claims = self.cache_breakpoint_claims(messages);
             if last_user == "first" {
-                return Ok(text("a".repeat(self.first_answer_bytes)));
+                return Ok(
+                    text("a".repeat(self.first_answer_bytes)).with_cache_breakpoint_claims(claims)
+                );
             }
             let mut calls = self.tool_calls.lock().unwrap();
             if *calls >= self.rounds {
-                return Ok(text("done".to_string()));
+                return Ok(text("done".to_string()).with_cache_breakpoint_claims(claims));
             }
             *calls += 1;
             Ok(super::LlmStreamResult::new(
@@ -16062,15 +16345,16 @@ mod tests {
                 }],
                 StopReason::ToolUse,
                 normalized_test_usage(self, Usage::default()),
-            ))
+            )
+            .with_cache_breakpoint_claims(claims))
         }
 
         fn provider(&self) -> crate::provider::Provider {
-            crate::provider::Provider::Other
+            self.provider
         }
 
         fn model(&self) -> &'static str {
-            "mock-model"
+            self.model
         }
     }
 
@@ -16531,6 +16815,820 @@ mod tests {
             })
             .expect("the run's result is in the request");
         assert_eq!(result.len(), 95_000, "the result is sent whole");
+    }
+
+    /// The `tool_results_bounded_for_request` notices among `events`, in
+    /// their wire form.
+    #[cfg(feature = "workspace-tests")]
+    fn bounded_request_notices(events: &[crate::event::AgentEvent]) -> Vec<serde_json::Value> {
+        events
+            .iter()
+            .filter(|event| {
+                crate::event::agent_event_type(event) == "tool_results_bounded_for_request"
+            })
+            .map(|event| serde_json::to_value(event).unwrap())
+            .collect()
+    }
+
+    /// The text blocks `request` carries for the result of the call
+    /// `call_id`.
+    #[cfg(feature = "workspace-tests")]
+    fn carried_result_texts(request: &[Message], call_id: &str) -> Vec<String> {
+        request
+            .iter()
+            .find_map(|message| match message {
+                Message::ToolResults { results, .. } => {
+                    results.iter().find(|result| result.tool_use_id == call_id)
+                }
+                _ => None,
+            })
+            .expect("the request carries the result")
+            .content
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text { text } => text.clone(),
+                _ => panic!("the listing's result holds text only"),
+            })
+            .collect()
+    }
+
+    /// The run that made the stored tool call `call_id`.
+    #[cfg(feature = "workspace-tests")]
+    fn run_of_call(transcript: &[Message], call_id: &str) -> RunId {
+        transcript
+            .iter()
+            .find_map(|message| match message {
+                Message::BlockAssistant(assistant)
+                    if assistant.tool_calls().any(|call| call.id == call_id) =>
+                {
+                    assistant.identity.run_id.clone()
+                }
+                _ => None,
+            })
+            .expect("the stored call names its run")
+    }
+
+    /// The open run's own 400 KB result is past the model's 50k-token context
+    /// window by itself, at the transcript estimator's four bytes a token as
+    /// at the provider's two. The compaction at the round boundary folds the
+    /// earlier run, as before, and the request's forecast is still over the
+    /// window's input budget, so the result is bounded for that request only,
+    /// sized from the token overage, and the run completes. The request
+    /// carries the result's head and a marker naming the call; the stored
+    /// transcript keeps the result whole; the typed notice names the call,
+    /// both sizes and the context-window axis; the bound records that the
+    /// transcript holds content a request could not carry; and the answer to
+    /// the bounded request anchors no input projection, since its count
+    /// understates the transcript. Sent whole, the request was refused for
+    /// context and the run failed.
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn an_open_run_result_past_the_context_window_is_bounded_for_the_request() {
+        let client = Arc::new(RoundsClient::new(1).with_window(50_000));
+        let dispatcher = Arc::new(LargeListingDispatcher::new(400_000));
+        // Boundary 0 is run "first"; 1 is run "second" before its first
+        // response; 2 follows its tool round.
+        let mut agent = with_test_turn_state_handle_for_session(
+            AgentBuilder::new()
+                .model("primary")
+                .max_tokens_per_turn(1_024)
+                .compactor(Arc::new(FoldingCompactor::at(|boundary| boundary == 2)))
+                .with_effective_model_registry(summary_window_test_registry(&[(
+                    "primary", 50_000,
+                )])),
+            explicit_hot_swap_session("primary"),
+        )
+        .with_tool_visibility_owner(explicit_test_visibility_owner())
+        .build_standalone(client.clone(), dispatcher.clone(), Arc::new(NoopStore))
+        .await;
+
+        agent.run("first".into()).await.unwrap();
+        let (tx, mut rx) = mpsc::channel::<crate::event::AgentEvent>(256);
+        let second = agent.run_with_events("second".into(), tx).await;
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            second.is_ok(),
+            "the run completes with its result bounded for the request; requests refused for \
+             context: {}; error: {:?}",
+            client.refused(),
+            second.err()
+        );
+
+        assert_eq!(client.refused(), 0, "no request was refused for context");
+        assert_eq!(client.summary_requests(), 1, "the earlier run folded first");
+        assert_eq!(dispatcher.dispatches(), 1, "the tool ran once");
+        let last_request = client.requests().last().cloned().expect("the last request");
+        assert!(
+            last_request.iter().any(is_summary),
+            "the request follows the fold"
+        );
+        let carried = carried_result_texts(&last_request, "tc_1");
+        let [head, marker] = carried.as_slice() else {
+            panic!(
+                "the request carries the result's head and a marker, not {} blocks",
+                carried.len()
+            );
+        };
+        assert!(
+            (4 * 1024..400_000).contains(&head.len()),
+            "the head is bounded: {} bytes",
+            head.len()
+        );
+        assert!(
+            head.bytes().all(|byte| byte == b'r'),
+            "the head is the start of the result"
+        );
+        assert!(
+            marker.contains("list_records") && marker.contains("tc_1") && marker.contains("400000"),
+            "the marker names the call and its whole size: {marker}"
+        );
+
+        let transcript = agent.session().messages().to_vec();
+        let stored = rows_where(&transcript, is_tool_results);
+        let [Message::ToolResults { results, .. }] = stored.as_slice() else {
+            panic!("the run's one result row is stored");
+        };
+        assert_eq!(
+            results[0].text_content().len(),
+            400_000,
+            "the stored transcript keeps the result whole"
+        );
+
+        let notices = bounded_request_notices(&events);
+        assert_eq!(notices.len(), 1, "the bounded request is announced once");
+        assert_eq!(
+            notices[0]["run_id"],
+            serde_json::to_value(run_of_call(&transcript, "tc_1")).unwrap()
+        );
+        assert_eq!(notices[0]["axis"], "context_window");
+        assert_eq!(
+            notices[0]["results"].as_array().map(Vec::len),
+            Some(1),
+            "one result was bounded"
+        );
+        let bounded = &notices[0]["results"][0];
+        assert_eq!(bounded["tool_use_id"], "tc_1");
+        assert_eq!(bounded["tool_name"], "list_records");
+        assert_eq!(bounded["kept_bytes"], u64::try_from(head.len()).unwrap());
+        assert_eq!(bounded["total_bytes"], 400_000);
+
+        assert_eq!(
+            agent.compaction_cadence.last_answered_request, None,
+            "the fold dropped the anchor, and the bounded request's answer anchors none"
+        );
+        assert!(
+            agent
+                .compaction_cadence
+                .last_context_refusal_boundary_index
+                .is_some(),
+            "the bound records that the transcript holds content a request could not carry"
+        );
+        assert_eq!(persisted_cadence(agent.session()), agent.compaction_cadence);
+    }
+
+    /// The open run's own 300 KB result is past a 100 KB provider cap and no
+    /// compaction makes room. The request carries the result bounded for
+    /// itself, as before, and the bound is now announced: the typed notice
+    /// names the call, both sizes and the request-byte axis. The answer to
+    /// the bounded request anchors no input projection (the anchor stays on
+    /// the request that made the call), and the bound records that the
+    /// transcript holds content a request could not carry. Before, only the
+    /// marker the model reads said so, and the answer anchored the
+    /// projection on the count of the bounded request.
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn an_open_run_result_past_the_request_cap_is_announced_and_anchors_nothing() {
+        let client = Arc::new(RoundsClient::new(1).with_cap(100_000));
+        let dispatcher = Arc::new(LargeListingDispatcher::new(300_000));
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .compactor(Arc::new(RecordingDiscardingCompactor::new(|_| false)))
+            .build_standalone(client.clone(), dispatcher.clone(), Arc::new(NoopStore))
+            .await;
+
+        agent.run("first".into()).await.unwrap();
+        let (tx, mut rx) = mpsc::channel::<crate::event::AgentEvent>(256);
+        agent
+            .run_with_events("second".into(), tx)
+            .await
+            .expect("the run completes with its result bounded");
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+
+        let last_request = client.requests().last().cloned().expect("the last request");
+        let carried = carried_result_texts(&last_request, "tc_1");
+        let [head, _marker] = carried.as_slice() else {
+            panic!(
+                "the request carries the result's head and a marker, not {} blocks",
+                carried.len()
+            );
+        };
+        let notices = bounded_request_notices(&events);
+        assert_eq!(notices.len(), 1, "the bounded request is announced");
+        assert_eq!(notices[0]["axis"], "request_bytes");
+        let bounded = &notices[0]["results"][0];
+        assert_eq!(bounded["tool_use_id"], "tc_1");
+        assert_eq!(bounded["tool_name"], "list_records");
+        assert_eq!(bounded["kept_bytes"], u64::try_from(head.len()).unwrap());
+        assert_eq!(bounded["total_bytes"], 300_000);
+
+        let transcript = agent.session().messages().to_vec();
+        let call_at = transcript
+            .iter()
+            .position(is_tool_call)
+            .expect("the stored call");
+        let anchor = agent
+            .compaction_cadence
+            .last_answered_request
+            .clone()
+            .expect("the request that made the call anchored the projection");
+        assert_eq!(
+            anchor.transcript_rows,
+            u64::try_from(call_at).unwrap(),
+            "the anchor stays on the request that made the call: the bounded request's answer \
+             anchors none"
+        );
+        assert!(
+            agent
+                .compaction_cadence
+                .last_context_refusal_boundary_index
+                .is_some(),
+            "the bound records that the transcript holds content a request could not carry"
+        );
+        assert_eq!(persisted_cadence(agent.session()), agent.compaction_cadence);
+    }
+
+    /// A run whose two rounds each return a 300 KB result past a 100 KB
+    /// provider cap carries both bounded, and the check after its second
+    /// round does not see the fact the first bound recorded: a compaction
+    /// inside a run keeps the run's request and newest round, so it could not
+    /// fold what did not fit. The next run's first request would carry both
+    /// results whole again, so its first check sees the fact and compacts the
+    /// whole transcript once, and the run after it compacts no more. Before,
+    /// nothing recorded the bounds, and the next run sent its request past
+    /// the cap and failed as too large.
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn the_next_run_compacts_once_after_a_bounded_request() {
+        let client = Arc::new(RoundsClient::new(2).with_cap(100_000));
+        let dispatcher = Arc::new(LargeListingDispatcher::new(300_000));
+        let compactor = Arc::new(RecordingDiscardingCompactor::new(|ctx| {
+            ctx.last_context_refusal_boundary_index.is_some()
+        }));
+        // Boundary 0 is run "first"; 1 is run "second" before its first
+        // response; 2 and 3 follow its two rounds; 4 is run "third".
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .compactor(compactor.clone())
+            .build_standalone(client.clone(), dispatcher.clone(), Arc::new(NoopStore))
+            .await;
+
+        agent.run("first".into()).await.unwrap();
+        agent
+            .run("second".into())
+            .await
+            .expect("both rounds are bounded and the run completes");
+        assert_eq!(dispatcher.dispatches(), 2, "each call ran once");
+        assert_eq!(
+            client.summary_requests(),
+            0,
+            "nothing compacted inside the run"
+        );
+        assert_eq!(
+            compactor.at(3).last_context_refusal_boundary_index,
+            None,
+            "the check inside the run does not see the first bound's fact"
+        );
+        let recorded = agent.compaction_cadence.last_context_refusal_boundary_index;
+        assert_eq!(recorded, Some(3), "the newest bound's boundary is recorded");
+        assert_eq!(persisted_cadence(agent.session()), agent.compaction_cadence);
+
+        agent
+            .run("third".into())
+            .await
+            .expect("the next run compacts first and its request fits");
+        assert_eq!(
+            compactor.at(4).last_context_refusal_boundary_index,
+            recorded,
+            "the next run's first check sees the fact"
+        );
+        assert_eq!(
+            client.summary_requests(),
+            1,
+            "one compaction for the bounds"
+        );
+        assert!(
+            !agent.session().messages().iter().any(is_tool_results),
+            "the bounded results folded into the summary"
+        );
+        assert_eq!(
+            agent.compaction_cadence.last_context_refusal_boundary_index, None,
+            "the compaction of the whole transcript answered the fact"
+        );
+
+        agent.run("fourth".into()).await.unwrap();
+        assert_eq!(
+            client.summary_requests(),
+            1,
+            "no bound since, no compaction"
+        );
+        assert_eq!(persisted_cadence(agent.session()), agent.compaction_cadence);
+    }
+
+    /// The fact a bound records says the transcript holds content a request
+    /// could not carry; an answered request that carried every result whole
+    /// shows the transcript fits after all, and clears it. Here the agent's
+    /// declared window (50k) is smaller than what the provider takes: the
+    /// run's 400 KB result is bounded for its request, which records the
+    /// fact, and the bounded request's answer keeps it and anchors no input
+    /// projection (the anchor stays on the request that made the call). The
+    /// compactor ignores the fact, so nothing folds the result, and the next
+    /// run's request carries it whole; the provider answers it, and the fact
+    /// is gone, so it does not stay behind for a compactor that ignores it.
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn an_answer_sent_whole_clears_the_fact_a_bound_recorded() {
+        let client = Arc::new(RoundsClient::new(1).with_window(1_000_000));
+        let dispatcher = Arc::new(LargeListingDispatcher::new(400_000));
+        let compactor = Arc::new(RecordingDiscardingCompactor::new(|_| false));
+        // Boundary 0 is run "first"; 1 is run "second" before its first
+        // response; 2 follows its tool round; 3 is run "third".
+        let mut agent = with_test_turn_state_handle_for_session(
+            AgentBuilder::new()
+                .model("primary")
+                .max_tokens_per_turn(1_024)
+                .compactor(compactor.clone())
+                .with_effective_model_registry(summary_window_test_registry(&[(
+                    "primary", 50_000,
+                )])),
+            explicit_hot_swap_session("primary"),
+        )
+        .with_tool_visibility_owner(explicit_test_visibility_owner())
+        .build_standalone(client.clone(), dispatcher.clone(), Arc::new(NoopStore))
+        .await;
+
+        agent.run("first".into()).await.unwrap();
+        let (tx, mut rx) = mpsc::channel::<crate::event::AgentEvent>(256);
+        agent
+            .run_with_events("second".into(), tx)
+            .await
+            .expect("the run completes with its result bounded");
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(
+            bounded_request_notices(&events).len(),
+            1,
+            "test setup: the run's request was bounded"
+        );
+        let recorded = agent.compaction_cadence.last_context_refusal_boundary_index;
+        assert_eq!(
+            recorded,
+            Some(2),
+            "the bound recorded the fact, and the bounded request's answer kept it"
+        );
+        let call_at = agent
+            .session()
+            .messages()
+            .iter()
+            .position(is_tool_call)
+            .expect("the stored call");
+        let anchor = agent
+            .compaction_cadence
+            .last_answered_request
+            .clone()
+            .expect("the request that made the call anchored the projection");
+        assert_eq!(
+            anchor.transcript_rows,
+            u64::try_from(call_at).unwrap(),
+            "the anchor stays on the request that made the call: the answer to the request \
+             bounded on the context window anchors none"
+        );
+
+        agent
+            .run("third".into())
+            .await
+            .expect("the next run's request is answered whole");
+        assert_eq!(
+            compactor.at(3).last_context_refusal_boundary_index,
+            recorded,
+            "the next run's first check saw the fact, which this compactor ignores"
+        );
+        assert_eq!(client.summary_requests(), 0, "nothing compacted");
+        assert_eq!(
+            client.refused(),
+            0,
+            "the provider took the whole transcript"
+        );
+        let last_request = client.requests().last().cloned().expect("the last request");
+        let carried = carried_result_texts(&last_request, "tc_1");
+        assert_eq!(
+            carried.iter().map(String::len).collect::<Vec<_>>(),
+            vec![400_000],
+            "the next run's request carried the result whole"
+        );
+        assert_eq!(
+            agent.compaction_cadence.last_context_refusal_boundary_index, None,
+            "the answer to a request sent whole cleared the fact"
+        );
+        assert_eq!(persisted_cadence(agent.session()), agent.compaction_cadence);
+    }
+
+    /// The control: a result that fits the window's input budget and the
+    /// provider cap is sent whole. Nothing is announced or recorded, and the
+    /// answer to the request that carried it anchors the input projection on
+    /// the transcript that request was composed from.
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn an_unbounded_request_anchors_and_announces_nothing() {
+        let client = Arc::new(RoundsClient::new(1).with_window(50_000).with_cap(100_000));
+        let dispatcher = Arc::new(LargeListingDispatcher::new(4_000));
+        let mut agent = with_test_turn_state_handle_for_session(
+            AgentBuilder::new()
+                .model("primary")
+                .max_tokens_per_turn(1_024)
+                .compactor(Arc::new(RecordingDiscardingCompactor::new(|_| false)))
+                .with_effective_model_registry(summary_window_test_registry(&[(
+                    "primary", 50_000,
+                )])),
+            explicit_hot_swap_session("primary"),
+        )
+        .with_tool_visibility_owner(explicit_test_visibility_owner())
+        .build_standalone(client.clone(), dispatcher.clone(), Arc::new(NoopStore))
+        .await;
+
+        agent.run("first".into()).await.unwrap();
+        let (tx, mut rx) = mpsc::channel::<crate::event::AgentEvent>(256);
+        agent.run_with_events("second".into(), tx).await.unwrap();
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+
+        assert!(
+            bounded_request_notices(&events).is_empty(),
+            "nothing is announced"
+        );
+        let last_request = client.requests().last().cloned().expect("the last request");
+        assert_eq!(
+            carried_result_texts(&last_request, "tc_1"),
+            vec!["r".repeat(4_000)],
+            "the result is sent whole"
+        );
+        let anchor = agent
+            .compaction_cadence
+            .last_answered_request
+            .clone()
+            .expect("the answer anchors the projection");
+        assert_eq!(
+            anchor.transcript_rows,
+            u64::try_from(agent.session().messages().len() - 1).unwrap(),
+            "on the request the final answer came after"
+        );
+        assert_eq!(
+            agent.compaction_cadence.last_context_refusal_boundary_index, None,
+            "nothing is recorded"
+        );
+    }
+
+    /// The fallback fixtures' agent ([`FallbackActivatingClient`]) whose
+    /// primary and backup declare the context windows `windows`, whose
+    /// backup's provider takes at most `backup_cap` request bytes, and whose
+    /// compactor never compacts, so only a bound shortens a request. Its run
+    /// calls `list_records` once on the primary for a 400 KB result; the
+    /// primary then fails the request that carries the result, and the retry
+    /// goes to the backup.
+    #[cfg(feature = "workspace-tests")]
+    async fn fallback_bound_agent(
+        windows: (u32, u32),
+        backup_cap: u64,
+    ) -> (
+        Arc<FallbackActivatingClient>,
+        crate::agent::Agent<FallbackActivatingClient, LargeListingDispatcher, NoopStore>,
+    ) {
+        use crate::retry::RetryPolicy;
+
+        let client = Arc::new(FallbackActivatingClient::with_tool_round(
+            summary_window_test_registry(&[("primary", windows.0), ("backup", windows.1)]),
+            backup_cap,
+        ));
+        let visibility_owner: Arc<dyn crate::ToolVisibilityOwner> =
+            Arc::new(RecordingFallbackVisibilityOwner::default());
+        let generated_visibility_owner =
+            crate::tool_scope::generated_test_tool_visibility_owner_from(Arc::clone(
+                &visibility_owner,
+            ));
+        let agent = with_test_turn_state_handle_for_session(
+            AgentBuilder::new(),
+            explicit_hot_swap_session("primary"),
+        )
+        .with_effective_model_registry(client.registry())
+        .max_tokens_per_turn(1_024)
+        .compactor(Arc::new(RecordingDiscardingCompactor::new(|_| false)))
+        .with_tool_visibility_owner(generated_visibility_owner)
+        .with_model_routing_handle(Arc::new(RecordingModelRoutingHandle::new(visibility_owner)))
+        .with_sticky_model_fallback_commit_coordinator(Arc::new(
+            RecordingStickyFallbackCoordinator::default(),
+        ))
+        .retry_policy(RetryPolicy {
+            max_retries: 1,
+            initial_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            multiplier: 1.0,
+            call_timeout: None,
+            stream_inactivity_timeout: None,
+        })
+        .build_standalone(
+            Arc::clone(&client),
+            Arc::new(LargeListingDispatcher::new(400_000)),
+            Arc::new(NoopStore),
+        )
+        .await;
+        (client, agent)
+    }
+
+    /// After a run whose request a fallback's limits bounded: the stored
+    /// transcript keeps the result whole, the bound recorded (and persisted)
+    /// that the transcript holds content a request could not carry, and the
+    /// answer to the bounded request anchored no input projection: the anchor
+    /// stays on the request that made the call.
+    #[cfg(feature = "workspace-tests")]
+    fn assert_fallback_bound_recorded_and_anchored_nothing(
+        agent: &crate::agent::Agent<FallbackActivatingClient, LargeListingDispatcher, NoopStore>,
+    ) {
+        let transcript = agent.session().messages().to_vec();
+        let stored = rows_where(&transcript, is_tool_results);
+        let [Message::ToolResults { results, .. }] = stored.as_slice() else {
+            panic!("the run's one result row is stored");
+        };
+        assert_eq!(
+            results[0].text_content().len(),
+            400_000,
+            "the stored transcript keeps the result whole"
+        );
+        assert!(
+            agent
+                .compaction_cadence
+                .last_context_refusal_boundary_index
+                .is_some(),
+            "the bound records that the transcript holds content a request could not carry"
+        );
+        assert_eq!(
+            persisted_cadence(agent.session()).last_context_refusal_boundary_index,
+            agent.compaction_cadence.last_context_refusal_boundary_index,
+            "the fact is persisted with the session"
+        );
+        let call_at = transcript
+            .iter()
+            .position(is_tool_call)
+            .expect("the stored call");
+        let anchor = agent
+            .compaction_cadence
+            .last_answered_request
+            .clone()
+            .expect("the request that made the call anchored the projection");
+        assert_eq!(
+            anchor.transcript_rows,
+            u64::try_from(call_at).unwrap(),
+            "the anchor stays on the request that made the call: the answer to the bounded \
+             request anchors none"
+        );
+    }
+
+    /// The primary's 60k-token window bounds the run's own 400 KB result for
+    /// the request that carries it; the primary fails that request, and the
+    /// retry goes to the backup, whose provider takes 50 KB of request, less
+    /// than the bounded request holds. The retry path bounds the request
+    /// again from the whole result the first bound cut, not from the head the
+    /// request carries: the backup's request carries a shorter head of the
+    /// whole result, and each sent request is announced once, the second
+    /// with the whole size on the request-byte axis. The bound is recorded,
+    /// the answer anchors no input projection, and the stored transcript
+    /// keeps the result whole. Cut from the carried head, the second notice
+    /// would state the head's size as the whole.
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn a_bound_after_a_model_fallback_cuts_again_from_the_whole_result() {
+        let (client, mut agent) = fallback_bound_agent((60_000, 60_000), 50_000).await;
+
+        let (tx, mut rx) = mpsc::channel::<crate::event::AgentEvent>(256);
+        let result = agent.run_with_events("go".into(), tx).await;
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            result.is_ok(),
+            "the run completes on the backup: {:?}",
+            result.err()
+        );
+        assert_eq!(client.fallback_commits(), 1, "the fallback activated");
+
+        let requests = client.seen_requests();
+        assert_eq!(
+            requests.len(),
+            3,
+            "the call, the primary's failed request and the backup's request"
+        );
+        let primary = carried_result_texts(&requests[1], "tc_1");
+        assert_eq!(
+            primary.len(),
+            2,
+            "test setup: the primary's request carries the result bounded"
+        );
+        let carried = carried_result_texts(&requests[2], "tc_1");
+        let [head, marker] = carried.as_slice() else {
+            panic!(
+                "the backup's request carries a head and a marker, not {} blocks",
+                carried.len()
+            );
+        };
+        assert!(
+            head.len() < primary[0].len(),
+            "the backup's request carries a shorter head: {} of the primary's {} bytes",
+            head.len(),
+            primary[0].len()
+        );
+        assert!(
+            head.bytes().all(|byte| byte == b'r'),
+            "the head is the start of the whole result"
+        );
+        assert!(
+            marker.contains("400000"),
+            "the marker states the whole size: {marker}"
+        );
+
+        let notices = bounded_request_notices(&events);
+        assert_eq!(notices.len(), 2, "each bounded request is announced once");
+        assert_eq!(notices[0]["axis"], "context_window");
+        assert_eq!(
+            notices[0]["results"][0]["kept_bytes"],
+            u64::try_from(primary[0].len()).unwrap()
+        );
+        assert_eq!(notices[0]["results"][0]["total_bytes"], 400_000);
+        assert_eq!(notices[1]["axis"], "request_bytes");
+        assert_eq!(notices[1]["results"][0]["tool_use_id"], "tc_1");
+        assert_eq!(
+            notices[1]["results"][0]["kept_bytes"],
+            u64::try_from(head.len()).unwrap()
+        );
+        assert_eq!(
+            notices[1]["results"][0]["total_bytes"], 400_000,
+            "the bound after the fallback is cut from the whole result"
+        );
+
+        assert_fallback_bound_recorded_and_anchored_nothing(&agent);
+    }
+
+    /// The primary's 128k-token window takes the run's own 400 KB result, so
+    /// the request that carries it goes whole; the primary fails it, and the
+    /// retry goes to the backup, whose provider takes 100 KB of request. Only
+    /// the retry path bounds the request, for the backup: the bound is
+    /// announced once, after the fallback is staged, and recorded, and the
+    /// answer to the bounded request anchors no input projection.
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn a_request_the_fallback_bounds_is_announced_recorded_and_anchors_nothing() {
+        let (client, mut agent) = fallback_bound_agent((128_000, 128_000), 100_000).await;
+
+        let (tx, mut rx) = mpsc::channel::<crate::event::AgentEvent>(256);
+        let result = agent.run_with_events("go".into(), tx).await;
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            result.is_ok(),
+            "the run completes on the backup: {:?}",
+            result.err()
+        );
+        assert_eq!(client.fallback_commits(), 1, "the fallback activated");
+
+        let requests = client.seen_requests();
+        assert_eq!(
+            requests.len(),
+            3,
+            "the call, the primary's failed request and the backup's request"
+        );
+        assert_eq!(
+            carried_result_texts(&requests[1], "tc_1")
+                .iter()
+                .map(String::len)
+                .collect::<Vec<_>>(),
+            vec![400_000],
+            "test setup: the primary's request carries the result whole"
+        );
+        let carried = carried_result_texts(&requests[2], "tc_1");
+        let [head, _marker] = carried.as_slice() else {
+            panic!(
+                "the backup's request carries a head and a marker, not {} blocks",
+                carried.len()
+            );
+        };
+
+        let notices = bounded_request_notices(&events);
+        assert_eq!(notices.len(), 1, "the backup's request is announced once");
+        assert_eq!(notices[0]["axis"], "request_bytes");
+        assert_eq!(notices[0]["results"][0]["tool_use_id"], "tc_1");
+        assert_eq!(
+            notices[0]["results"][0]["kept_bytes"],
+            u64::try_from(head.len()).unwrap()
+        );
+        assert_eq!(notices[0]["results"][0]["total_bytes"], 400_000);
+        let kinds = events
+            .iter()
+            .map(crate::event::agent_event_type)
+            .collect::<Vec<_>>();
+        let staged = kinds
+            .iter()
+            .position(|kind| *kind == "model_fallback_staged")
+            .expect("the fallback is staged");
+        let announced = kinds
+            .iter()
+            .position(|kind| *kind == "tool_results_bounded_for_request")
+            .expect("the bound is announced");
+        assert!(
+            staged < announced,
+            "the bound is announced for the backup's request: {kinds:?}"
+        );
+
+        assert_fallback_bound_recorded_and_anchored_nothing(&agent);
+    }
+
+    /// The provider places a cache breakpoint at the end of each request it
+    /// answers and one before the request's first tool results. On either
+    /// axis, the breakpoint at the end of a request that carried the open
+    /// run's own result shortened anchors a prefix the transcript never held
+    /// (the transcript keeps the result whole), so it is dropped unreported;
+    /// the one before the shortened result binds and is kept. Before, every
+    /// bounded request published `provider_cache_breakpoints_discarded` for
+    /// a moved prefix: a degradation that did not happen.
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn a_cache_breakpoint_past_a_shortened_result_is_dropped_unreported() {
+        // The declared window, the provider's request cap, the result size
+        // and the axis that bounds the result.
+        for (window, cap, result_bytes, axis) in [
+            (50_000, None, 400_000, "context_window"),
+            (1_000_000, Some(100_000), 300_000, "request_bytes"),
+        ] {
+            let mut client = RoundsClient::new(1)
+                .with_window(1_000_000)
+                .with_cache_claims();
+            if let Some(cap) = cap {
+                client = client.with_cap(cap);
+            }
+            let client = Arc::new(client);
+            let mut agent = with_test_turn_state_handle_for_session(
+                AgentBuilder::new()
+                    .model("primary")
+                    .max_tokens_per_turn(1_024)
+                    .compactor(Arc::new(RecordingDiscardingCompactor::new(|_| false)))
+                    .with_effective_model_registry(summary_window_test_registry(&[(
+                        "primary", window,
+                    )])),
+                explicit_hot_swap_session("primary"),
+            )
+            .with_tool_visibility_owner(explicit_test_visibility_owner())
+            .build_standalone(
+                client.clone(),
+                Arc::new(LargeListingDispatcher::new(result_bytes)),
+                Arc::new(NoopStore),
+            )
+            .await;
+
+            agent.run("first".into()).await.unwrap();
+            let (tx, mut rx) = mpsc::channel::<crate::event::AgentEvent>(256);
+            agent
+                .run_with_events("second".into(), tx)
+                .await
+                .expect("the run completes with its result bounded");
+            let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+
+            let notices = bounded_request_notices(&events);
+            assert_eq!(
+                notices.len(),
+                1,
+                "{axis}: test setup: the run's request was bounded"
+            );
+            assert_eq!(notices[0]["axis"], axis);
+            let discards = events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        crate::event::AgentEvent::ProviderCacheBreakpointsDiscarded { .. }
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                discards.is_empty(),
+                "{axis}: the bound discards no cache breakpoint: {discards:?}"
+            );
+
+            let bounded = client.requests().last().cloned().expect("the last request");
+            let shortened_at = bounded
+                .iter()
+                .position(is_tool_results)
+                .expect("the bounded request carries the result");
+            let kept = agent
+                .session()
+                .authored_cache_breakpoints()
+                .expect("the session's cache evidence reads");
+            assert!(
+                kept.iter().any(|breakpoint| breakpoint.boundary()
+                    == crate::CacheBreakpointBoundary::TranscriptAfter {
+                        message_count: u64::try_from(shortened_at).unwrap(),
+                    }),
+                "{axis}: the breakpoint before the shortened result binds and is kept"
+            );
+        }
     }
 
     /// Answers every ordinary request with `presented` input tokens and
@@ -29806,6 +30904,14 @@ mod tests {
             Mutex<Vec<Option<crate::lifecycle::run_primitive::ProviderParamsOverride>>>,
         forged_client_capability_filter: Mutex<ToolFilter>,
         forged_client_max_output_tokens: std::sync::atomic::AtomicU32,
+        /// Answer the next request, on any model, with one call of
+        /// `list_records` (`tc_1`): the primary then fails the request that
+        /// carries its result.
+        tool_round_pending: std::sync::atomic::AtomicBool,
+        /// The request bytes the backup's provider takes; `None` measures no
+        /// request. The primary's provider takes any size.
+        backup_request_cap: Option<u64>,
+        seen_requests: Mutex<Vec<Vec<Message>>>,
     }
 
     fn fallback_activation_test_registry() -> Arc<crate::ModelRegistry> {
@@ -30216,7 +31322,26 @@ mod tests {
                 seen_provider_params: Mutex::new(Vec::new()),
                 forged_client_capability_filter: Mutex::new(ToolFilter::All),
                 forged_client_max_output_tokens: std::sync::atomic::AtomicU32::new(u32::MAX),
+                tool_round_pending: std::sync::atomic::AtomicBool::new(false),
+                backup_request_cap: None,
+                seen_requests: Mutex::new(Vec::new()),
             }
+        }
+
+        /// The models of `registry`, a run that calls `list_records` once on
+        /// the primary before the primary fails, so the fallback's request
+        /// carries the run's result, and a backup whose provider takes at most
+        /// `backup_request_cap` request bytes.
+        fn with_tool_round(registry: Arc<crate::ModelRegistry>, backup_request_cap: u64) -> Self {
+            let mut client = Self::new();
+            client.registry = registry;
+            client.tool_round_pending = std::sync::atomic::AtomicBool::new(true);
+            client.backup_request_cap = Some(backup_request_cap);
+            client
+        }
+
+        fn seen_requests(&self) -> Vec<Vec<Message>> {
+            self.seen_requests.lock().unwrap().clone()
         }
 
         fn with_post_activation_identity_read_failure() -> Self {
@@ -30710,13 +31835,22 @@ mod tests {
     impl AgentLlmClient for FallbackActivatingClient {
         fn request_pressure(
             &self,
-            _messages: &[Message],
+            messages: &[Message],
             _tools: &[Arc<ToolDef>],
             _max_tokens: u32,
             _temperature: Option<f32>,
             _params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
         ) -> Result<Option<crate::ProviderRequestPressure>, AgentError> {
-            Ok(Some(crate::ProviderRequestPressure::new(0, None)))
+            let backup_cap = self
+                .backup_request_cap
+                .filter(|_| self.active.load(std::sync::atomic::Ordering::SeqCst) != 0);
+            let Some(cap) = backup_cap else {
+                return Ok(Some(crate::ProviderRequestPressure::new(0, None)));
+            };
+            let bytes = serde_json::to_vec(messages).map_or(u64::MAX, |encoded| {
+                u64::try_from(encoded.len()).unwrap_or(u64::MAX)
+            });
+            Ok(Some(crate::ProviderRequestPressure::new(bytes, Some(cap))))
         }
 
         async fn stream_response(
@@ -30727,6 +31861,7 @@ mod tests {
             _temperature: Option<f32>,
             provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
         ) -> Result<super::LlmStreamResult, AgentError> {
+            self.seen_requests.lock().unwrap().push(messages.to_vec());
             self.seen_max_tokens.lock().unwrap().push(max_tokens);
             self.seen_provider_params
                 .lock()
@@ -30748,6 +31883,22 @@ mod tests {
                     .collect::<Vec<_>>(),
             );
 
+            if self
+                .tool_round_pending
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Ok(super::LlmStreamResult::new(
+                    vec![AssistantBlock::ToolUse {
+                        id: "tc_1".to_string(),
+                        name: "list_records".into(),
+                        args: serde_json::value::RawValue::from_string("{}".to_string())
+                            .expect("static raw value should parse"),
+                        meta: None,
+                    }],
+                    StopReason::ToolUse,
+                    normalized_test_usage(self, Usage::default()),
+                ));
+            }
             if self.active.load(std::sync::atomic::Ordering::SeqCst) == 0 {
                 return Err(AgentError::llm(
                     "mock",
