@@ -256,9 +256,16 @@ if [[ "${run_mutants}" == "true" ]]; then
     write_cfg "${cfg}" "${settle_first}" ""
     # The stop-intent invariants are left to their own targeted mutants
     # (below): a general mutant that keeps the in-flight input also keeps it
-    # after a stop of its run, which they would report first.
+    # after a stop of its run, which they would report first. A renamed one
+    # must not stay in silently, so the filter must drop exactly two lines.
     awk '$0 != "  AuditStoppedRunInputNotRetained" && $0 != "  AuditStoppedGapRunSettledCancelled"' \
       "${cfg}" > "${cfg}.next"
+    local dropped
+    dropped=$(( $(wc -l < "${cfg}") - $(wc -l < "${cfg}.next") ))
+    if [[ "${dropped}" != "2" ]]; then
+      echo "error: mutant ${name}'s config dropped ${dropped} stop-intent invariant lines, not 2" >&2
+      exit 1
+    fi
     mv "${cfg}.next" "${cfg}"
     run_tlc "mutant-${name}" "${cfg}" "${dir}"
     local log="${work_dir}/mutant-${name}.log"

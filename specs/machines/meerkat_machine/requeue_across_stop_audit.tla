@@ -25,9 +25,10 @@
 \* runtime. A stop of A's run (StopCurrentRunForRun) may come first, at any
 \* point before the stop transaction: then the stop keeps nothing of the
 \* run, suspended or not. That branch ends in process 1: it never restarts
-\* and never takes the gap path, since what it checks is process 1's. The stop classifies each non-terminal input twice, as the shell
-\* does: once for the carriers before the exit and once for the cleanup after
-\* it (the shell refuses a stop whose two answers differ). After the stop it
+\* and never takes the gap path, since what it checks is process 1's. The
+\* stop classifies each non-terminal input twice, as the shell does: once
+\* for the carriers before the exit and once for the cleanup after it (the
+\* shell refuses a stop whose two answers differ). After the stop it
 \* explores a replayed stop transaction (terminalize_async_stop_once runs
 \* again when no runless carrier was committed), an unregister begun only
 \* after a plain stop, and the unregister drain. The restart is a NEW

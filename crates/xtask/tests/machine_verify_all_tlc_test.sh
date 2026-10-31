@@ -293,8 +293,9 @@ fi
 # the same process resumes any other suspended run and starts its turn
 # again. It requires twelve witnesses reached, a graceful end and a crash
 # among them; its --mutants mode (by hand) refuses seventeen seeded defects
-# against every invariant and nine stop-intent and fence-gap defects each
-# against its target invariant alone. 32 steps reach the deepest witness.
+# against every invariant but the two stop-intent ones and nine stop-intent
+# and fence-gap defects each against its target invariant alone. 32 steps
+# reach the deepest witness.
 requeue_across_stop_audit="${workspace_root}/specs/machines/meerkat_machine/requeue_across_stop_audit.sh"
 if [[ ! -x "${requeue_across_stop_audit}" ]]; then
   echo "error: requeue-across-stop audit runner is missing from workspace runfiles: ${requeue_across_stop_audit}" >&2
@@ -308,24 +309,29 @@ fi
 # The Keep disposition: a materialization refused before it served (a durable
 # tail held for recovery, a failed agent build) rolls its registration back
 # with an unregister that keeps every input the registration recovered from
-# the store, exactly as the store holds it, and still stops an input admitted
+# the store, exactly as the store holds it, except the inputs bound to a run
+# marked resumable whose stop was asked, and still stops an input admitted
 # while the registration stood; so does the retirement of an executor
 # attachment that never served, while a retire that meets one still stops;
 # once the registration served live work (an admission, a deduplicated wait
 # or a recycle) its unregister keeps nothing. A hand-written audit over the
 # same generated model runs three processes: the first crashes with one
 # input staged and one queued under a key, the second recovers both through
-# the generated recovery arms, may admit a third, resolve a resubmission as a
-# duplicate or take a recycle, and rolls back with Keep (or, as the control,
-# Stop), or attaches an executor that never serves and unregisters it
-# through the unserved-attachment arm with its abort's Keep or a retire's
-# Stop, and the third recovers and serves. It checks that exactly one
-# verdict arm answers each input, that Keep stops no recovered input and
-# keeps no admitted one, that only Keep keeps, that a kept input survives
-# the rollback, that live work forfeits the keep and that a retire over the
-# unserved attachment keeps nothing, and requires ten witnesses reached; its
-# --mutants mode refuses twelve seeded defects, the machine without the Keep
-# arm, an unregister begin that keeps after live work and a retire that
+# the generated recovery arms, either marking the first's run resumable
+# first (its staged input stays bound to it, and a stop of the run may be
+# recorded) or not, then, unmarked, may admit a third, resolve a
+# resubmission as a duplicate or take a recycle, and rolls back with Keep
+# (or, as the control, Stop), or attaches an executor that never serves and
+# unregisters it through the unserved-attachment arm with its abort's Keep
+# or a retire's Stop, and the third recovers and serves. It checks that
+# exactly one verdict arm answers each input, that the input bound to a
+# stopped marked run is never kept, that Keep stops no other recovered input
+# and keeps no admitted one, that only Keep keeps, that a kept input
+# survives the rollback, that live work forfeits the keep and that a retire
+# over the unserved attachment keeps nothing, and requires eleven witnesses
+# reached; its --mutants mode refuses fourteen seeded defects, the machine
+# without the Keep arm, an unregister begin that keeps after live work, the
+# machine without the exception for a stopped marked run and a retire that
 # requests Keep among them. 44 steps reach the deepest witness, and 50 the
 # whole reachable space.
 materialization_rollback_keep_audit="${workspace_root}/specs/machines/meerkat_machine/materialization_rollback_keep_audit.sh"

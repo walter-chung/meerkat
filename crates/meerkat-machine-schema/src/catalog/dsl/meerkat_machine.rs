@@ -15559,12 +15559,12 @@ macro_rules! meerkat_catalog_machine_dsl {
         // gap's, or a restart's that has not resumed yet): no run is current,
         // so there is no turn to interrupt. The stop intent is recorded on
         // that run as on a current one: the run never resumes (`ResumeRun`
-        // refuses it), a requeue stop keeps none of its inputs, and the
-        // runtime settles it, its bound inputs abandoned as `Cancelled`, once
-        // its store takes writes again (the shell wakes its loop). A
-        // registration draining for its unregister keeps its resumable run
-        // for the next start, whose fresh machine a stop of this registration
-        // does not reach: such a stop is refused here.
+        // refuses it), a requeue stop or a Keep rollback keeps none of its
+        // inputs, and the runtime settles it, its bound inputs abandoned as
+        // `Cancelled`, once its store takes writes again (the shell wakes its
+        // loop). A registration draining for its unregister keeps its
+        // resumable run for the next start, whose fresh machine a stop of this
+        // registration does not reach: such a stop is refused here.
         transition StopCurrentRunForRunResumable {
             per_phase [Idle, Attached]
             on input StopCurrentRunForRun { run_id }
@@ -40044,7 +40044,12 @@ macro_rules! meerkat_catalog_machine_dsl {
                     && self.recovered_admitted_inputs.contains(input_id))
                 || (self.resumable_run_id != None
                     && self.run_stop_requested == self.resumable_run_id
-                    && self.input_run_associations.get_cloned(input_id) == self.resumable_run_id)
+                    && self.input_run_associations.get_cloned(input_id) == self.resumable_run_id
+                    && self.input_phases.contains_key(input_id)
+                    && (self.input_phases.get(input_id).get("value") == InputPhase::Staged
+                        || self.input_phases.get(input_id).get("value") == InputPhase::Applied
+                        || self.input_phases.get(input_id).get("value")
+                            == InputPhase::AppliedPendingConsumption))
             }
             update {}
             to Idle
@@ -40092,9 +40097,15 @@ macro_rules! meerkat_catalog_machine_dsl {
         // nothing (registration_live_input_seen): its unregister records a
         // requested Keep as Stop, since a recycle's recovery or a
         // deduplicated wait mixes live inputs into the recovered witness.
-        // The inputs of a run marked resumable whose stop was asked are not
-        // kept either: the Abandon arm ends them, so the next registration
-        // never resumes the stopped run.
+        // The inputs bound to a run marked resumable whose stop was asked
+        // (associated with it in a bound phase: Staged, Applied or
+        // AppliedPendingConsumption, as the resumed-run plan selects them)
+        // are not kept either: the Abandon arm ends them, so the next
+        // registration never resumes the stopped run. A queued input that
+        // only still names that run (a discarded live join keeps its
+        // association, and recovery restores a queued row's last run) is not
+        // the run's: it is kept like any other recovered input, as every
+        // other stop path leaves it.
         transition ClassifyStopInputDispositionKeep {
             per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
             on input ClassifyStopInputDisposition { input_id, durability, directed, objective_bound }
@@ -40107,7 +40118,12 @@ macro_rules! meerkat_catalog_machine_dsl {
             guard "not_a_stopped_resumable_run_input" {
                 !(self.resumable_run_id != None
                     && self.run_stop_requested == self.resumable_run_id
-                    && self.input_run_associations.get_cloned(input_id) == self.resumable_run_id)
+                    && self.input_run_associations.get_cloned(input_id) == self.resumable_run_id
+                    && self.input_phases.contains_key(input_id)
+                    && (self.input_phases.get(input_id).get("value") == InputPhase::Staged
+                        || self.input_phases.get(input_id).get("value") == InputPhase::Applied
+                        || self.input_phases.get(input_id).get("value")
+                            == InputPhase::AppliedPendingConsumption))
             }
             update {}
             to Idle
