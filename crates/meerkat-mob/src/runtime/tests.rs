@@ -98927,12 +98927,12 @@ async fn turn_driven_placed_spawn_with_initial_message_retains_no_activation_cle
 /// A member whose endpoint migrated (a wake onto a successor session) is
 /// wired to a placed peer while it is dormant, so the wire wakes it and the
 /// wake's topology repairs the new edge. The repair reinstalls the member's
-/// own trust toward the placed peer first, then asks the peer's host to drop
-/// the member's old endpoint (`RemovePeerTrust` carrying the historical peer
-/// id). A host that refuses that removal (`Unavailable`) leaves the woken
-/// member trusting its placed peer; the edge's next repair (an idempotent
-/// `wire`) removes the old endpoint. No removal names the member's current
-/// endpoint.
+/// own trust toward the placed peer first, then asks the peer's host, once per
+/// repair, to drop the member's old endpoint (`RemovePeerTrust` carrying the
+/// historical peer id). A host that refuses that removal (`Unavailable`)
+/// leaves the woken member trusting its placed peer; the edge's next repair
+/// (an idempotent `wire`) removes the old endpoint. No removal names the
+/// member's current endpoint.
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_placed_peer_drops_a_migrated_members_old_endpoint_after_the_member_trusts_it() {
@@ -98999,9 +98999,9 @@ async fn a_placed_peer_drops_a_migrated_members_old_endpoint_after_the_member_tr
     let remote_key = dsl::AgentIdentity::from_domain(&remote);
 
     // The local member's history: it is released, its binding then names a
-    // session no store holds, and an unbound session named for it is
-    // listed, so its wake restores it on that successor, whose key is
-    // another endpoint.
+    // session no store holds, its original session is unlisted, and an
+    // unbound session named for it is listed, so its wake restores it on
+    // that successor, whose key is another endpoint.
     tokio::time::timeout(
         STEP,
         controlling
@@ -99011,6 +99011,7 @@ async fn a_placed_peer_drops_a_migrated_members_old_endpoint_after_the_member_tr
     .await
     .expect("the local spawn answers")
     .expect("spawn the local member");
+    let original = controlling.member_session_id(&local).await;
     release_landed(&controlling.handle, &local).await;
     let old_peer_id = controlling
         .handle
@@ -99026,6 +99027,16 @@ async fn a_placed_peer_drops_a_migrated_members_old_endpoint_after_the_member_tr
         .rebind_member_session_for_test(&local, SessionId::new())
         .await
         .expect("move the member's binding to a session no store holds");
+    // Unlisted, the original session is no successor candidate: the
+    // session created below is the only one, whatever the clock says (the
+    // original would tie with it on match rank and lose only on its earlier
+    // `updated_at`).
+    meerkat_runtime::RuntimeStore::delete_runtime_session_catalog_entry(
+        &*controlling.runtime_store,
+        &meerkat_runtime::LogicalRuntimeId::for_session(&original),
+    )
+    .await
+    .expect("unlist the member's original session");
     let successor = controlling
         .service
         .create_session(CreateSessionRequest {
@@ -99123,10 +99134,12 @@ async fn a_placed_peer_drops_a_migrated_members_old_endpoint_after_the_member_tr
             .map(|payload| payload.peer.peer_id)
             .collect::<Vec<_>>()
     };
-    let refused = removals();
-    assert!(
-        !refused.is_empty() && refused.iter().all(|peer_id| peer_id == &old_peer_id),
-        "the wake's repair asked the host to remove the old endpoint, and only it: {refused:?}"
+    // One retained endpoint and one host lane: the wake's repair sends one
+    // removal, and a rejected one is not resent (only a timeout is).
+    assert_eq!(
+        removals(),
+        vec![old_peer_id.clone()],
+        "the wake's repair asked the host once to remove the old endpoint, and only it"
     );
     assert!(
         controlling
@@ -99135,15 +99148,15 @@ async fn a_placed_peer_drops_a_migrated_members_old_endpoint_after_the_member_tr
         "the woken member trusts its placed peer although the host refused the old endpoint's removal"
     );
 
-    // The edge's next repair asks again, and the host accepts.
+    // The edge's next repair asks again, once, and the host accepts.
     tokio::time::timeout(STEP, controlling.handle.wire(local.clone(), remote.clone()))
         .await
         .expect("the repair answers")
         .expect("the repair removes the old endpoint once the host accepts");
-    let removed = removals();
-    assert!(
-        removed.len() > refused.len() && removed.iter().all(|peer_id| peer_id == &old_peer_id),
-        "the repair asked again, and no removal names the member's current endpoint: {removed:?}"
+    assert_eq!(
+        removals(),
+        vec![old_peer_id.clone(), old_peer_id.clone()],
+        "the repair asked once more, and no removal names the member's current endpoint"
     );
     host.shutdown();
 }
