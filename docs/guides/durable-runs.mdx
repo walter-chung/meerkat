@@ -468,8 +468,12 @@ fence:
   written again the same way, but it cannot suspend the run, whose turn
   has already ended: a closing save still refused after its one wait keeps
   the teardown class, and the turn fails. A turn that no runtime run backs
-  (a direct turn) fails with a retryable storage error instead, after up
-  to two waits (its dispatch's, then its closing write's).
+  (a direct turn) is stopped at the gap instead: its run is suspended with
+  its stop recorded, so it never resumes and is settled as cancelled once
+  the fence is back, and the turn fails with a retryable storage error
+  after its one wait. Until the run is settled, a direct turn of the
+  session is refused with `SESSION_BUSY`, as it is while a run a restart
+  left open has not resumed or been settled: retry it.
 - **A stop asked of the run still ends it.** A cancel the run accepted
   before the gap, an interrupt or a stop that reaches the run while the
   holder is stopped (which suspends the run rather than interrupting it),

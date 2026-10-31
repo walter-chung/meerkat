@@ -92,6 +92,12 @@ Committed create failure must not be silently rewritten to “cancelled” or cl
 
 - At most one in-flight turn per session.
 - Concurrent attempts return `SESSION_BUSY`.
+- A turn the runtime queue does not dispatch (a direct turn, such as a
+  create's first turn) also returns `SESSION_BUSY` while the session's
+  runtime holds a run that waits to resume: one a store fence gap suspended
+  (see [Durable runs](/guides/durable-runs#one-writer%2C-fenced)), or one a
+  restart left open. It goes through once the runtime has resumed or
+  settled that run.
 - Committed success must not be rewritten to cancellation.
 - Runtime-backed surfaces may hot-swap supported live settings on an existing session where the surface contract says that is allowed.
 - Runtime-backed surfaces do not race `start_turn`: they admit each turn through the session's runtime queue, so a surface turn that arrives while another is running waits behind it and then runs.

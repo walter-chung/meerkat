@@ -59,6 +59,11 @@ them.
   run's stop intent, and an ambient `CancelAfterBoundary` of an attached
   session that holds a run marked resumable, with no run current and no
   unregister draining, records the stop intent on that run.
+  `StartConversationRun` from `Idle`, `Initializing` or `Attached` (a run
+  the runtime did not prepare: a direct turn's) is refused while a run is
+  marked resumable, as `Prepare` refuses another run
+  (`no_other_resumable_run`); the session service refuses such a direct
+  turn with `SessionError::Busy` before it reaches the machine.
 
 - Behaviour-only (not measured by the gate): a host store meets obligation
   5 (fencing) at commit: it refuses a batch whose token is below one
@@ -435,13 +440,21 @@ them.
     last any number of waits, so a store outage that begins before a run's
     final answer no longer ends inputs as `MaxAttemptsExhausted` either.
     This holds on every runtime apply path: the facade's default executor,
-    mob members, the CLI, REST, the MCP server and JSON-RPC. A direct turn,
-    which no runtime run backs, fails with a retryable `StoreError` instead
-    of the teardown class, after up to two waits (its dispatch's, then its
-    closing write's: about 70 s at the defaults). A closing save is written
-    after the run's final answer and terminal, so it cannot suspend the
-    run: a closing save still refused after its one wait keeps the teardown
-    class, and the turn fails (see Known limitations);
+    mob members, the CLI, REST, the MCP server and JSON-RPC. A direct turn
+    (no runtime run backs it) is stopped there instead: its run's stop is
+    recorded and the machine suspends it
+    (`MeerkatMachine::stop_and_suspend_service_turn_for_fence_gap`), so
+    nothing of it is written while the gap lasts, it never resumes, and the
+    runtime settles it as cancelled once the fence is back. The turn fails
+    with a retryable `StoreError` after that one wait, instead of the
+    teardown class. Before, it failed only after a second wait, its closing
+    save's, and its terminal's write met the gap and left the session
+    repair-blocked. Until the run is settled, a direct turn of the session
+    is refused with `SessionError::Busy` (`SESSION_BUSY`), as it is while a
+    restart's open run has not resumed or been settled. A closing save is
+    written after the run's final answer and terminal, so it cannot suspend
+    the run: a closing save still refused after its one wait keeps the
+    teardown class, and the turn fails (see Known limitations);
   - a cancel the run accepted before the gap, and an interrupt or a stop
     that reaches the run while its writer is stopped (which now suspends
     the run instead of a hard interrupt, which the gap would have undone
@@ -652,9 +665,12 @@ them.
   `RequeuedAcrossStop`. A cancel at the next boundary accepted just before
   that suspension can likewise fail when its dispatch to the dropped turn
   fails, while the run is still settled as cancelled once the fence is
-  back. A gap met while a run re-bases its session is not suspended: the
-  re-base's outcome is
-  unknown, and the session reloads as before. A closing save still
+  back. A direct turn's run that a gap stopped publishes no run terminal on
+  the session's event stream: its turn is answered with the refusal, and
+  the settlement's terminal finds no live session (the failed turn
+  discarded it). A gap met while a run re-bases its session is not
+  suspended: the re-base's outcome is unknown, and the session reloads as
+  before. A closing save still
   refused after its one wait (a gap that outlasts the wait after a run's
   final answer) keeps the teardown class, and the turn fails: the turn's
   terminal is recorded before that save, so the run cannot be suspended
