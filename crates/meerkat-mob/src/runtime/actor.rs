@@ -11723,9 +11723,10 @@ impl MobActor {
     }
 
     /// Remove one stale generation endpoint from every surviving placed
-    /// target before retirement unwires the edge. The route-removal authority
-    /// proves the exact host lane; the consumed endpoint-migration authority
-    /// proves `retained_spec.peer_id` is historical trust for the retiring
+    /// target, before retirement unwires the edge or before an edge repair
+    /// reinstalls current trust. The route-removal authority proves the exact
+    /// host lane; the consumed endpoint-migration authority proves
+    /// `retained_spec.peer_id` is historical trust for `retiring_identity`'s
     /// runtime.
     async fn realize_historical_route_removals_before_unwire(
         &mut self,
@@ -11772,6 +11773,62 @@ impl MobActor {
             }
         }
         Ok(true)
+    }
+
+    /// Remove every endpoint MobMachine retains as `migrated`'s history
+    /// (`retained_peer_endpoints`, left by an endpoint migration) from the
+    /// other end of the wired `edge`. Each removal names exactly one retained
+    /// peer id under its own `AuthorizeMemberEndpointMigrationTrustCleanup`
+    /// authority. A local survivor (`survivor_comms`) removes the row from
+    /// its own trust store; otherwise every surviving placed end's host is
+    /// sent an authenticated `RemovePeerTrust` it must acknowledge. Removing
+    /// an absent row is a no-op, so a repeated sweep is idempotent.
+    /// `incomplete` types a removal that fails for the caller.
+    async fn remove_retained_member_endpoints(
+        &mut self,
+        edge: &mob_dsl::WiringEdge,
+        migrated: &RosterEntry,
+        retained_peer_endpoints: BTreeSet<mob_dsl::MemberPeerEndpoint>,
+        survivor_comms: Option<Arc<dyn CoreCommsRuntime>>,
+        incomplete: fn(String) -> MobError,
+    ) -> Result<(), MobError> {
+        let migrated_identity = &migrated.agent_identity;
+        for retained_peer_endpoint in retained_peer_endpoints {
+            let retained_spec = Self::peer_only_spec_from_member_endpoint(
+                &retained_peer_endpoint,
+                "historical member endpoint cleanup",
+            )?;
+            let retained_peer_id = retained_peer_endpoint.peer_id.0.clone();
+            let handoff = self.authorize_member_endpoint_migration_trust_cleanup(
+                edge,
+                migrated,
+                &retained_peer_endpoint,
+                "historical_member_endpoint_trust_authority",
+            )?;
+            let authority = handoff.unwiring_authority_for(migrated_identity, &retained_peer_id)?;
+            if let Some(comms) = survivor_comms.as_ref() {
+                self.apply_trusted_peer_remove(comms.as_ref(), retained_peer_id.clone(), authority)
+                    .await
+                    .map_err(|error| {
+                        incomplete(format!(
+                            "failed to remove historical member trust '{retained_peer_id}' of '{migrated_identity}' from its local peer: {error}"
+                        ))
+                    })?;
+            } else if !self
+                .realize_historical_route_removals_before_unwire(
+                    edge,
+                    migrated_identity,
+                    &retained_spec,
+                    authority,
+                )
+                .await?
+            {
+                return Err(incomplete(format!(
+                    "historical member trust '{retained_peer_id}' of '{migrated_identity}' has no surviving local or placed cleanup lane"
+                )));
+            }
+        }
+        Ok(())
     }
 
     async fn restore_route_installs_after_unwire_abort(&mut self, edge: &mob_dsl::WiringEdge) {
@@ -45603,10 +45660,62 @@ impl MobActor {
         }
     }
 
+    /// Before an existing edge's trust is reinstalled, remove each end's
+    /// retained endpoints from the other end's trust. An endpoint migration
+    /// (a wake or a resume that moved a member to a session with another key)
+    /// keeps the old endpoint as the member's history, and a live or placed
+    /// peer may still trust it: reinstalling only the current endpoint would
+    /// leave that peer two rows under the member's name. A counterpart that
+    /// is not materialized holds no trust store (its wake installs current
+    /// endpoints only), and a legacy peer-only counterpart's trust lives in
+    /// its own runtime, so neither is swept. A removal that fails fails the
+    /// repair: the edge stays owed and its next repair sweeps again.
+    async fn remove_retained_endpoints_across_edge(
+        &mut self,
+        edge: &mob_dsl::WiringEdge,
+        ends: [(&AgentIdentity, &WiringEndpoint); 2],
+    ) -> Result<(), MobError> {
+        for (migrated, counterpart) in ends {
+            let retained_peer_endpoints = self
+                .dsl_authority
+                .state()
+                .member_prior_peer_endpoints
+                .get(&mob_dsl::AgentIdentity::from_domain(migrated))
+                .cloned()
+                .unwrap_or_default();
+            if retained_peer_endpoints.is_empty() {
+                continue;
+            }
+            let counterpart_comms = match counterpart {
+                WiringEndpoint::Local { comms, .. } => Some(Arc::clone(comms)),
+                WiringEndpoint::Placed { .. } => None,
+                WiringEndpoint::LocalDormant { .. } | WiringEndpoint::PeerOnly { .. } => continue,
+            };
+            let migrated_entry = self
+                .roster
+                .read()
+                .await
+                .get(migrated)
+                .cloned()
+                .ok_or_else(|| MobError::MemberNotFound(migrated.clone()))?;
+            self.remove_retained_member_endpoints(
+                edge,
+                &migrated_entry,
+                retained_peer_endpoints,
+                counterpart_comms,
+                MobError::WiringError,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Reinstall the shell trust/route projection for an edge the MobMachine
     /// already owns. This excludes every new-edge branch so respawn topology
     /// restoration does not poll the generic wire future's large frame on the
-    /// already-deep spawn/respawn actor stack.
+    /// already-deep spawn/respawn actor stack. Each end's retained historical
+    /// endpoints are first removed from the other end
+    /// ([`Self::remove_retained_endpoints_across_edge`]).
     async fn repair_existing_member_wire(
         &mut self,
         edge: &mob_dsl::WiringEdge,
@@ -45622,6 +45731,18 @@ impl MobActor {
             ));
         }
         let handoff = authority.member_handoff()?;
+        // Built in its own frame (see `boxed_arm_future`): a repair also runs
+        // on the deep respawn stack.
+        boxed_arm_future(|| {
+            self.remove_retained_endpoints_across_edge(
+                edge,
+                [
+                    (local, peer_endpoint),
+                    (peer_member_identity, local_endpoint),
+                ],
+            )
+        })
+        .await?;
         match (local_endpoint, peer_endpoint) {
             (
                 WiringEndpoint::Local {
@@ -46992,46 +47113,14 @@ impl MobActor {
                 }
                 _ => None,
             };
-            for retained_peer_endpoint in retained_peer_endpoints {
-                let retained_spec = Self::peer_only_spec_from_member_endpoint(
-                    &retained_peer_endpoint,
-                    "placed-edge historical retirement cleanup",
-                )?;
-                let retained_peer_id = retained_peer_endpoint.peer_id.0.clone();
-                let handoff = self.authorize_member_endpoint_migration_trust_cleanup(
-                    edge,
-                    &retiring_entry,
-                    &retained_peer_endpoint,
-                    "placed_edge_historical_retire_trust_authority",
-                )?;
-                let authority =
-                    handoff.unwiring_authority_for(retiring_identity, &retained_peer_id)?;
-                if let Some(comms) = surviving_local_comms.as_ref() {
-                    self.apply_trusted_peer_remove(
-                        comms.as_ref(),
-                        retained_peer_id.clone(),
-                        authority,
-                    )
-                    .await
-                    .map_err(|error| {
-                        MobError::RetirementTopologyIncomplete(format!(
-                            "failed to remove historical retiring member trust '{retained_peer_id}' from local survivor: {error}"
-                        ))
-                    })?;
-                } else if !self
-                    .realize_historical_route_removals_before_unwire(
-                        edge,
-                        retiring_identity,
-                        &retained_spec,
-                        authority,
-                    )
-                    .await?
-                {
-                    return Err(MobError::RetirementTopologyIncomplete(format!(
-                        "historical retiring member trust '{retained_peer_id}' has no surviving local or placed cleanup lane"
-                    )));
-                }
-            }
+            self.remove_retained_member_endpoints(
+                edge,
+                &retiring_entry,
+                retained_peer_endpoints,
+                surviving_local_comms,
+                MobError::RetirementTopologyIncomplete,
+            )
+            .await?;
         }
 
         // Remote trust removal is a synchronous precondition of the durable

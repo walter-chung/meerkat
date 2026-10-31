@@ -140,6 +140,12 @@ acts on it, and the read is never a write path: only the machine's own
 transitions move a member's residency, and a host that needs a member live
 wakes it with a delivery or `ensure_member_live`.
 
+A wake that finds a member's bound session gone from the store restores it
+on a listed successor session (not archived, bound to no member, naming the
+same mob, member and role) when one exists. The successor's key gives the
+member a new endpoint, and the wake removes the old one from each live or
+placed peer's trust before it reinstalls the edge, as a resume does.
+
 ### One-shot durable role migration
 
 Role is durable context, but it is not member identity. `MemberLaunchMode::Resume`

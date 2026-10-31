@@ -505,6 +505,27 @@ them.
   the 8 MiB budget. The added size is virtual address space; pages are
   committed only when touched.
 
+- `meerkat-mob`: a wake that moves a member to a successor session now
+  removes the member's old endpoint from its peers. A wake takes a successor
+  when the member's bound session is gone from the store and a listed
+  session that is not archived and is bound to no member names the same mob,
+  member and role; that session's key gives the member a new endpoint.
+  MobMachine kept the old endpoint as the member's history, but the wake
+  only added the new endpoint to each live or placed peer's trust, so every
+  wired peer kept a second row under the member's name until its comms
+  runtime was rebuilt (a restart, its own release and wake, or a mob
+  resume): its `peers` listed the member twice, and every send to the old
+  peer id failed `peer_not_found_or_not_trusted`. The repair of an existing
+  edge (a wake's topology step, an owed edge repair, an idempotent `wire`)
+  now first removes each end's retained endpoints from the other end, as a
+  resume and a retirement do, each removal under MobMachine's
+  `AuthorizeMemberEndpointMigrationTrustCleanup` (for a placed peer, through
+  a `RemovePeerTrust` its host acknowledges). A removal that fails fails the
+  edge's repair, which stays owed and is retried. A member-to-member message
+  whose delivery woke the member still fails once with `PeerNotFound`, as
+  before: it was addressed to the old endpoint, which the peer's directory
+  no longer lists.
+
 ### Known limitations
 
 - `meerkat-runtime`: a governed input admitted under its own authority
