@@ -17052,6 +17052,85 @@ mod tests {
         assert_eq!(persisted_cadence(agent.session()), agent.compaction_cadence);
     }
 
+    /// The fact a bound records says the transcript holds content a request
+    /// could not carry; an answered request that carried every result whole
+    /// shows the transcript fits after all, and clears it. Here the agent's
+    /// declared window (50k) is smaller than what the provider takes: the
+    /// run's 400 KB result is bounded for its request, which records the
+    /// fact, and the bounded request's answer keeps it. The compactor ignores
+    /// the fact, so nothing folds the result, and the next run's request
+    /// carries it whole; the provider answers it, and the fact is gone, so it
+    /// does not stay behind for a compactor that ignores it.
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn an_answer_sent_whole_clears_the_fact_a_bound_recorded() {
+        let client = Arc::new(RoundsClient::new(1).with_window(1_000_000));
+        let dispatcher = Arc::new(LargeListingDispatcher::new(400_000));
+        let compactor = Arc::new(RecordingDiscardingCompactor::new(|_| false));
+        // Boundary 0 is run "first"; 1 is run "second" before its first
+        // response; 2 follows its tool round; 3 is run "third".
+        let mut agent = with_test_turn_state_handle_for_session(
+            AgentBuilder::new()
+                .model("primary")
+                .max_tokens_per_turn(1_024)
+                .compactor(compactor.clone())
+                .with_effective_model_registry(summary_window_test_registry(&[(
+                    "primary", 50_000,
+                )])),
+            explicit_hot_swap_session("primary"),
+        )
+        .with_tool_visibility_owner(explicit_test_visibility_owner())
+        .build_standalone(client.clone(), dispatcher.clone(), Arc::new(NoopStore))
+        .await;
+
+        agent.run("first".into()).await.unwrap();
+        let (tx, mut rx) = mpsc::channel::<crate::event::AgentEvent>(256);
+        agent
+            .run_with_events("second".into(), tx)
+            .await
+            .expect("the run completes with its result bounded");
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(
+            bounded_request_notices(&events).len(),
+            1,
+            "test setup: the run's request was bounded"
+        );
+        let recorded = agent.compaction_cadence.last_context_refusal_boundary_index;
+        assert_eq!(
+            recorded,
+            Some(2),
+            "the bound recorded the fact, and the bounded request's answer kept it"
+        );
+
+        agent
+            .run("third".into())
+            .await
+            .expect("the next run's request is answered whole");
+        assert_eq!(
+            compactor.at(3).last_context_refusal_boundary_index,
+            recorded,
+            "the next run's first check saw the fact, which this compactor ignores"
+        );
+        assert_eq!(client.summary_requests(), 0, "nothing compacted");
+        assert_eq!(
+            client.refused(),
+            0,
+            "the provider took the whole transcript"
+        );
+        let last_request = client.requests().last().cloned().expect("the last request");
+        let carried = carried_result_texts(&last_request, "tc_1");
+        assert_eq!(
+            carried.iter().map(String::len).collect::<Vec<_>>(),
+            vec![400_000],
+            "the next run's request carried the result whole"
+        );
+        assert_eq!(
+            agent.compaction_cadence.last_context_refusal_boundary_index, None,
+            "the answer to a request sent whole cleared the fact"
+        );
+        assert_eq!(persisted_cadence(agent.session()), agent.compaction_cadence);
+    }
+
     /// The control: a result that fits the window's input budget and the
     /// provider cap is sent whole. Nothing is announced or recorded, and the
     /// answer to the request that carried it anchors the input projection on
