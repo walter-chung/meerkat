@@ -311,11 +311,14 @@ The store relies on Core keeping these rules:
   at most one self-fence window plus the acquire's own timeouts (its two
   acquires and its renew, 35 s at the default timing), trying again once
   per renew interval while it fails, and goes on once it resumed the
-  holder. When no acquire succeeds in that time and no other process shows
-  up (a fence gap), the runtime suspends the run with its inputs bound to
-  it and resumes it once the fence is back; the gap may last as long as the
-  store does not answer. Only an acquire that finds another process ends
-  the run and the session's live state here.
+  holder. A round commit refused while the holder is stopped waits the same
+  way and is written again, once, when the acquire succeeds. When no
+  acquire succeeds in that time and no other process shows up (a fence
+  gap), the runtime suspends the run with its inputs bound to it and
+  resumes it once the fence is back; the gap may last as long as the store
+  does not answer. Only another process ends the run and the session's live
+  state here: one an acquire finds, or one a renew or a commit answered
+  `FencedOut` reveals, wherever Core meets it first.
 - **Self-fencing.** The holder fences itself on its own clock: it makes no
   model call, dispatches nothing and commits nothing unless its last
   successful acquire or renew started less than the self-fence window ago.
@@ -496,8 +499,10 @@ on the database's clock, in a row of their own.
   (obligation 5). A takeover that lands between that read and the commit
   is not seen there: the load below still drops the batch, and Core's
   writer learns of the takeover at its next renew, within one renew
-  interval, but answers it gave in between can claim that batch. Keep that
-  window short.
+  interval, but answers it gave in between can claim that batch. That
+  window does not meet obligation 5, which asks that the commit itself be
+  refused: keep it short, or make the fence check and the commit one
+  transaction (a write conditional on the fence row).
 - **Retries.** A streaming insert can fail in transport under a burst of
   commits. Retry it a bounded number of times with jittered backoff.
   Per-row insert ids, and a load that keeps one copy of a repeated commit id

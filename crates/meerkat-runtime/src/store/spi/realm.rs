@@ -686,7 +686,9 @@ impl SelfFence for SpiRealm {
         window
     }
 
-    /// Another writer holds the realm: it is poisoned, and never resumes.
+    /// The realm lost its fence: it is poisoned (another writer's holder or
+    /// batch, a fenced-out renew or commit, or a break of the writer's own
+    /// rules), and this writer never resumes.
     fn lost(&self) -> bool {
         self.realm_poisoned().is_some()
     }

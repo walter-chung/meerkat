@@ -259,6 +259,13 @@ again; no approval given before the crash is reused. MCP tools and host callback
 are dispatched again the same way, and a callback request to a client is
 sent again.
 
+A run that a store fence gap suspends (see
+[One writer, fenced](#one-writer-fenced)) resumes the same way, in the same
+process, once the fence is back, which can be seconds later. A tool whose
+work outlives its call (a job it started, a request still in flight) can
+then see the same call again while that work still runs: the dedupe key is
+how it tells them apart.
+
 ### The Dedupe Key
 
 Every tool call made in a run's tool round carries a dedupe key, whether or
@@ -449,14 +456,26 @@ fence:
   waiting on them are answered `requeued_across_stop` within that one wait.
   The runtime resumes the run once the fence is back: from its last
   committed round, or from its inputs when it had not committed a round
-  yet. The gap may last any number of waits. A turn that no runtime run
-  backs (a direct turn) fails with a retryable storage error instead.
+  yet. The gap may last any number of waits. A round commit that meets
+  the stopped holder waits and suspends the run the same way (the commit
+  is written again, once, when the acquire succeeds within the wait); the
+  round it was writing is done again on resume, as after a crash. A turn
+  that no runtime run backs (a direct turn) fails with a retryable storage
+  error instead.
+- **A stop asked of the run still ends it.** A cancel the run accepted
+  before the gap, or an interrupt or a stop of the suspended run, ends the
+  run: it never resumes, and once the fence is back it is settled, its
+  inputs abandoned as cancelled. Ending it needs a write, so it ends only
+  then.
 - **Another process ends this one's runs.** When the acquire finds that
-  another process holds the fence or committed meanwhile, the run is
-  refused and the live session torn down. The store refuses every later
-  write of this process, so the session's inputs stay as last committed,
-  for the new owner to run, and callers waiting on them here are answered
-  `requeued_across_stop`.
+  another process holds the fence or committed meanwhile, or a renew or a
+  commit is answered `FencedOut`, the run is refused and the live session
+  torn down, whether that is met at a dispatch, at a commit or while a
+  suspended run waits to resume. The store refuses every later write of
+  this process, so the session's inputs stay as last committed, for the
+  new owner to run, and callers waiting on them here are answered
+  `requeued_across_stop` (an ephemeral input, which no store keeps, ends
+  with the teardown instead).
 - **Self-fencing.** The holder makes no model call, dispatches no tool and
   commits nothing unless its last successful acquire or renew started less
   than the self-fence window ago. The window is the lease minus the store's
@@ -586,10 +605,22 @@ Before you run a host store in production, run the host store chapter of the
 - A run that a store fence gap suspended resumes in the same process as
   after a restart: what it did after its last round commit is done again.
   A run suspended before its first round commit starts again from its
-  inputs, so its run-start hooks run again and `RunStarted` is published
-  again under the same run id. A mob delegation whose member turn a fence
-  gap suspends ends as it does for a stop; the member's input still runs
-  once the fence is back.
+  inputs, so its run-start hooks run again and `run_started` is published
+  again under the same run id, with no terminal in between: read a repeated
+  `run_started` for a run id that has no terminal yet as that run starting
+  over, and drop what you received for the run id before.
+- A mob delegation (a temporary council, a fork-off, a live delegation)
+  whose member turn a fence gap suspends reads the `requeued_across_stop`
+  answer as a stop's and ends; the member's input still runs once the fence
+  is back, with no one waiting for it.
+- A stop asked of a suspended run is kept in memory until the fence is
+  back: a process that ends before then loses it, and the next start
+  resumes the run. A cancel at the next boundary (`cancel_after_boundary`)
+  asked while the run is suspended finds no running turn and is refused;
+  interrupt or stop the run instead.
+- A gap met while a run re-bases its session (after a compaction, on a
+  WholeBlob realm whose store supports it) is not suspended: the re-base's
+  outcome is unknown, so the session reloads, as before.
 - Budget counters that span the agent's lifetime, rather than the run's,
   start again with the agent after a restart, as for any session a host
   rebuilds; the run's own time budget continues.

@@ -6018,6 +6018,28 @@ struct FeedWakeHoldState {
 /// whose wait answers at once is polled no faster than this.
 const FENCE_GAP_REPOLL: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Tell the local waiters of the session's inputs that the store keeps (every
+/// unfinished input but an ephemeral one) that their inputs stay queued
+/// (`RequeuedAcrossStop`): another writer holds the session store's fence, so
+/// nothing this process does for them lands, and the new owner runs them. An
+/// ephemeral input is in no store: the session's teardown ends it, and
+/// answers its waiters, as before.
+async fn answer_waiters_for_lost_store_fence(
+    driver: &crate::meerkat_machine::SharedDriver,
+    completions: Option<&crate::meerkat_machine::SharedCompletionRegistry>,
+) {
+    let Some(completions) = completions else {
+        return;
+    };
+    let kept = driver.lock().await.store_kept_input_ids();
+    completions.lock().await.fail_inputs(
+        kept,
+        crate::completion::CompletionWaitError::RequeuedAcrossStop {
+            stopped_at: chrono::Utc::now(),
+        },
+    );
+}
+
 const FEED_HOLD_REPOLL_BASE: std::time::Duration = std::time::Duration::from_millis(25);
 const FEED_HOLD_REPOLL_CAP: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -7439,6 +7461,22 @@ async fn admit_resumed_run(
     authority_binding: &RuntimeLoopAuthorityBinding,
     run_id: RunId,
 ) -> ResumedRunAdmissionLap {
+    // A run whose stop was asked (a cancel it accepted before a store fence
+    // gap suspended it, or a stop or an interrupt of it while it was
+    // suspended) never resumes: it is settled, its inputs abandoned as
+    // cancelled. The loop gets here only once the session's store takes
+    // writes again.
+    if driver.lock().await.resumable_run_stop_requested() {
+        return settle_unresumed_run(
+            driver,
+            completions,
+            executor,
+            authority_binding,
+            &run_id,
+            UnresumedRun::Stopped,
+        )
+        .await;
+    }
     let (lacks_controller, held, waits_for_destination) = {
         let d = driver.lock().await;
         (
@@ -7521,15 +7559,81 @@ async fn settle_refused_resumed_run(
     run_id: &RunId,
     detail: String,
 ) -> ResumedRunAdmissionLap {
-    tracing::warn!(
-        session_id = %authority_binding.session_id,
-        %run_id,
-        %detail,
-        "the resumed run was refused; it is settled without running"
-    );
+    settle_unresumed_run(
+        driver,
+        completions,
+        executor,
+        authority_binding,
+        run_id,
+        UnresumedRun::Refused { detail },
+    )
+    .await
+}
+
+/// Why a run marked resumable is settled without resuming.
+enum UnresumedRun {
+    /// Its resume was refused; `detail` says why.
+    Refused { detail: String },
+    /// Its stop was asked: a cancel it accepted before a store fence gap
+    /// suspended it, or a stop or an interrupt of it while it was suspended.
+    Stopped,
+}
+
+impl UnresumedRun {
+    fn abandon_reason(&self) -> crate::input_state::InputAbandonReason {
+        match self {
+            Self::Refused { .. } => crate::input_state::InputAbandonReason::ResumeRefused,
+            Self::Stopped => crate::input_state::InputAbandonReason::Cancelled,
+        }
+    }
+
+    /// The fixed, host-neutral reason the cross-runtime terminal carries; a
+    /// refusal's detail is logged and stays out of it.
+    fn termination_reason(&self) -> &'static str {
+        match self {
+            Self::Refused { .. } => "the resumed run was refused",
+            Self::Stopped => "the suspended run was stopped",
+        }
+    }
+
+    /// What the settled inputs' local waiters are told.
+    fn waiter_reason(&self) -> String {
+        match self {
+            Self::Refused { detail } => format!("the resumed run was refused: {detail}"),
+            Self::Stopped => "the suspended run was stopped before it resumed".to_string(),
+        }
+    }
+}
+
+/// Settle a run marked resumable without resuming it, for `why`. The machine
+/// clears the run's mark, records its terminal and abandons its bound inputs
+/// (as refused resumes, or as cancelled); the loop fails their waiters, owes
+/// the runless terminal and drains any directed terminal outbox the
+/// settlement staged. The run never begins again.
+async fn settle_unresumed_run(
+    driver: &crate::meerkat_machine::SharedDriver,
+    completions: Option<&crate::meerkat_machine::SharedCompletionRegistry>,
+    executor: &mut dyn meerkat_core::lifecycle::CoreExecutor,
+    authority_binding: &RuntimeLoopAuthorityBinding,
+    run_id: &RunId,
+    why: UnresumedRun,
+) -> ResumedRunAdmissionLap {
+    match &why {
+        UnresumedRun::Refused { detail } => tracing::warn!(
+            session_id = %authority_binding.session_id,
+            %run_id,
+            %detail,
+            "the resumed run was refused; it is settled without running"
+        ),
+        UnresumedRun::Stopped => tracing::info!(
+            session_id = %authority_binding.session_id,
+            %run_id,
+            "the suspended run was stopped; it is settled without resuming"
+        ),
+    }
     let mut runless_terminal = authority_binding.runless_terminal_announcement();
     let queue_authority_guard = match authority_binding
-        .lock_current_queue_driver_authority(driver, "refused resumed run settlement")
+        .lock_current_queue_driver_authority(driver, "unresumed run settlement")
         .await
     {
         Ok(guard) => guard,
@@ -7542,18 +7646,12 @@ async fn settle_refused_resumed_run(
     let settled = driver
         .lock()
         .await
-        .settle_resumable_run_with_terminals(
-            run_id,
-            crate::input_state::InputAbandonReason::ResumeRefused,
-            // A fixed, host-neutral reason: the admission's detail is
-            // logged above and stays out of the cross-runtime terminal.
-            "the resumed run was refused",
-        )
+        .settle_resumable_run_with_terminals(run_id, why.abandon_reason(), why.termination_reason())
         .await;
     let (abandoned, settled_terminal) = match settled {
         Ok(settled) => (settled.abandoned, settled.terminal),
         Err(error) => {
-            tracing::error!(%run_id, %error, "failed to settle a refused resumed run");
+            tracing::error!(%run_id, %error, "failed to settle a run marked resumable");
             drop(queue_authority_guard);
             return ResumedRunAdmissionLap::Exit(true);
         }
@@ -7563,11 +7661,7 @@ async fn settle_refused_resumed_run(
     }
     if let Some(completions) = completions {
         let mut completions = completions.lock().await;
-        fail_completion_waiters(
-            &mut completions,
-            &abandoned,
-            format!("the resumed run was refused: {detail}"),
-        );
+        fail_completion_waiters(&mut completions, &abandoned, why.waiter_reason());
     }
     authority_binding.release_ended_run_tool_markers(run_id);
     // The settled run never resumes, so its provisional tail is repaired as
@@ -7637,10 +7731,12 @@ enum SuspendedRunRealization {
 ///   run's inputs bound to it with its requeue mark and the next start
 ///   resumes the run from its last committed round;
 /// - a store fence gap (the session store's writer stayed stopped through the
-///   run's whole dispatch wait and no other writer was found, outside any
-///   unregister): the machine marks the run resumable and returns its turn to
-///   `Ready`, its inputs keep their run and their stage attempts, and this
-///   loop resumes the run once the store's fence is restored.
+///   run's whole dispatch wait, or a round commit's, and no other writer was
+///   found, outside any unregister): the machine marks the run resumable and
+///   returns its turn to `Ready`, its inputs keep their run and their stage
+///   attempts, and this loop resumes the run once the store's fence is
+///   restored, or settles it then, when its stop was asked (a cancel it
+///   accepted before the gap stands as that stop).
 ///
 /// Nothing else is realized: no terminal, no input change, and the
 /// provisional tail stays.
@@ -8077,37 +8173,48 @@ async fn process_queue(
         // run a store fence gap suspended waits here, one bounded wait at a
         // time, until the fence is restored. No guard is held while it waits,
         // and each wait ends with a new lap, so stops and effects are seen
-        // between waits. Another writer holding the fence ends the session's
-        // runs here: nothing of the run starts again in this process, the
-        // store keeps its inputs for the new owner, and every local waiter is
-        // told its input stays queued, as a teardown for that cause tells it.
+        // between waits. A realm that lost its fence to another writer ends
+        // the session here, as a takeover met at a dispatch does: nothing of
+        // the run starts again in this process, the store keeps the session's
+        // inputs for the new owner, every local waiter of one is told it
+        // stays queued, and the loop hands the session over to its teardown.
         if resumable_run_id.is_some()
             && let Some(fence) = authority_binding.store_self_fence()
-            && !fence.window().is_open()
         {
-            drop(turn_finalization_guard);
-            let window = fence.dispatch_window().await;
-            if !window.is_open() {
-                if fence.lost() {
-                    tracing::warn!(
+            if fence.lost() {
+                tracing::warn!(
+                    session_id = %authority_binding.session_id,
+                    "another writer holds the session store's fence; the suspended run does not \
+                     resume in this process, the session's waiters are told their inputs stay \
+                     queued for the new owner, and the session is torn down"
+                );
+                answer_waiters_for_lost_store_fence(driver, completions).await;
+                handoff.disposition = RuntimeLoopTeardownDisposition::UnregisterRequired;
+                // As a teardown-required apply does: returning exits the
+                // loop, and the watcher starts the canonical unregister.
+                if let Err(error) = authority_binding
+                    .begin_durable_unregister_for_teardown(driver)
+                    .await
+                {
+                    tracing::error!(
                         session_id = %authority_binding.session_id,
-                        "another writer holds the session store's fence; the suspended run does \
-                         not resume in this process, and the session's waiters are told their \
-                         inputs stay queued for the new owner"
+                        %error,
+                        "the lost store fence's teardown could not persist BeginUnregister before \
+                         loop handoff"
                     );
-                    if let Some(completions) = completions {
-                        completions.lock().await.fail_all_waiters(
-                            crate::completion::CompletionWaitError::RequeuedAcrossStop {
-                                stopped_at: chrono::Utc::now(),
-                            },
-                        );
-                    }
-                    return false;
                 }
-                // A fence whose wait answers at once must not spin the loop.
-                tokio::time::sleep(FENCE_GAP_REPOLL).await;
+                return true;
             }
-            continue 'lap;
+            if !fence.window().is_open() {
+                drop(turn_finalization_guard);
+                let window = fence.dispatch_window().await;
+                if !window.is_open() && !fence.lost() {
+                    // A fence whose wait answers at once must not spin the
+                    // loop.
+                    tokio::time::sleep(FENCE_GAP_REPOLL).await;
+                }
+                continue 'lap;
+            }
         }
         let resumed_run_id = match resumable_run_id {
             Some(run_id) => {
@@ -9662,8 +9769,13 @@ async fn process_queue(
                                         // back or at the next start. Their
                                         // waiters are told so now, within the
                                         // run's one dispatch wait, instead of
-                                        // waiting out the gap.
-                                        if let Some(completions) = completions {
+                                        // waiting out the gap. A run whose stop
+                                        // was asked never resumes: its waiters
+                                        // get its settlement's answer once the
+                                        // fence is back.
+                                        let stopped =
+                                            driver.lock().await.resumable_run_stop_requested();
+                                        if !stopped && let Some(completions) = completions {
                                             completions.lock().await.fail_inputs(
                                                 input_ids.iter().cloned(),
                                                 crate::completion::CompletionWaitError::RequeuedAcrossStop {
@@ -9723,35 +9835,34 @@ async fn process_queue(
                             completed_terminal_witness_before_failure_realization(
                                 d, cancelled, &run_id,
                             );
-                        let teardown_required =
-                            e.requires_runtime_teardown() || completed_terminal_before_failure;
+                        // Another writer holds the session store's fence,
+                        // whatever class the failure has (a takeover first met
+                        // at a commit fails it as an ordinary store error):
+                        // the store refuses every write of this process from
+                        // here on, so the session is torn down, nothing this
+                        // teardown realizes for the session's inputs lands,
+                        // and the store keeps them as last committed, pending,
+                        // for the new owner to run. Every local waiter of an
+                        // input the store keeps is told it stays queued, not
+                        // that it ended, so no caller resubmits work the new
+                        // owner runs.
+                        let store_fence_lost = authority_binding.store_fence_lost();
+                        let teardown_required = e.requires_runtime_teardown()
+                            || completed_terminal_before_failure
+                            || store_fence_lost;
                         if teardown_required {
                             handoff.disposition =
                                 RuntimeLoopTeardownDisposition::UnregisterRequired;
                         }
-                        // Another writer holds the session store's fence: the
-                        // store refuses every write of this process from here
-                        // on, so nothing this teardown realizes for the
-                        // session's inputs lands, and the store keeps them as
-                        // last committed, pending, for the new owner to run.
-                        // Every local waiter is told its input stays queued,
-                        // not that it ended, so no caller resubmits work the
-                        // new owner runs.
-                        if teardown_required
-                            && authority_binding.store_fence_lost()
-                            && let Some(completions) = completions
-                        {
+                        if store_fence_lost {
                             tracing::warn!(
                                 session_id = %authority_binding.session_id,
                                 %run_id,
                                 "another writer holds the session store's fence; the session's \
-                                 waiters are told their inputs stay queued for the new owner"
+                                 waiters are told their inputs stay queued for the new owner, and \
+                                 the session is torn down"
                             );
-                            completions.lock().await.fail_all_waiters(
-                                crate::completion::CompletionWaitError::RequeuedAcrossStop {
-                                    stopped_at: chrono::Utc::now(),
-                                },
-                            );
+                            answer_waiters_for_lost_store_fence(driver, completions).await;
                         }
                         let terminal_authority_guard = match authority_binding
                             .lock_current_driver_authority(driver, "runtime loop terminal failure")

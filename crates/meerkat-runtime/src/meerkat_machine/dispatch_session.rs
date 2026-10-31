@@ -1992,6 +1992,45 @@ impl MeerkatMachine {
         if let Some(capture) = stop.as_deref_mut() {
             capture.current_run_id = current_run_id.clone();
         }
+        // A run a store fence gap suspended is marked resumable with no run
+        // current, so there is no turn to interrupt: an interrupt or a stop
+        // of it records the run's stop intent instead (the machine refuses it
+        // while the registration drains for its unregister, whose next start
+        // resumes the run), and the runtime settles the run, its inputs
+        // abandoned as cancelled, once its store takes writes again. A stop's
+        // receipt then lists no contributor: the run ends only with that
+        // settlement.
+        let resumable = if current_run_id.is_none() {
+            let authority = authority
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::meerkat_machine::dsl_authority::resumable_run_id_from_authority(&authority)
+        } else {
+            None
+        };
+        if let Some(resumable) = resumable
+            && expected_run_id.is_none_or(|expected| expected == &resumable)
+            && Self::stage_dsl_transition_on_authority(
+                &authority,
+                crate::meerkat_machine::dsl::MeerkatMachineInput::StopCurrentRunForRun {
+                    run_id: crate::meerkat_machine::dsl::RunId::from_domain(&resumable),
+                },
+                "StopCurrentRunForRun",
+            )
+            .is_ok()
+        {
+            tracing::info!(
+                %session_id,
+                run_id = %resumable,
+                "a stop of the run a store fence gap suspended is recorded; the run is settled \
+                 once its store takes writes again"
+            );
+            if let Some(capture) = stop.as_deref_mut() {
+                capture.current_run_id = Some(resumable);
+                capture.staged = true;
+            }
+            return Ok(true);
+        }
         if let Some(expected_run_id) = expected_run_id {
             if !matches!(phase, RuntimeState::Running | RuntimeState::Retired)
                 || current_run_id.as_ref() != Some(expected_run_id)

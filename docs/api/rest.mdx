@@ -897,8 +897,8 @@ Event types:
 | Event | Description |
 |-------|-------------|
 | `session_loaded` | Emitted on connect with session metadata |
-| `run_started` | Agent execution began |
-| `run_resumed` | Since 0.9.5: a run continued after a restart from its last committed round, under its original run id; carries `run_id`, `round` and `resume_point` (`tools_pending` or `awaiting_model`). See [Durable runs](/guides/durable-runs#after-a-crash) |
+| `run_started` | Agent execution began. A repeated `run_started` for a run id that has no terminal yet means that run started over from its inputs (a durable run a store fence gap suspended before its first round commit, run again once the fence is back): drop what you received for that run id before |
+| `run_resumed` | Since 0.9.5: a run continued from its last committed round, under its original run id, after a restart or, in the same process, once a store fence gap that suspended it ended; carries `run_id`, `round` and `resume_point` (`tools_pending` or `awaiting_model`). See [Durable runs](/guides/durable-runs#after-a-crash) |
 | `run_completed` | Agent run finished |
 | `run_failed` | Agent run failed; `error_report` carries `class`, `message` and a typed `reason` (since 0.9.4 a `content_filtered` failure carries `{"reason_type": "content_filtered", "stop": ..., "detail": ...}` instead of `null`; see the [RPC event reference](/api/rpc#notifications)) |
 | `turn_started` | New LLM call within the turn; `assistant_message_id` names the assistant message it will commit |

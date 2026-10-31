@@ -419,6 +419,35 @@ impl super::driver::DriverEntry {
         .is_ok()
     }
 
+    /// Whether a stop was asked of the run marked resumable (the machine's
+    /// stop intent names it): a cancel the run accepted before a store fence
+    /// gap suspended it, or a stop or an interrupt of it while suspended.
+    /// Such a run never resumes; the runtime settles it.
+    pub(crate) fn resumable_run_stop_requested(&self) -> bool {
+        let authority = self.shared_dsl_authority();
+        let authority = authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = authority.state();
+        state.resumable_run_id.is_some() && state.run_stop_requested == state.resumable_run_id
+    }
+
+    /// The session's unfinished inputs its store keeps: every active input
+    /// but an ephemeral one, which no store holds (an input whose row does
+    /// not say counts as kept).
+    pub(crate) fn store_kept_input_ids(&self) -> Vec<meerkat_core::lifecycle::InputId> {
+        let driver = self.as_driver();
+        driver
+            .active_input_ids()
+            .into_iter()
+            .filter(|input_id| {
+                driver.stored_input_state(input_id).is_none_or(|stored| {
+                    stored.state.durability != Some(crate::input::InputDurability::Ephemeral)
+                })
+            })
+            .collect()
+    }
+
     /// Whether the registration is draining for an unregister: its runtime is
     /// stopping, whatever it keeps for the next start.
     pub(crate) fn registration_draining(&self) -> bool {

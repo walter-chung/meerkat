@@ -358,11 +358,14 @@ pub trait SelfFence: Send + Sync {
         self.window()
     }
 
-    /// Whether another writer is proven to hold the fence now: a live
-    /// holder, or a batch this writer did not write. Such a writer never
-    /// resumes, and the store refuses its writes. A closed window of a
-    /// writer that is not lost is a gap: no re-acquire has succeeded yet,
-    /// and nothing proves another owner. The default answers `false`.
+    /// Whether this writer's realm lost its fence for good: another writer
+    /// holds it (a live holder, a batch this writer did not write, or a renew
+    /// or commit answered `FencedOut`), or the realm stopped itself for
+    /// another reason it cannot recover from. Such a writer never resumes,
+    /// and the store refuses its writes; its window may still read open. A
+    /// closed window of a writer that is not lost is a gap: no re-acquire
+    /// has succeeded yet, and nothing proves another owner. The default
+    /// answers `false`.
     fn lost(&self) -> bool {
         false
     }

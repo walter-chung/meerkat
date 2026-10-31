@@ -942,14 +942,28 @@ included, uses this stop with a 15 minute max age for sessions that commit
 every round.
 
 A store fence gap answers the same. When a host store realm's writer stays
-stopped through a run's whole dispatch wait and no other process holds the
-fence, the runtime suspends the run with its inputs bound to it, and their
-waiters get `RequeuedAcrossStop` within that wait: the inputs run when the
-fence is re-acquired (the run resumes in the same process) or at the next
-start. When another process holds the fence, the store keeps the session's
-inputs as last committed for that owner, and every waiter in this process
-gets `RequeuedAcrossStop` too (see
+stopped through a run's whole dispatch wait, or through the wait of a round
+commit that met the stopped writer, and no other process holds the fence,
+the runtime suspends the run with its inputs bound to it, and their waiters
+get `RequeuedAcrossStop` within that wait: the inputs run when the fence is
+re-acquired (the run resumes in the same process) or at the next start (an
+ephemeral input only in the same process). A run whose stop was asked, a
+cancel it accepted before the gap or an interrupt or stop of the suspended
+run, never resumes: once the fence is back the runtime settles it, its
+inputs abandoned as `Cancelled`, and its waiters get that answer instead.
+When another process holds the fence, however this process meets it (at a
+dispatch, at a commit or while a suspended run waits), the live session is
+torn down, the store keeps the session's inputs as last committed for that
+owner, and every waiter in this process of an input the store keeps gets
+`RequeuedAcrossStop` too (see
 [Durable runs](/guides/durable-runs#one-writer-fenced)).
+
+A run the gap suspended before its first round commit starts again from its
+inputs under the same run id, and publishes `run_started` again with no
+terminal in between. An observer reads a repeated `run_started` for a run
+id that has no terminal yet as that run starting over, and drops what it
+received for the run id before; a run that resumes from a round commit
+publishes `run_resumed` instead.
 
 - The generated wait-failure resolver classes such a wait: session not
   running, reason `requeued_across_stop`, resumable, and the surface's

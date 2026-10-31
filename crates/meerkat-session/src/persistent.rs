@@ -1121,6 +1121,59 @@ struct StoreCheckpointer {
     run_suspension: std::sync::OnceLock<crate::ephemeral::RunSuspensionHandle>,
 }
 
+/// What a refused round commit met at the session store's fence.
+enum CommitFenceGap {
+    /// No fence gap: the writer was not stopped, or another writer holds the
+    /// fence. The refusal stands.
+    NoGap,
+    /// The writer's re-acquire restored it: the commit is written again,
+    /// once.
+    Restored,
+    /// The writer stayed stopped through the whole wait, and no other writer
+    /// was found (a store fence gap).
+    Closed(meerkat_core::host_store::SelfFenceWindow),
+}
+
+/// Whether a round commit refused while `fence`'s writer may have been
+/// stopped met a store fence gap, waiting for the writer's re-acquire as a
+/// dispatch does ([`meerkat_core::host_store::SelfFence::dispatch_window`]).
+/// `open_before` is whether the writer's window was open when the commit
+/// began: a writer that was not stopped then, and is not now, refused for
+/// another reason.
+async fn commit_fence_gap(
+    fence: &dyn meerkat_core::host_store::SelfFence,
+    open_before: bool,
+) -> CommitFenceGap {
+    if fence.lost() {
+        return CommitFenceGap::NoGap;
+    }
+    if fence.window().is_open() {
+        return if open_before {
+            CommitFenceGap::NoGap
+        } else {
+            CommitFenceGap::Restored
+        };
+    }
+    let window = fence.dispatch_window().await;
+    if window.is_open() {
+        CommitFenceGap::Restored
+    } else if fence.lost() {
+        CommitFenceGap::NoGap
+    } else {
+        CommitFenceGap::Closed(window)
+    }
+}
+
+/// Whether `session`'s checkpoint for `run_id` is a round commit: the run's
+/// cursor is on the session (a closing save clears it first).
+fn round_commit_of(session: &Session, run_id: &RunId) -> bool {
+    session
+        .try_run_cursor()
+        .ok()
+        .flatten()
+        .is_some_and(|cursor| cursor.run_id == *run_id)
+}
+
 /// Clears the run the runtime dispatched to a store checkpointer's actor once
 /// the service's apply of that run ends ([`StoreCheckpointer::enter_runtime_run`]).
 struct RuntimeRunGuard {
@@ -3036,7 +3089,199 @@ impl meerkat_core::SessionCheckpointer for StoreCheckpointer {
         }
     }
 
+    /// A round commit refused while the store's writer was stopped meets the
+    /// gap as a dispatch does
+    /// ([`meerkat_core::SessionCheckpointer::dispatch_fence_ready`]). When
+    /// the refusal could be the gap's (the writer was stopped before the
+    /// commit, or is now, and no other writer is proven), the commit waits,
+    /// bounded, for the writer's re-acquire and is written again, once, when
+    /// that restored the writer. When the writer stays stopped through the
+    /// whole wait, the runtime's run on this actor is suspended there, as at
+    /// a dispatch: nothing of the round was written, so the run resumes from
+    /// its last round commit and does the round again, as after a crash. A
+    /// refusal of the teardown class, a closing save's (the run's cursor is
+    /// gone by then), and one of a run the runtime did not dispatch here,
+    /// stand as before.
     async fn checkpoint_run(
+        &self,
+        session: &mut Session,
+        run_id: &RunId,
+        previous: Option<&RunCheckpointReceipt>,
+    ) -> Result<Option<RunCheckpointReceipt>, AgentError> {
+        let fence = self.runtime_store.self_fence();
+        let open_before = fence.as_ref().is_none_or(|fence| fence.window().is_open());
+        let error = match self.checkpoint_run_once(session, run_id, previous).await {
+            Err(error) => error,
+            written => return written,
+        };
+        let Some(fence) = fence else {
+            return Err(error);
+        };
+        if error.requires_session_teardown() || !round_commit_of(session, run_id) {
+            return Err(error);
+        }
+        match commit_fence_gap(fence.as_ref(), open_before).await {
+            CommitFenceGap::NoGap => Err(error),
+            CommitFenceGap::Restored => {
+                tracing::info!(
+                    %run_id,
+                    %error,
+                    "a round commit refused while the session store's writer was stopped is \
+                     written again: the writer's fence is back"
+                );
+                self.checkpoint_run_once(session, run_id, previous).await
+            }
+            CommitFenceGap::Closed(window) => {
+                if self.suspend_runtime_run(run_id) {
+                    tracing::warn!(
+                        %run_id,
+                        %error,
+                        elapsed = ?window.elapsed,
+                        window = ?window.window,
+                        "a round commit met a store fence gap: the session store's writer stayed \
+                         stopped through the commit's wait and no other writer was found; the run \
+                         is suspended and resumes from its last round commit once the fence is \
+                         back"
+                    );
+                    return std::future::pending().await;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn note_run_transcript_retirement(&self, run_id: &RunId, retired_occurrences: u64) {
+        if let Ok(mut slot) = self.latest_run_transcript_retirement.lock() {
+            *slot = Some((run_id.clone(), retired_occurrences));
+        }
+    }
+
+    fn rebases_runs(&self) -> bool {
+        self.runtime_store.session_persistence_profile()
+            == RuntimeSessionPersistenceProfile::WholeBlobV1
+            && self.runtime_store.supports_whole_blob_run_rebase()
+    }
+
+    async fn rebase_run(
+        &self,
+        session: &mut Session,
+        run_id: &RunId,
+        previous: Option<&RunCheckpointReceipt>,
+    ) -> Result<RunCheckpointReceipt, AgentError> {
+        let guard = self.gate.cancelled.lock().await;
+        if *guard {
+            return Err(AgentError::session_durable_projection_authority_unknown(
+                format!(
+                    "checkpoint gate is cancelled for session {}; the run re-base was not attempted; live actor reload required",
+                    session.id()
+                ),
+            ));
+        }
+        if !self.rebases_runs() {
+            return Err(AgentError::InternalError(format!(
+                "the runtime store of session {} does not re-base runs: a run re-base is a WholeBlob operation of a store that supports it",
+                session.id()
+            )));
+        }
+        self.clear_rebased_run_unless(Some(run_id));
+        let result = self.rebase_whole_blob_run(session, run_id, previous).await;
+        if let Ok(receipt) = result.as_ref() {
+            *self.latest_run_checkpoint_receipt.lock().await = Some(receipt.clone());
+            self.record_held_checkpoint_cursor(Some((
+                run_id.clone(),
+                HeldCheckpointCursor::of(session),
+            )));
+            if let Ok(mut slot) = self.latest_run_transcript_retirement.lock() {
+                *slot = None;
+            }
+        }
+        drop(guard);
+        result
+    }
+
+    /// The host store's self-fence: over a runtime store whose writer holds a
+    /// fence lease ([`RuntimeStore::self_fence`]), the run makes no model
+    /// call and dispatches nothing once the writer's window has closed, since
+    /// another process may already own the session. The window is read
+    /// afresh on every call. A store without a lease always allows. A clock
+    /// read and an atomic load: no I/O, and it never waits.
+    fn dispatch_fence_check(&self) -> Result<(), AgentError> {
+        let Some(fence) = self.runtime_store.self_fence() else {
+            return Ok(());
+        };
+        let window = fence.window();
+        // A realm that lost its fence never dispatches again, even while
+        // this writer's own window still reads open.
+        if fence.lost() {
+            return Err(self.lost_fence_refusal(window));
+        }
+        if window.is_open() {
+            return Ok(());
+        }
+        Err(self.dispatch_fence_refusal(window))
+    }
+
+    /// [`Self::dispatch_fence_check`] for a dispatch that may wait: an open
+    /// window allows at once, with no I/O. A writer that stopped (its renew
+    /// failed or timed out, or its window closed) waits, bounded, for the
+    /// re-acquire its next write would make
+    /// ([`meerkat_core::host_store::SelfFence::dispatch_window`]), and goes
+    /// on when that resumed it. A realm that lost its fence refuses at once,
+    /// with the teardown class, even while this writer's own window still
+    /// reads open (a renew fenced out by another writer poisons the realm
+    /// without closing the window). When the window stays closed:
+    ///
+    /// - the realm lost its fence ([`meerkat_core::host_store::SelfFence::lost`]):
+    ///   it refuses as the check does, with the teardown class;
+    /// - otherwise (a store fence gap), the runtime's run on this actor
+    ///   (`suspendable_run`, the run the runtime dispatched here) is
+    ///   suspended: this asks the session task to drop the run at this wait
+    ///   and never answers, so the run ends suspended at its last round
+    ///   commit, its inputs stay bound to it, and the runtime resumes it once
+    ///   the fence is back;
+    /// - a store fence gap of any other dispatch (a direct turn, or a run
+    ///   the agent cannot suspend) is refused with a retryable store error:
+    ///   nothing proves another owner, so the live session is not torn down.
+    async fn dispatch_fence_ready(
+        &self,
+        suspendable_run: Option<&RunId>,
+    ) -> Result<(), AgentError> {
+        let Some(fence) = self.runtime_store.self_fence() else {
+            return Ok(());
+        };
+        if fence.lost() {
+            return Err(self.lost_fence_refusal(fence.window()));
+        }
+        if fence.window().is_open() {
+            return Ok(());
+        }
+        let window = fence.dispatch_window().await;
+        if window.is_open() {
+            return Ok(());
+        }
+        if fence.lost() {
+            return Err(self.dispatch_fence_refusal(window));
+        }
+        if let Some(run_id) = suspendable_run
+            && self.suspend_runtime_run(run_id)
+        {
+            tracing::warn!(
+                %run_id,
+                elapsed = ?window.elapsed,
+                window = ?window.window,
+                "the session store's writer stayed stopped through the run's dispatch wait and no \
+                 other writer was found; the run is suspended and resumes once the fence is back"
+            );
+            return std::future::pending().await;
+        }
+        Err(self.fence_gap_refusal(window))
+    }
+}
+
+impl StoreCheckpointer {
+    /// One attempt at a round commit or a closing save, as
+    /// [`meerkat_core::SessionCheckpointer::checkpoint_run`] writes it.
+    async fn checkpoint_run_once(
         &self,
         session: &mut Session,
         run_id: &RunId,
@@ -3105,124 +3350,6 @@ impl meerkat_core::SessionCheckpointer for StoreCheckpointer {
         result
     }
 
-    fn note_run_transcript_retirement(&self, run_id: &RunId, retired_occurrences: u64) {
-        if let Ok(mut slot) = self.latest_run_transcript_retirement.lock() {
-            *slot = Some((run_id.clone(), retired_occurrences));
-        }
-    }
-
-    fn rebases_runs(&self) -> bool {
-        self.runtime_store.session_persistence_profile()
-            == RuntimeSessionPersistenceProfile::WholeBlobV1
-            && self.runtime_store.supports_whole_blob_run_rebase()
-    }
-
-    async fn rebase_run(
-        &self,
-        session: &mut Session,
-        run_id: &RunId,
-        previous: Option<&RunCheckpointReceipt>,
-    ) -> Result<RunCheckpointReceipt, AgentError> {
-        let guard = self.gate.cancelled.lock().await;
-        if *guard {
-            return Err(AgentError::session_durable_projection_authority_unknown(
-                format!(
-                    "checkpoint gate is cancelled for session {}; the run re-base was not attempted; live actor reload required",
-                    session.id()
-                ),
-            ));
-        }
-        if !self.rebases_runs() {
-            return Err(AgentError::InternalError(format!(
-                "the runtime store of session {} does not re-base runs: a run re-base is a WholeBlob operation of a store that supports it",
-                session.id()
-            )));
-        }
-        self.clear_rebased_run_unless(Some(run_id));
-        let result = self.rebase_whole_blob_run(session, run_id, previous).await;
-        if let Ok(receipt) = result.as_ref() {
-            *self.latest_run_checkpoint_receipt.lock().await = Some(receipt.clone());
-            self.record_held_checkpoint_cursor(Some((
-                run_id.clone(),
-                HeldCheckpointCursor::of(session),
-            )));
-            if let Ok(mut slot) = self.latest_run_transcript_retirement.lock() {
-                *slot = None;
-            }
-        }
-        drop(guard);
-        result
-    }
-
-    /// The host store's self-fence: over a runtime store whose writer holds a
-    /// fence lease ([`RuntimeStore::self_fence`]), the run makes no model
-    /// call and dispatches nothing once the writer's window has closed, since
-    /// another process may already own the session. The window is read
-    /// afresh on every call. A store without a lease always allows. A clock
-    /// read and an atomic load: no I/O, and it never waits.
-    fn dispatch_fence_check(&self) -> Result<(), AgentError> {
-        let Some(fence) = self.runtime_store.self_fence() else {
-            return Ok(());
-        };
-        let window = fence.window();
-        if window.is_open() {
-            return Ok(());
-        }
-        Err(self.dispatch_fence_refusal(window))
-    }
-
-    /// [`Self::dispatch_fence_check`] for a dispatch that may wait: an open
-    /// window allows at once, with no I/O. A writer that stopped (its renew
-    /// failed or timed out, or its window closed) waits, bounded, for the
-    /// re-acquire its next write would make
-    /// ([`meerkat_core::host_store::SelfFence::dispatch_window`]), and goes
-    /// on when that resumed it. When the window stays closed:
-    ///
-    /// - another writer is proven ([`meerkat_core::host_store::SelfFence::lost`]):
-    ///   it refuses as the check does, with the teardown class;
-    /// - otherwise (a store fence gap), the runtime's run on this actor
-    ///   (`suspendable_run`, the run the runtime dispatched here) is
-    ///   suspended: this asks the session task to drop the run at this wait
-    ///   and never answers, so the run ends suspended at its last round
-    ///   commit, its inputs stay bound to it, and the runtime resumes it once
-    ///   the fence is back;
-    /// - a store fence gap of any other dispatch (a direct turn, or a run
-    ///   the agent cannot suspend) is refused with a retryable store error:
-    ///   nothing proves another owner, so the live session is not torn down.
-    async fn dispatch_fence_ready(
-        &self,
-        suspendable_run: Option<&RunId>,
-    ) -> Result<(), AgentError> {
-        let Some(fence) = self.runtime_store.self_fence() else {
-            return Ok(());
-        };
-        if fence.window().is_open() {
-            return Ok(());
-        }
-        let window = fence.dispatch_window().await;
-        if window.is_open() {
-            return Ok(());
-        }
-        if fence.lost() {
-            return Err(self.dispatch_fence_refusal(window));
-        }
-        if let Some(run_id) = suspendable_run
-            && self.suspend_runtime_run(run_id)
-        {
-            tracing::warn!(
-                %run_id,
-                elapsed = ?window.elapsed,
-                window = ?window.window,
-                "the session store's writer stayed stopped through the run's dispatch wait and no \
-                 other writer was found; the run is suspended and resumes once the fence is back"
-            );
-            return std::future::pending().await;
-        }
-        Err(self.fence_gap_refusal(window))
-    }
-}
-
-impl StoreCheckpointer {
     /// Ask the session task to suspend `run_id` for a store fence gap, when
     /// it is the run the runtime dispatched to this actor and the actor's
     /// suspension handle is attached; whether the suspension was asked.
@@ -3279,6 +3406,25 @@ impl StoreCheckpointer {
             window.elapsed,
             window.window,
             window.renew_failed
+        ))
+    }
+
+    /// The teardown-class refusal of a dispatch whose realm lost its fence
+    /// (another writer holds it, so this writer never writes again, and the
+    /// store keeps the session's inputs as last committed for that owner),
+    /// read before any wait: a closed `window` refuses as
+    /// [`Self::dispatch_fence_refusal`] does, and an open one (a renew
+    /// fenced out by another writer poisons the realm without closing the
+    /// window) names the lost fence.
+    fn lost_fence_refusal(&self, window: meerkat_core::host_store::SelfFenceWindow) -> AgentError {
+        if !window.is_open() {
+            return self.dispatch_fence_refusal(window);
+        }
+        AgentError::session_durable_projection_authority_unknown(format!(
+            "{}: the session store's realm lost its fence to another writer, while this writer's \
+             self-fence window still reads open; nothing more is dispatched, and the store keeps \
+             the session's inputs as last committed for the new owner; live actor reload required",
+            self.session_label()
         ))
     }
 
@@ -15438,6 +15584,24 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         self.live_authority_advanced.notify_waiters();
     }
 
+    /// Begin a runtime turn of `run_id` on `id`'s live image, on either
+    /// apply path (with a reserved admission or without): the turn owns the
+    /// live image from here, since its boundary commit may be coming again;
+    /// the live actor forgets any other run's provisional receipt; and the
+    /// run is marked as the run the runtime dispatched to that actor until
+    /// the returned guard drops, so a store fence gap the run meets suspends
+    /// it for the runtime to resume instead of failing it.
+    async fn begin_runtime_turn_on_live_image(
+        &self,
+        id: &SessionId,
+        run_id: &RunId,
+    ) -> Option<RuntimeRunGuard> {
+        self.clear_live_uncommitted_terminal(id);
+        self.forget_other_runs_checkpoint_receipt(id, Some(run_id))
+            .await;
+        self.mark_runtime_run(id, run_id).await
+    }
+
     /// Mark `run_id` as the run the runtime dispatched to `id`'s live actor,
     /// until the returned guard drops: a store fence gap the run meets on
     /// that actor's checkpointer then suspends it
@@ -15512,14 +15676,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 .await
                 .map_err(|error| (error, None))?;
         }
-        // A new runtime turn owns the live image from here; its boundary
-        // commit may be coming again.
-        self.clear_live_uncommitted_terminal(id);
-        self.forget_other_runs_checkpoint_receipt(id, Some(&run_id))
-            .await;
-        // While the run is applied, a store fence gap it meets suspends it
-        // for the runtime to resume, instead of failing it.
-        let _runtime_run = self.mark_runtime_run(id, &run_id).await;
+        let _runtime_run = self.begin_runtime_turn_on_live_image(id, &run_id).await;
         let execution = self
             .inner
             .start_runtime_turn_execution_with_admission_recovering_not_found(
@@ -15712,11 +15869,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 .discard_stale_live_session_if_needed(id, LiveStalenessPosition::TurnBoundaryHeld)
                 .await?;
         }
-        // A new runtime turn owns the live image from here; its boundary
-        // commit may be coming again.
-        self.clear_live_uncommitted_terminal(id);
-        self.forget_other_runs_checkpoint_receipt(id, Some(&run_id))
-            .await;
+        let _runtime_run = self.begin_runtime_turn_on_live_image(id, &run_id).await;
         let execution = match admission {
             Some(admission) => self
                 .inner

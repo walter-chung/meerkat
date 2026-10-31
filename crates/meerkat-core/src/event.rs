@@ -2460,7 +2460,14 @@ impl StructuredOutputOrigin {
 #[non_exhaustive]
 pub enum AgentEvent {
     // === Session Lifecycle ===
-    /// Agent run started
+    /// Agent run started.
+    ///
+    /// A durable run that a store fence gap suspended before its first round
+    /// commit starts again from its inputs, under the same run id, once the
+    /// fence is back, and publishes `run_started` again with no terminal in
+    /// between. An observer reads a repeated `run_started` for a run id that
+    /// has no terminal yet as that run starting over, and drops what it
+    /// received for the run id before.
     RunStarted {
         session_id: SessionId,
         /// Runtime-owned transcript lineage. Older events may omit it; an
@@ -3138,8 +3145,9 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         outcome: Option<crate::lifecycle::run_primitive::ReasoningLoweringOutcome>,
     },
-    /// A durable run resumed from its run cursor after a restart, in place of
-    /// `run_started`: the same run continues under its run id, and its
+    /// A durable run resumed from its run cursor, in place of `run_started`:
+    /// after a restart, or in the same process once a store fence gap that
+    /// suspended it ended. The same run continues under its run id, and its
     /// terminal follows as for any run.
     ///
     /// At `tools_pending` the run takes the round's staged assistant message

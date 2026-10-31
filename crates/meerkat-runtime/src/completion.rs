@@ -87,11 +87,15 @@ pub enum CompletionWaitError {
     ///   The next start runs it, or ends it as abandoned with reason
     ///   `requeue_expired` when it is older than the stop's max age by then.
     /// - A store fence gap: the session store's writer stayed stopped through
-    ///   the dispatch wait of the run the input is bound to, and the run was
-    ///   suspended with the input still bound to it; or another writer took
-    ///   the session over, and the store keeps the input for that owner. The
+    ///   a dispatch wait or a round commit of the run the input is bound to,
+    ///   and the run was suspended with the input still bound to it. The
     ///   input runs when the fence is re-acquired (the run resumes) or at the
-    ///   next start.
+    ///   next start; an ephemeral input, which no store keeps, runs only in
+    ///   this process, once the fence is re-acquired.
+    /// - Another writer took the session over (its store refuses this
+    ///   process's writes): the store keeps the input as last committed, and
+    ///   the new owner resumes or repairs its run and runs it. This process
+    ///   runs nothing more of the session.
     ///
     /// Do not resubmit it; read it later.
     #[error(

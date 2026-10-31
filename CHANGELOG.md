@@ -41,11 +41,14 @@ them.
   `MeerkatMachineInput::SuspendRunForStop` gains `cause`, of the new enum
   `RunSuspensionCause` (`RequeueStop`, `FenceGap`), with the `meerkat_machine::dsl`
   re-export and the kernel type, and the generated transition enums gain
-  `SuspendRunForStopFenceGapRunningToIdle` and
-  `SuspendRunForStopFenceGapRunningToAttached`, appended last. Pass
+  `SuspendRunForStopFenceGapRunningToIdle`,
+  `SuspendRunForStopFenceGapRunningToAttached`,
+  `StopCurrentRunForRunResumableIdle` and
+  `StopCurrentRunForRunResumableAttached`, appended last. Pass
   `RunSuspensionCause::RequeueStop` where you build the input (the 0.9.8
   behaviour), and add the arms (or a wildcard) where you match the enums
-  exhaustively.
+  exhaustively. `ResumeRun` (and the resumed-run plan) now refuses a run
+  whose stop was asked.
 
 - Behaviour-only (not measured by the gate): a host store meets obligation
   5 (fencing) at commit: it refuses a batch whose token is below one
@@ -407,22 +410,32 @@ them.
     (its two acquires and its renew): 35 s at the default fence timing and
     realm configuration. The turn goes on once the re-acquire resumed the
     writer;
+  - a round commit refused while the writer is stopped waits for the same
+    re-acquire and is written again, once, when it succeeded;
   - when no re-acquire succeeds within that wait and no other writer is
-    found (a store fence gap), the runtime suspends the run through the
-    machine (`SuspendRunForStop` with `RunSuspensionCause::FenceGap`): the
-    run stops at the wait, its inputs stay bound to it without spending a
-    stage attempt, and their waiters are answered `RequeuedAcrossStop`
-    within that wait. Once the fence is back the runtime resumes the run
-    from its last round commit, or starts it again from its inputs when it
-    had not committed a round. The gap may last any number of waits, so a
-    store outage no longer ends inputs as `MaxAttemptsExhausted` either. A
-    direct turn, which no runtime run backs, fails with a retryable
-    `StoreError` instead of the teardown class;
-  - only another writer (a live holder, or a batch this writer did not
-    write, which poisons the realm) still refuses with the teardown class.
-    The store refuses every later write of this process, so the session's
-    inputs stay pending for the new owner, and every waiter in this process
-    is answered `RequeuedAcrossStop` instead of an abandon.
+    found (a store fence gap), at a dispatch or at a round commit, the
+    runtime suspends the run through the machine (`SuspendRunForStop` with
+    `RunSuspensionCause::FenceGap`): the run stops at the wait, its inputs
+    stay bound to it without spending a stage attempt, and their waiters
+    are answered `RequeuedAcrossStop` within that wait. Once the fence is
+    back the runtime resumes the run from its last round commit, or starts
+    it again from its inputs when it had not committed a round. The gap may
+    last any number of waits, so a store outage no longer ends inputs as
+    `MaxAttemptsExhausted` either. This holds on every runtime apply path:
+    the facade's default executor, mob members, the CLI, REST, the MCP
+    server and JSON-RPC. A direct turn, which no runtime run backs, fails
+    with a retryable `StoreError` instead of the teardown class;
+  - a cancel the run accepted before the gap, and an interrupt or a stop of
+    the suspended run, end the run: it never resumes, and once the fence is
+    back it is settled, its inputs abandoned as `Cancelled`;
+  - only another writer (a live holder, a batch this writer did not write,
+    or a renew or commit answered `FencedOut`, each of which poisons the
+    realm) still ends the session, with the teardown class, wherever this
+    process meets it first: at a dispatch, at a commit, or while a
+    suspended run waits to resume. The store refuses every later write of
+    this process, so the session's inputs stay pending for the new owner,
+    and every waiter in this process of an input the store keeps is
+    answered `RequeuedAcrossStop` instead of an abandon.
 
   `SelfFence` gains the provided `dispatch_window` and `lost`, and
   `SessionCheckpointer` the provided `dispatch_fence_ready`, whose defaults
@@ -575,13 +588,22 @@ them.
   resumes from its last round commit, as after a restart: what it did after
   that commit is done again (an uncommitted model response is asked for
   again, and the calls of an unfinished round are dispatched again with
-  their dedupe keys), and the asynchronous operations a resumed round waited
-  for are reported to the model as lost. A run suspended before its first
-  round commit starts again from its inputs: its run-start hooks run again,
-  and `RunStarted` is published again for the same run. A mob delegation
-  (a temporary council, a fork-off, a live delegation) whose member turn a
-  fence gap suspends reads the `RequeuedAcrossStop` answer as a stop's: the
-  delegation ends, and the member's input still runs once the fence is back.
+  their dedupe keys, possibly while a tool's own work from the first call
+  still runs), and the asynchronous operations a resumed round waited for
+  are reported to the model as lost. A run suspended before its first round
+  commit starts again from its inputs: its run-start hooks run again, and
+  `run_started` is published again for the same run id with no terminal in
+  between; an observer reads that as the run starting over and drops what
+  it received for the run id before (documented on `AgentEvent::RunStarted`).
+  A mob delegation (a temporary council, a fork-off, a live delegation)
+  whose member turn a fence gap suspends reads the `RequeuedAcrossStop`
+  answer as a stop's: the delegation ends, and the member's input still
+  runs once the fence is back. A stop asked of a suspended run is kept in
+  memory until the fence is back (a process that ends first loses it, and
+  the next start resumes the run); a cancel at the next boundary asked
+  while the run is suspended is refused (interrupt or stop the run
+  instead). A gap met while a run re-bases its session is not suspended:
+  the re-base's outcome is unknown, and the session reloads as before.
 
 - `meerkat-core`: a tool call that waits at the fence of a stopped host
   store writer waits within its own deadline, as it waits for its
