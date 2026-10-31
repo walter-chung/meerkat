@@ -80,7 +80,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+// The lease clock shares tokio's clock with the renew and timeout timers.
+use tokio::time::Instant;
 
 use meerkat_core::host_store::{
     AcquireMode, CommitBatch, CommitId, FenceTiming, FenceToken, HostStore, HostStoreError,
