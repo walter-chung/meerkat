@@ -7655,9 +7655,11 @@ async fn settle_unresumed_run(
     // The settlement writes, so it needs the session store's fence: when
     // the fence reads closed (it closed again since the lap read it open, or
     // a controller re-ask settles a refused run during a gap), nothing is
-    // changed and the caller waits for the fence before it goes round again
-    // (`wait_out_store_fence_gap`, with no guard held), so the settlement
-    // never meets the gap and the loop never spins through it.
+    // changed, and a fence wait (`wait_out_store_fence_gap`, with no guard
+    // held) comes before the next settlement: the controller re-ask waits
+    // before it goes round, and after the resumable block the next lap waits
+    // at the block's own fence check. So the settlement never meets the gap
+    // and the loop never spins through it.
     if authority_binding.store_fence_gap() {
         return ResumedRunAdmissionLap::Again;
     }

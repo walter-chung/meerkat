@@ -49,8 +49,10 @@ them.
   behaviour), and add the arms (or a wildcard) where you match the enums
   exhaustively. `ResumeRun` (and the resumed-run plan) now refuses a run
   whose stop was asked, `SettleResumableRun` refuses to settle such a run
-  as `ResumeRefused`, and `ClassifyStopInputDisposition` keeps none of its
-  inputs, under `Requeue` or under `Keep` (they are answered `Abandon`).
+  as `ResumeRefused`, and `ClassifyStopInputDisposition` keeps none of the
+  inputs bound to it (Staged, Applied or AppliedPendingConsumption), under
+  `Requeue` or under `Keep` (they are answered `Abandon`); a queued input
+  that only still names the run is answered as any other input.
 
 - Behaviour-only (not measured by the gate): a host store meets obligation
   5 (fencing) at commit: it refuses a batch whose token is below one
@@ -443,7 +445,9 @@ them.
     `Cancelled`. An interrupt or a stop of a run marked resumable ends it
     the same way: a gap's suspended run (its waiters were answered at the
     suspension) is settled once the fence is back, and a restart's run that
-    has not resumed yet at its loop's next lap (the stop wakes the loop).
+    has not resumed yet at its loop's next lap (the stop wakes the loop), or
+    at its attachment when the start settles it there (its stop's max age
+    passed, or its first input's controller cannot be supplied again).
     For such a run `stop_run`, `turn/stop_run` and `mob/stop_member_run`
     return at once, `stopped` with no contributors (read the inputs'
     outcome later), and the runtime's `hard_cancel_current_run` (a

@@ -5292,7 +5292,8 @@ impl EphemeralRuntimeDriver {
     /// yet, which stays Staged or Applied and bound to its run) keeps its
     /// phase and payload and is durably marked with the stop's time and max
     /// age. An input it keeps (the rollback of a materialization that never
-    /// served keeps every input its registration recovered) stays exactly
+    /// served keeps every input its registration recovered, but the inputs
+    /// bound to a run marked resumable whose stop was asked) stays exactly
     /// as the store holds it, with no mark. Every other input ends as
     /// stopped. Returns the retained and kept inputs.
     ///

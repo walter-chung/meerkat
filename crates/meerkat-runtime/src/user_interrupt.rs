@@ -281,10 +281,12 @@ impl MeerkatMachine {
     /// restart's run, once the store takes writes again for a gap's): read
     /// their outcome later. A process that ends first, or another writer
     /// that takes the session over, runs them instead. A graceful requeue
-    /// stop that begins before that settlement ends them `Abandoned` with
-    /// reason `Stopped`, and leaves the run itself to the next start, which
-    /// repairs its tail as an interrupted run; no run terminal is published
-    /// for it. A stop that races the gap's own suspension of the run may fail
+    /// stop, or the Keep rollback of a start refused before it served
+    /// ([`crate::UnregisterQueuedInputs::Keep`]), that begins before that
+    /// settlement ends them `Abandoned` with reason `Stopped`, and leaves the
+    /// run itself to the next start, which repairs its tail as an interrupted
+    /// run; no run terminal is published for it. A stop that races the gap's
+    /// own suspension of the run may fail
     /// with an internal error naming a contributor whose wait was answered
     /// `RequeuedAcrossStop`.
     ///

@@ -173,12 +173,15 @@ process killed during it leaves the run as a crash would.
 A host that boots over a store another host serves, holds its members' run
 starts and must hand the store back unchanged shuts down with
 `with_queued_inputs(QueuedInputsOnShutdown::Keep)`, which unregisters each
-member with `UnregisterQueuedInputs::Keep` and changes nothing it finds: a
-registration that served no live work keeps every input it recovered and
+member with `UnregisterQueuedInputs::Keep` and keeps what it finds as it is:
+a registration that served no live work keeps every input it recovered and
 the run its session left open as the Shutdown finds them, with no requeue
 mark, and one that served live work is stopped (see [Mobs](/guides/mobs)).
-The boot's ordinary recovery may still normalize a staged input whose run
-cannot continue to queued, as every start does.
+The exception is a run left open whose stop was asked after the start
+registered it: the inputs bound to it end `Abandoned` with reason `Stopped`,
+and no later start resumes it. The boot's ordinary recovery may still
+normalize a staged input whose run cannot continue to queued, as every start
+does.
 
 - **The stop does not wait for the round.** It stops the turn at once. The
   run continues from its last committed round, and the work since that
@@ -195,8 +198,9 @@ cannot continue to queued, as every start does.
   Meerkat does not look for such runs at start-up.
 - **The max age still applies.** If any input bound to the run is older
   than `max_age`, counted from its admission, when the next start finds it,
-  the run's inputs end as `requeue_expired` and the run does not continue:
-  it is closed as interrupted, with the rounds it committed kept.
+  the run's inputs end as `requeue_expired` (as `cancelled` when the run's
+  stop was asked after that start registered it) and the run does not
+  continue: it is closed as interrupted, with the rounds it committed kept.
   An explicit `max_age` lies between 1 millisecond and 24 hours; the default
   shutdowns above use 15 minutes (`UnregisterQueuedInputs::DEFAULT_MAX_AGE`,
   and `RequeueMaxAge::DEFAULT` for a mob Shutdown).

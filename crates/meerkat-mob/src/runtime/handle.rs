@@ -16598,8 +16598,8 @@ impl MobHandle {
     /// [`QueuedInputsOnShutdown::Stop`](super::QueuedInputsOnShutdown::Stop)
     /// ends them as stopped for every member, as before 0.9.5;
     /// [`QueuedInputsOnShutdown::Keep`](super::QueuedInputsOnShutdown::Keep)
-    /// changes nothing of the members' work it finds, for a host that served
-    /// its members nothing.
+    /// keeps the members' work it finds as it is, but a member run whose stop
+    /// was asked, for a host that served its members nothing.
     pub async fn shutdown_with_report(
         &self,
         options: super::ShutdownOptions,
