@@ -1,7 +1,10 @@
 //! A host store writer whose self-fence window closes dispatches nothing more:
 //! a real native agent runs over the store checkpointer of a host store realm,
-//! and the window closes while one of its round commits lands. Unrun until the
-//! candidate's validation.
+//! and the window closes while one of its round commits lands. A writer that
+//! one timed-out renew stopped waits for its re-acquire instead: the turn goes
+//! on once the re-acquire succeeds, and is refused as before when the
+//! re-acquire fails, finds another writer's batch, or does not finish within
+//! the self-fence window. Unrun until the candidate's validation.
 
 use super::*;
 use futures::stream;
@@ -17,20 +20,43 @@ use meerkat_core::{
     ToolError, ToolResult,
 };
 use meerkat_runtime::MeerkatMachine;
+use meerkat_runtime::identifiers::LogicalRuntimeId;
+use meerkat_runtime::input_state::InputLifecycleState;
 use meerkat_runtime::store::spi::{SpiRealm, SpiRealmConfig, SpiRuntimeStore};
+use meerkat_runtime::store::{InputStateRow, RuntimeStore};
 use meerkat_session::PersistentSessionService;
 use meerkat_store::{MemoryBlobStore, MemoryStore};
 use serde_json::json;
 use std::collections::{BTreeMap, HashSet};
 use std::pin::Pin;
-use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex as StdMutex, OnceLock, Weak};
 use std::time::Duration;
 use tempfile::TempDir;
 
 const DEADLINE: Duration = Duration::from_secs(10);
 
-/// Which round commit the writer's window closes during.
+/// A turn's deadline under paused time: a row whose re-acquire lists for
+/// 30 s waits that long for the run's cleanup writes, at no wall clock cost.
+const PAUSED_DEADLINE: Duration = Duration::from_secs(600);
+
+/// How long a row waits for the writer to stop.
+const STOP_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The host's renew interval on its 3 s lease leaves a self-fence window of
+/// 2 s; the realm holds a renew to the interval (1 s).
+const RENEW_INTERVAL: Duration = Duration::from_secs(1);
+
+/// A re-acquire listing that answers within the 2 s window.
+const LISTING_WITHIN_THE_WINDOW: Duration = Duration::from_millis(1500);
+
+/// A re-acquire listing that answers long after the 2 s window.
+const LISTING_PAST_THE_WINDOW: Duration = Duration::from_secs(30);
+
+/// The scope another writer's batch creates in the foreign-batch row.
+const FOREIGN_SCOPE: &str = "rt:another-writer";
+
+/// Which step of the turn the writer stops during.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClosesDuring {
     /// The round's first commit: the window is closed before any call of
@@ -39,26 +65,101 @@ enum ClosesDuring {
     /// The round's second commit: the window is closed before the next
     /// model call.
     SecondCommit,
+    /// The first of the round's two calls, which run one at a time: the
+    /// window is closed before the second call starts.
+    FirstCall,
+}
+
+/// How the row stops the writer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Stop {
+    /// Every renew from then on fails, the renew of each re-acquire
+    /// included.
+    #[default]
+    FailingRenews,
+    /// One renew never answers, and the realm's renew timeout gives up on
+    /// it; later renews answer. What the re-acquire after it meets:
+    TimedOutRenew(Reacquire),
+}
+
+/// What the re-acquire after a timed-out renew meets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reacquire {
+    /// Its listing answers after this long; its acquire and its renew
+    /// answer at once.
+    ListsIn(Duration),
+    /// Every acquire answers `Unavailable`.
+    Fails,
+    /// Another writer committed while this one was stopped: the listing
+    /// shows that writer's batch.
+    FindsForeignBatch,
 }
 
 /// Shared between the host, the model and the tools of one row.
 #[derive(Default)]
 struct FenceControl {
+    /// How the row stops the writer.
+    stop: Stop,
     /// Every renew from now on fails.
     fail_renews: AtomicBool,
     /// A renew failed since `fail_renews` was set.
     renew_failed: AtomicBool,
-    /// The next host commit waits until a renew has failed, then lands.
+    /// The next host commit waits until the writer stopped, then lands.
     hold_next_commit: AtomicBool,
+    /// The next renew never answers.
+    hang_next_renew: AtomicBool,
+    /// Every acquire from now on answers `Unavailable`.
+    fail_acquires: AtomicBool,
+    /// The next listing call answers after this long.
+    list_delay: StdMutex<Option<Duration>>,
+    /// The next listing finds a batch another writer committed.
+    foreign_batch: AtomicBool,
+    /// The realm, once it is open: a row waits on its own window.
+    realm: OnceLock<Weak<SpiRealm>>,
 }
 
 impl FenceControl {
     /// Close the writer's window while the next host commit is in flight:
     /// the commit has passed the write path's own fence check when the host
-    /// sees it, and the renews fail only from then on, so the commit lands
+    /// sees it, and the writer stops only from then on, so the commit lands
     /// and the window is closed by the time it answers.
     fn close_during_next_commit(&self) {
         self.hold_next_commit.store(true, Ordering::SeqCst);
+    }
+
+    /// Stop the writer with one renew that never answers, set up what the
+    /// re-acquire after it meets, and wait until the realm's own window
+    /// reads closed. A row that does not stop the writer this way returns at
+    /// once.
+    async fn stop_with_a_timed_out_renew(&self) {
+        let Stop::TimedOutRenew(reacquire) = self.stop else {
+            return;
+        };
+        match reacquire {
+            Reacquire::ListsIn(delay) => {
+                *self
+                    .list_delay
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(delay);
+            }
+            Reacquire::Fails => self.fail_acquires.store(true, Ordering::SeqCst),
+            Reacquire::FindsForeignBatch => self.foreign_batch.store(true, Ordering::SeqCst),
+        }
+        self.hang_next_renew.store(true, Ordering::SeqCst);
+        let _ = tokio::time::timeout(STOP_DEADLINE, async {
+            while !self.writer_stopped() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+    }
+
+    /// Whether the realm's own window reads closed.
+    fn writer_stopped(&self) -> bool {
+        self.realm
+            .get()
+            .and_then(|realm| realm.upgrade())
+            .is_some_and(|realm| !realm.lease_is_live())
     }
 }
 
@@ -80,8 +181,8 @@ struct HostState {
 }
 
 /// An in-memory host store that meets its obligations at commit, with a
-/// 1 s renew interval and a 3 s lease, whose renews and commits follow
-/// `control`.
+/// 1 s renew interval and a 3 s lease, whose renews, acquires, listings and
+/// commits follow `control`.
 struct FenceHost {
     state: StdMutex<HostState>,
     control: Arc<FenceControl>,
@@ -105,6 +206,11 @@ impl FenceHost {
 #[async_trait]
 impl HostStore for FenceHost {
     async fn acquire_fence(&self, _mode: AcquireMode) -> Result<FenceGrant, HostStoreError> {
+        if self.control.fail_acquires.load(Ordering::SeqCst) {
+            return Err(HostStoreError::Unavailable(
+                "the row stops the acquires".to_string(),
+            ));
+        }
         let mut state = self.state();
         state.token += 1;
         Ok(FenceGrant {
@@ -114,6 +220,10 @@ impl HostStore for FenceHost {
     }
 
     async fn renew_fence(&self, token: FenceToken) -> Result<(), HostStoreError> {
+        if self.control.hang_next_renew.swap(false, Ordering::SeqCst) {
+            // The realm's renew timeout gives up on this renew.
+            std::future::pending::<()>().await;
+        }
         if self.control.fail_renews.load(Ordering::SeqCst) {
             self.control.renew_failed.store(true, Ordering::SeqCst);
             return Err(HostStoreError::Unavailable(
@@ -130,7 +240,7 @@ impl HostStore for FenceHost {
     }
 
     fn fence_timing(&self) -> FenceTiming {
-        FenceTiming::try_new(Duration::from_secs(1), Duration::from_secs(3))
+        FenceTiming::try_new(RENEW_INTERVAL, Duration::from_secs(3))
             .expect("a 1 s renew interval on a 3 s lease")
     }
 
@@ -152,6 +262,29 @@ impl HostStore for FenceHost {
         after: Option<&ScopeName>,
         limit: usize,
     ) -> Result<HeadPage, HostStoreError> {
+        let delay = self
+            .control
+            .list_delay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        if self.control.foreign_batch.swap(false, Ordering::SeqCst) {
+            // Another writer's batch landed while this writer was stopped.
+            self.state().scopes.insert(
+                (ScopeKind::Session, FOREIGN_SCOPE.to_string()),
+                StoredScope {
+                    version: ScopeVersion::FIRST,
+                    commit_id: CommitId::try_new("another-writers-batch")?,
+                    head: Vec::new(),
+                    start: 0,
+                    rows: BTreeMap::new(),
+                    end: 0,
+                },
+            );
+        }
         let state = self.state();
         let mut heads = Vec::new();
         let mut more = false;
@@ -203,15 +336,20 @@ impl HostStore for FenceHost {
 
     async fn commit(&self, batch: &CommitBatch) -> Result<(), HostStoreError> {
         if self.control.hold_next_commit.swap(false, Ordering::SeqCst) {
-            // The writer passed its own fence check before this commit; its
-            // window closes while the commit is in flight.
-            self.control.fail_renews.store(true, Ordering::SeqCst);
-            let _ = tokio::time::timeout(Duration::from_secs(5), async {
-                while !self.control.renew_failed.load(Ordering::SeqCst) {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+            // The writer passed its own fence check before this commit; it
+            // stops while the commit is in flight.
+            match self.control.stop {
+                Stop::FailingRenews => {
+                    self.control.fail_renews.store(true, Ordering::SeqCst);
+                    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                        while !self.control.renew_failed.load(Ordering::SeqCst) {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await;
                 }
-            })
-            .await;
+                Stop::TimedOutRenew(_) => self.control.stop_with_a_timed_out_renew().await,
+            }
         }
         let mut state = self.state();
         if state.landed.contains(batch.commit_id().as_str()) {
@@ -269,8 +407,8 @@ impl HostStore for FenceHost {
     }
 }
 
-/// Asks for one call of `probe`, then answers with text. Counts its
-/// requests.
+/// Asks for the row's calls of `probe` (one, or two when the window closes
+/// during the first call), then answers with text. Counts its requests.
 struct FenceModel {
     requests: AtomicUsize,
     control: Arc<FenceControl>,
@@ -300,18 +438,26 @@ impl LlmClient for FenceModel {
             if self.closes_during == ClosesDuring::FirstCommit {
                 self.control.close_during_next_commit();
             }
-            return Box::pin(stream::iter(vec![
-                Ok(LlmEvent::ToolCallComplete {
+            let mut events: Vec<Result<LlmEvent, LlmError>> =
+                vec![Ok(LlmEvent::ToolCallComplete {
                     id: "probe-call".into(),
                     name: "probe".into(),
                     args: json!({}),
                     meta: None,
-                }),
-                Ok(LlmEvent::UsageUpdate { usage }),
-                Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::success(meerkat_core::StopReason::ToolUse),
-                }),
-            ]));
+                })];
+            if self.closes_during == ClosesDuring::FirstCall {
+                events.push(Ok(LlmEvent::ToolCallComplete {
+                    id: "probe-call-2".into(),
+                    name: "probe".into(),
+                    args: json!({}),
+                    meta: None,
+                }));
+            }
+            events.push(Ok(LlmEvent::UsageUpdate { usage }));
+            events.push(Ok(LlmEvent::Done {
+                outcome: LlmDoneOutcome::success(meerkat_core::StopReason::ToolUse),
+            }));
+            return Box::pin(stream::iter(events));
         }
         Box::pin(stream::iter(vec![
             Ok(LlmEvent::TextDelta {
@@ -353,9 +499,11 @@ impl AgentToolDispatcher for FenceTools {
     }
 
     async fn dispatch(&self, call: ToolCallView<'_>) -> Result<ToolDispatchOutcome, ToolError> {
-        self.dispatched.fetch_add(1, Ordering::SeqCst);
-        if self.closes_during == ClosesDuring::SecondCommit {
-            self.control.close_during_next_commit();
+        let first = self.dispatched.fetch_add(1, Ordering::SeqCst) == 0;
+        match self.closes_during {
+            ClosesDuring::SecondCommit => self.control.close_during_next_commit(),
+            ClosesDuring::FirstCall if first => self.control.stop_with_a_timed_out_renew().await,
+            ClosesDuring::FirstCommit | ClosesDuring::FirstCall => {}
         }
         Ok(ToolDispatchOutcome::sync_result(ToolResult::new(
             call.id.into(),
@@ -365,11 +513,13 @@ impl AgentToolDispatcher for FenceTools {
     }
 }
 
-/// A real native agent through the factory, with the row's model and tools.
+/// A real native agent through the factory, with the row's model, tools
+/// and configuration.
 struct FenceBuilder {
     factory: AgentFactory,
     client: Arc<FenceModel>,
     tools: Arc<FenceTools>,
+    config: Config,
 }
 
 #[async_trait]
@@ -395,8 +545,9 @@ impl SessionAgentBuilder for FenceBuilder {
             _ => None,
         };
         let factory = self.factory.clone();
+        let agent_config = self.config.clone();
         let agent = meerkat_runtime::stack_relief::relieve_caller_stack(move || async move {
-            factory.build_agent(config, &Config::default()).await
+            factory.build_agent(config, &agent_config).await
         })
         .await
         .map_err(|error| SessionError::Agent(AgentError::InternalError(error.to_string())))?;
@@ -409,24 +560,41 @@ impl SessionAgentBuilder for FenceBuilder {
     }
 }
 
-/// What a run whose window closed during one of its round commits did.
+/// What a run whose writer stopped during one of its steps did.
 struct FencedRun {
     failed: bool,
     error: String,
     model_requests: usize,
     dispatched: usize,
     lease_live_after: bool,
+    poisoned_after: bool,
+    /// The phase of each of the session's input rows after the turn (`None`
+    /// for a row that does not decode), when the store answered.
+    input_phases: Option<Vec<Option<InputLifecycleState>>>,
+    /// The realm, kept open for a row that waits on it after the turn.
+    realm: Arc<SpiRealm>,
 }
 
 /// Run one turn of a fresh session over a host store realm whose writer's
-/// window closes during the round commit `closes_during` names.
+/// window closes during the round commit `closes_during` names, through
+/// renews that fail from then on.
 async fn run_with_window_closing_during(closes_during: ClosesDuring) -> FencedRun {
+    run_with_stop(closes_during, Stop::FailingRenews).await
+}
+
+/// Run one turn of a fresh session over a host store realm whose writer
+/// stops, the way `stop` names, during the step `closes_during` names.
+async fn run_with_stop(closes_during: ClosesDuring, stop: Stop) -> FencedRun {
     let temp = TempDir::new().expect("temp");
-    let control = Arc::new(FenceControl::default());
+    let control = Arc::new(FenceControl {
+        stop,
+        ..FenceControl::default()
+    });
     let host: Arc<dyn HostStore> = Arc::new(FenceHost::new(Arc::clone(&control)));
     let realm = SpiRealm::open(host, SpiRealmConfig::default())
         .await
         .expect("the realm opens");
+    let _ = control.realm.set(Arc::downgrade(&realm));
     let runtime_store = Arc::new(
         SpiRuntimeStore::open(Arc::clone(&realm))
             .await
@@ -448,13 +616,20 @@ async fn run_with_window_closing_during(closes_during: ClosesDuring) -> FencedRu
         control: Arc::clone(&control),
         closes_during,
     });
+    let mut config = Config::default();
+    if closes_during == ClosesDuring::FirstCall {
+        // One call at a time: the round's second call asks the fence once
+        // the first one has run.
+        config.tools.max_concurrent = 1;
+    }
     let builder = FenceBuilder {
         factory: AgentFactory::new(temp.path().join("sessions")).session_store(store.clone()),
         client: client.clone(),
         tools: tools.clone(),
+        config,
     };
     let service = Arc::new(
-        PersistentSessionService::new(builder, 1, store.clone(), runtime_store, blob_store)
+        PersistentSessionService::new(builder, 1, store.clone(), runtime_store.clone(), blob_store)
             .with_canonical_runtime_adapter(machine.clone()),
     );
     let request = CreateSessionRequest {
@@ -484,8 +659,12 @@ async fn run_with_window_closing_during(closes_during: ClosesDuring) -> FencedRu
     ))
     .await
     .expect("materialize the session and its executor");
+    let deadline = match stop {
+        Stop::FailingRenews => DEADLINE,
+        Stop::TimedOutRenew(_) => PAUSED_DEADLINE,
+    };
     let turn = tokio::time::timeout(
-        DEADLINE,
+        deadline,
         crate::surface::run_runtime_backed_initial_turn_with_machine(
             &service,
             &machine,
@@ -495,6 +674,18 @@ async fn run_with_window_closing_during(closes_during: ClosesDuring) -> FencedRu
     )
     .await
     .expect("the turn ends");
+    let input_phases: Option<Vec<Option<InputLifecycleState>>> = runtime_store
+        .load_input_states(&LogicalRuntimeId::for_session(&created.session_id))
+        .await
+        .ok()
+        .map(|rows| {
+            rows.iter()
+                .map(|row| match row {
+                    InputStateRow::Decoded(stored) => Some(stored.seed.phase),
+                    _ => None,
+                })
+                .collect()
+        });
     FencedRun {
         failed: turn.is_err(),
         error: turn
@@ -504,7 +695,56 @@ async fn run_with_window_closing_during(closes_during: ClosesDuring) -> FencedRu
         model_requests: client.requests.load(Ordering::SeqCst),
         dispatched: tools.dispatched.load(Ordering::SeqCst),
         lease_live_after: realm.lease_is_live(),
+        poisoned_after: realm.realm_poisoned().is_some(),
+        input_phases,
+        realm,
     }
+}
+
+/// A turn whose writer one timed-out renew stopped at `site`, and whose
+/// re-acquire then succeeded, ran to its end: the dispatch at `site` waited
+/// for the re-acquire, and nothing ran twice.
+fn assert_completed_once(run: &FencedRun, site: &str, calls: usize) {
+    assert!(
+        !run.failed,
+        "{site}: the dispatch waits for the re-acquire, and the turn completes: {}",
+        run.error
+    );
+    assert_eq!(
+        run.model_requests, 2,
+        "{site}: the tool round and the answer, each asked once"
+    );
+    assert_eq!(
+        run.dispatched, calls,
+        "{site}: each call of the round ran once"
+    );
+    assert!(
+        run.lease_live_after,
+        "{site}: the re-acquire resumed the writer"
+    );
+    assert!(!run.poisoned_after, "{site}: no other writer showed up");
+    assert_eq!(
+        run.input_phases,
+        Some(vec![Some(InputLifecycleState::Consumed)]),
+        "{site}: the turn's one input is consumed once, not stopped or queued again"
+    );
+}
+
+/// A turn whose writer stopped while the round's second commit was in
+/// flight, and whose re-acquire did not restore its window, made no model
+/// call after the stop: the dispatch fence refused it, as before.
+fn assert_refused_after_the_round(run: &FencedRun, row: &str) {
+    assert!(run.failed, "{row}: the run stops at the closed window");
+    assert!(
+        run.error.contains("self-fence window closed"),
+        "{row}: the dispatch fence refused it, not the write path: {}",
+        run.error
+    );
+    assert_eq!(
+        run.dispatched, 1,
+        "{row}: the call ran once, before the writer stopped"
+    );
+    assert_eq!(run.model_requests, 1, "{row}: no model call after the stop");
 }
 
 /// A host store writer whose self-fence window has closed makes no model
@@ -516,6 +756,9 @@ async fn run_with_window_closing_during(closes_during: ClosesDuring) -> FencedRu
 ///   dispatched, and no model call follows;
 /// - closed during the round's second commit, the call ran once, while the
 ///   window was open, and the next model call is refused.
+///
+/// Every renew fails from then on, the renew of each re-acquire included,
+/// so the writer never gets its window back.
 #[tokio::test]
 async fn a_writer_past_its_fence_window_makes_no_model_call_and_dispatches_no_tool() {
     let first = run_with_window_closing_during(ClosesDuring::FirstCommit).await;
@@ -542,4 +785,101 @@ async fn a_writer_past_its_fence_window_makes_no_model_call_and_dispatches_no_to
         "the call ran once, before the window closed"
     );
     assert_eq!(second.model_requests, 1, "the next model call is refused");
+}
+
+/// A writer that one timed-out renew stopped while the round's second
+/// commit was in flight waits, at the next model call, for the re-acquire
+/// that its next write would make. The re-acquire's listing answers 1.5 s
+/// later, within the 2 s window, so the model call goes ahead and the turn
+/// completes with its input consumed once. Before the fix the model call was
+/// refused at once and the turn failed with the teardown class
+/// (`DurableProjectionAuthorityUnknown`, "self-fence window closed ...
+/// renew failed: true").
+#[tokio::test(start_paused = true)]
+async fn a_model_call_after_a_timed_out_renew_waits_for_the_reacquire() {
+    let run = run_with_stop(
+        ClosesDuring::SecondCommit,
+        Stop::TimedOutRenew(Reacquire::ListsIn(LISTING_WITHIN_THE_WINDOW)),
+    )
+    .await;
+    assert_completed_once(&run, "the model call after the round", 1);
+}
+
+/// A writer that one timed-out renew stopped while the round's first commit
+/// was in flight waits, before it admits the round's call, for the
+/// re-acquire; the call then runs once and the turn completes. Before the
+/// fix the round was refused at once and the turn failed.
+#[tokio::test(start_paused = true)]
+async fn a_tool_round_after_a_timed_out_renew_waits_for_the_reacquire() {
+    let run = run_with_stop(
+        ClosesDuring::FirstCommit,
+        Stop::TimedOutRenew(Reacquire::ListsIn(LISTING_WITHIN_THE_WINDOW)),
+    )
+    .await;
+    assert_completed_once(&run, "the round after its first commit", 1);
+}
+
+/// A writer that one timed-out renew stopped while the round's first call
+/// ran (two calls, one at a time) waits, right before the second call
+/// starts, for the re-acquire; the second call then runs once and the turn
+/// completes. Before the fix the second call was refused ("this writer's
+/// self-fence window closed before the call started") and the turn failed.
+#[tokio::test(start_paused = true)]
+async fn a_tool_call_after_a_timed_out_renew_waits_for_the_reacquire() {
+    let run = run_with_stop(
+        ClosesDuring::FirstCall,
+        Stop::TimedOutRenew(Reacquire::ListsIn(LISTING_WITHIN_THE_WINDOW)),
+    )
+    .await;
+    assert_completed_once(&run, "the second call of the round", 2);
+}
+
+/// A re-acquire that fails (every acquire answers a store error) restores
+/// nothing: the waiting model call is refused as before, the writer stays
+/// stopped, and the realm is not poisoned.
+#[tokio::test(start_paused = true)]
+async fn a_failed_reacquire_still_refuses_the_dispatch() {
+    let run = run_with_stop(
+        ClosesDuring::SecondCommit,
+        Stop::TimedOutRenew(Reacquire::Fails),
+    )
+    .await;
+    assert_refused_after_the_round(&run, "a failed re-acquire");
+    assert!(!run.lease_live_after, "the writer stays stopped");
+    assert!(!run.poisoned_after, "a failed acquire poisons nothing");
+}
+
+/// A re-acquire whose listing shows a batch another writer committed while
+/// this one was stopped poisons the realm: the waiting model call is
+/// refused, and nothing more is dispatched.
+#[tokio::test(start_paused = true)]
+async fn a_foreign_batch_at_the_reacquire_refuses_the_dispatch() {
+    let run = run_with_stop(
+        ClosesDuring::SecondCommit,
+        Stop::TimedOutRenew(Reacquire::FindsForeignBatch),
+    )
+    .await;
+    assert_refused_after_the_round(&run, "another writer's batch");
+    assert!(run.poisoned_after, "the foreign batch poisons the realm");
+    assert!(!run.lease_live_after, "the writer never resumes");
+}
+
+/// The wait is bounded by the self-fence window: a re-acquire whose listing
+/// takes 30 s is not waited for, and the model call is refused as before.
+/// The re-acquire itself goes on and resumes the writer once its listing
+/// answers; only the dispatch gave up.
+#[tokio::test(start_paused = true)]
+async fn a_reacquire_slower_than_the_window_refuses_the_dispatch() {
+    let run = run_with_stop(
+        ClosesDuring::SecondCommit,
+        Stop::TimedOutRenew(Reacquire::ListsIn(LISTING_PAST_THE_WINDOW)),
+    )
+    .await;
+    assert_refused_after_the_round(&run, "a re-acquire slower than the window");
+    assert!(!run.poisoned_after, "a slow listing poisons nothing");
+    tokio::time::sleep(LISTING_PAST_THE_WINDOW + Duration::from_secs(5)).await;
+    assert!(
+        run.realm.lease_is_live(),
+        "the slow re-acquire resumes the writer once its listing answers"
+    );
 }
