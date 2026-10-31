@@ -1150,6 +1150,99 @@ async fn every_dispatch_awaits_the_waiting_fence() {
     );
 }
 
+/// A checkpointer whose fence lets the run's model call and its round's
+/// post-commit check through, then answers the round's two per-call checks
+/// out of order: the first refuses after a short wait, the second allows
+/// after a longer one, so both are waiting when the refusal comes in. It
+/// counts the waits.
+struct SplitFenceCheckpointer {
+    inner: Arc<RecordingCheckpointer>,
+    waits: AtomicUsize,
+}
+
+#[async_trait]
+impl SessionCheckpointer for SplitFenceCheckpointer {
+    async fn checkpoint_run(
+        &self,
+        session: &mut Session,
+        run_id: &RunId,
+        previous: Option<&RunCheckpointReceipt>,
+    ) -> Result<Option<RunCheckpointReceipt>, AgentError> {
+        self.inner.checkpoint_run(session, run_id, previous).await
+    }
+
+    async fn dispatch_fence_ready(&self) -> Result<(), AgentError> {
+        match self.waits.fetch_add(1, Ordering::SeqCst) {
+            // The model call and the round's post-commit check.
+            0 | 1 => Ok(()),
+            // The first call's check refuses after a short wait.
+            2 => {
+                for _ in 0..2 {
+                    tokio::task::yield_now().await;
+                }
+                Err(AgentError::session_durable_projection_authority_unknown(
+                    "the writer's fence window closed",
+                ))
+            }
+            // The other call's check allows, but only after that refusal.
+            _ => {
+                for _ in 0..20 {
+                    tokio::task::yield_now().await;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// A refusal that comes in while another call of the round waits at the
+/// fence stops that call too, although its own wait then allows: each call
+/// checks the round's refusal again after its wait. With two calls at once,
+/// the first call's check refuses while the second's still waits; the second
+/// call never starts, and the round fails with the refusal.
+#[tokio::test]
+async fn a_refusal_while_another_call_waits_stops_that_call_too() {
+    let client = ScriptedClient::new(vec![Step::Tools(vec![
+        ("call-1", "probe", "{}"),
+        ("call-2", "probe2", "{}"),
+    ])]);
+    let tools = RecordingTools::new(RecordingTools::probes(), None);
+    let checkpointer = Arc::new(SplitFenceCheckpointer {
+        inner: RecordingCheckpointer::new(),
+        waits: AtomicUsize::new(0),
+    });
+    let mut agent = AgentBuilder::new()
+        .resume_session(fresh_session())
+        .with_turn_state_handle(Arc::new(
+            crate::agent::test_turn_state_handle::TestTurnStateHandle::new(),
+        ))
+        .with_runtime_execution_kind_for_test(
+            meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn,
+        )
+        .with_checkpointer(Arc::clone(&checkpointer) as Arc<dyn SessionCheckpointer>)
+        .with_tools_config(meerkat_core::ToolsConfig {
+            max_concurrent: 2,
+            ..meerkat_core::ToolsConfig::default()
+        })
+        .build_standalone(Arc::clone(&client), Arc::clone(&tools), Arc::new(NoopStore))
+        .await;
+
+    let error = agent
+        .run("start".into())
+        .await
+        .expect_err("the refusal fails the round");
+    assert!(error.requires_session_teardown(), "{error}");
+    assert!(
+        tools.dispatched().is_empty(),
+        "neither call started: the refused one, nor the one whose wait allowed after the refusal"
+    );
+    assert_eq!(
+        checkpointer.waits.load(Ordering::SeqCst),
+        4,
+        "both calls waited at the fence: the model call, the post-commit check and two calls"
+    );
+}
+
 /// No round outlives its run. A run whose round fails (here its first
 /// commit returns no receipt) leaves no round bound, and a call the host
 /// dispatches next carries no dedupe key, even under the failed round's call

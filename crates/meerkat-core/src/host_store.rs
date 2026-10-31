@@ -129,10 +129,10 @@
 //!   store I/O per round, and there is no fence check on the per round
 //!   path. Core exposes the window through [`SelfFence`], so the run loop
 //!   checks it right before each model call and each tool dispatch. A
-//!   stopped holder's run waits there, for at most one self-fence window,
-//!   for the fresh acquire it makes before its next write
-//!   ([`SelfFence::dispatch_window`]), and dispatches only once that acquire
-//!   resumed it.
+//!   stopped holder's run waits there, bounded, for the fresh acquire it
+//!   makes before its next write ([`SelfFence::dispatch_window`]; Core's
+//!   realm bounds the wait by one self-fence window plus that acquire's own
+//!   timeouts), and dispatches only once that acquire resumed it.
 //! - **The host's obligation on the margin:** it is at least one renew
 //!   interval plus twice the store's visibility lag (the time from the
 //!   start of a write until every acquire and renew sees it). A takeover

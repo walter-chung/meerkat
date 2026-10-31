@@ -377,17 +377,19 @@ them.
   fails or times out stops the realm's writer until a fresh acquire, and
   store writes already waited for that re-acquire; the run's dispatch check
   did not. A turn that reached a model call, a compaction summary call, a
-  tool round or a tool call during the gap failed at once with
-  `SessionDurableProjectionAuthorityUnknown` ("self-fence window closed ...
-  renew failed: true"), the runtime tore the live session down, and the
-  turn's input and every other unfinished input of the session ended as
-  stopped. The dispatch check now waits for the same re-acquire, for at
-  most one self-fence window (the lease minus the self-fence margin, 20 s at
-  the default fence timing), and the turn goes on once the re-acquire
-  resumed the writer. It still refuses as before when the re-acquire fails,
-  finds another writer (a live holder, or a batch this writer did not
-  write, which poisons the realm), or does not finish within the window;
-  the realm then logs a warning naming the cause. `SelfFence` gains
+  decided consent's retained tool attempt, a tool round or a tool call
+  during the gap failed at once with `SessionDurableProjectionAuthorityUnknown`
+  ("self-fence window closed ... renew failed: true"), the runtime tore the
+  live session down, and the turn's input and every other unfinished input
+  of the session ended as stopped. The dispatch check now waits for the same
+  re-acquire, for at most one self-fence window (the lease minus the
+  self-fence margin) plus the re-acquire's own timeouts (its two acquires
+  and its renew): 35 s at the default fence timing and realm configuration.
+  The turn goes on once the re-acquire resumed the writer. It still refuses
+  as before when the re-acquire fails, finds another writer (a live holder,
+  or a batch this writer did not write, which poisons the realm), or does
+  not finish within the bound; the realm then logs a warning naming the
+  cause. `SelfFence` gains
   `dispatch_window` and `SessionCheckpointer` gains `dispatch_fence_ready`,
   provided methods whose defaults keep the check without a wait; the run
   loop awaits `dispatch_fence_ready` before every dispatch. The warning
@@ -528,6 +530,14 @@ them.
   committed only when touched.
 
 ### Known limitations
+
+- `meerkat-core`: a tool call that waits at the fence of a stopped host
+  store writer waits within its own deadline, as it waits for its
+  concurrency permit. A call whose deadline (a per-tool override, its
+  plan's deadline or one an MCP tool declares) passes during that wait ends
+  as a tool timeout although it never started, and the model reads it as a
+  timeout of unknown outcome; a call that starts after a wait runs with what
+  is left of its deadline.
 
 - `meerkat-runtime`: a governed input admitted under its own authority
   association (a governed prompt, for example) that a graceful requeue stop

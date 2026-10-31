@@ -45,9 +45,10 @@
 //!   [`SelfFence`]: the run loop reads the same window right before each
 //!   model call and each tool dispatch. Otherwise the call re-acquires
 //!   first, and refuses when that fails; a dispatch waits for that
-//!   re-acquire for at most one self-fence window
-//!   ([`SelfFence::dispatch_window`]). In the steady
-//!   state this is a local clock read: no store I/O is added to a round.
+//!   re-acquire for at most [`SpiRealm::dispatch_wait_bound`] (one
+//!   self-fence window plus the re-acquire's own timeouts,
+//!   [`SelfFence::dispatch_window`]). In the steady state this is a local
+//!   clock read: no store I/O is added to a round.
 //!   Every per-round commit of a run (commits A and B) is such a mutation,
 //!   so a writer past its window dispatches no tool and makes no model call
 //!   after its next commit point.
@@ -623,39 +624,66 @@ impl SelfFence for SpiRealm {
 
     /// While the window is open, the reading as it is: a clock read, no
     /// store I/O. Otherwise the dispatch waits for the re-acquire a write
-    /// would wait for ([`SpiRealm::ensure_lease`]: the one in flight, or a
-    /// fresh one on a task of its own, so giving up on it leaves it
-    /// running), for at most one self-fence window, and reads the window
-    /// again: open only when that re-acquire resumed the writer.
-    ///
-    /// The bound is the self-fence window, the span one successful acquire
-    /// or renew lets a writer dispatch for: a run waits no longer for its
-    /// writer to prove the fence again than one proof lasts. The window is
-    /// at least two renew intervals, and the re-acquire's renew is held to
-    /// one; its listing has no timeout of its own, and the bound keeps a run
-    /// from waiting on a store that does not answer.
+    /// would wait for ([`SpiRealm::ensure_lease`]: it waits behind a
+    /// re-acquire in flight and, when that one did not resume the writer,
+    /// runs one of its own, on a task of its own, so giving up on it leaves
+    /// it running), for at most [`SpiRealm::dispatch_wait_bound`], and reads
+    /// the window again: open only when a re-acquire resumed the writer.
     async fn dispatch_window(&self) -> SelfFenceWindow {
         let window = SelfFence::window(self);
         if window.is_open() {
             return window;
         }
-        match tokio::time::timeout(self.self_fence_window, self.ensure_lease()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(
+        let bound = self.dispatch_wait_bound();
+        let reacquired = tokio::time::timeout(bound, self.ensure_lease()).await;
+        // The window read after the wait decides, not the attempt's outcome:
+        // another attempt may have resumed the writer meanwhile, or a new
+        // stop may have closed the window again since.
+        let window = SelfFence::window(self);
+        if !window.is_open() {
+            match reacquired {
+                Ok(Ok(())) => tracing::warn!(
+                    "host store writer's fence window closed again right after its re-acquire; \
+                     the dispatch does not proceed"
+                ),
+                Ok(Err(error)) => tracing::warn!(
                     %error,
-                    "host store writer stopped and its re-acquire did not resume it; the dispatch is refused"
-                );
-            }
-            Err(_) => {
-                tracing::warn!(
-                    bound = ?self.self_fence_window,
-                    "host store writer stopped and its re-acquire did not finish within the self-fence window; the dispatch is refused"
-                );
+                    "host store writer's fence window is closed and its re-acquire did not \
+                     restore it; the dispatch does not proceed"
+                ),
+                Err(_) => tracing::warn!(
+                    ?bound,
+                    "host store writer's fence window is closed and its re-acquire did not \
+                     finish within the dispatch wait bound; the dispatch does not proceed"
+                ),
             }
         }
-        SelfFence::window(self)
+        window
     }
+}
+
+/// How long a dispatch waits, at most, for the re-acquire of a writer whose
+/// fence window closed ([`SelfFence::dispatch_window`]): the re-acquire's
+/// own bounded steps, its two acquires (the exclusive one, then the takeover
+/// of the writer's own lease, each under `acquire_timeout`) and its renew
+/// (under `renew_timeout`), plus one self-fence window for its steps that
+/// have no timeout of their own (the drain of the commits in flight and the
+/// listing of every head).
+///
+/// The bound keeps the run loop from waiting on a store that does not
+/// answer; fence safety does not depend on it, since a dispatch proceeds
+/// only on an open window. Right after a renew stop the store still records
+/// this writer's lease, so a re-acquire takes both acquires; under the tail
+/// latency that stopped the writer they are slow too, and a bound of one
+/// self-fence window alone cuts such a re-acquire off.
+pub(crate) fn dispatch_wait_bound(
+    self_fence_window: Duration,
+    acquire_timeout: Duration,
+    renew_timeout: Duration,
+) -> Duration {
+    self_fence_window
+        .saturating_add(acquire_timeout.saturating_mul(2))
+        .saturating_add(renew_timeout)
 }
 
 fn lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -753,6 +781,23 @@ impl SpiRealm {
     #[must_use]
     pub fn timing(&self) -> FenceTiming {
         self.timing
+    }
+
+    /// How long a dispatch waits, at most, for this writer's re-acquire once
+    /// its fence window closed: the re-acquire's own bounded steps, its two
+    /// acquires (the exclusive one, then the takeover of this writer's own
+    /// lease, each under [`SpiRealmConfig::renew_timeout`]) and its renew
+    /// (held to one renew interval), plus one self-fence window for its
+    /// steps that have no timeout of their own (the drain of the commits in
+    /// flight and the listing of every head). 35 s at the default timing and
+    /// configuration.
+    #[must_use]
+    pub fn dispatch_wait_bound(&self) -> Duration {
+        dispatch_wait_bound(
+            self.self_fence_window,
+            self.config.renew_timeout,
+            self.renew_timeout,
+        )
     }
 
     /// What remained of the superseded holder's recorded lease, which the

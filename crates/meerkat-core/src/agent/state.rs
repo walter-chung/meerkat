@@ -9213,7 +9213,11 @@ where
         // A writer past its self-fence window starts no further call: each
         // call asks the fence right before it starts, after its concurrency
         // permit (a stopped writer's call waits there, bounded, for the
-        // re-acquire), and once one is refused, no later call starts.
+        // re-acquire), and once one is refused, no later call starts. Like
+        // the permit wait, the fence wait counts against the call's own
+        // deadline: a call whose deadline passes while it waits ends as a
+        // tool timeout although it never started, and a call that starts
+        // after a wait runs with what is left of its deadline.
         let fence = self.checkpointer.clone().map(DispatchFence::new);
         let mut dispatch_results = dispatch_tool_calls_fenced_boxed(
             Arc::clone(&self.tools),

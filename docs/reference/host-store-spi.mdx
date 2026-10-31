@@ -301,9 +301,10 @@ The store relies on Core keeping these rules:
   and refuses only a token that was superseded or that it never issued.
   A stop is a pause, not a failure: a run that reaches a model call or a
   tool call while the holder is stopped waits for that fresh acquire, for
-  at most one self-fence window, and goes on once it resumed the holder.
-  The run fails only when the acquire fails, finds another process, or
-  takes longer than the window.
+  at most one self-fence window plus the acquire's own timeouts (its two
+  acquires and its renew, 35 s at the default timing), and goes on once it
+  resumed the holder. The run fails only when the acquire fails, finds
+  another process, or takes longer than that.
 - **Self-fencing.** The holder fences itself on its own clock: it makes no
   model call, dispatches nothing and commits nothing unless its last
   successful acquire or renew started less than the self-fence window ago.
