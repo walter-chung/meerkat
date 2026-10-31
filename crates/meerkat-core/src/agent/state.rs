@@ -17131,10 +17131,11 @@ mod tests {
     /// shows the transcript fits after all, and clears it. Here the agent's
     /// declared window (50k) is smaller than what the provider takes: the
     /// run's 400 KB result is bounded for its request, which records the
-    /// fact, and the bounded request's answer keeps it. The compactor ignores
-    /// the fact, so nothing folds the result, and the next run's request
-    /// carries it whole; the provider answers it, and the fact is gone, so it
-    /// does not stay behind for a compactor that ignores it.
+    /// fact, and the bounded request's answer keeps it and anchors no input
+    /// projection (the anchor stays on the request that made the call). The
+    /// compactor ignores the fact, so nothing folds the result, and the next
+    /// run's request carries it whole; the provider answers it, and the fact
+    /// is gone, so it does not stay behind for a compactor that ignores it.
     #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn an_answer_sent_whole_clears_the_fact_a_bound_recorded() {
@@ -17174,6 +17175,23 @@ mod tests {
             recorded,
             Some(2),
             "the bound recorded the fact, and the bounded request's answer kept it"
+        );
+        let call_at = agent
+            .session()
+            .messages()
+            .iter()
+            .position(is_tool_call)
+            .expect("the stored call");
+        let anchor = agent
+            .compaction_cadence
+            .last_answered_request
+            .clone()
+            .expect("the request that made the call anchored the projection");
+        assert_eq!(
+            anchor.transcript_rows,
+            u64::try_from(call_at).unwrap(),
+            "the anchor stays on the request that made the call: the answer to the request \
+             bounded on the context window anchors none"
         );
 
         agent
