@@ -88336,7 +88336,6 @@ struct MobRuntimeParitySnapshotSummary {
     owner_bridge_session_id: Option<String>,
     owner_bridge_destroy_on_archive: bool,
     implicit_delegation_mob: bool,
-    live_intent_identities: BTreeSet<String>,
     live_runtime_ids: BTreeSet<String>,
     externally_addressable_runtime_ids: BTreeSet<String>,
     runtime_fence_tokens: BTreeMap<String, u64>,
@@ -88625,6 +88624,10 @@ struct MobRuntimeParityPairReport {
     right_phase: String,
     summary: MobRuntimeParityPairSummary,
     rows: Vec<MobRuntimeParityRowReport>,
+    /// Every kernel row of the pair next to the runtime outcome it models,
+    /// for the fail-closed verdict.
+    #[serde(skip)]
+    observations: Vec<MobParityObservation>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -88670,12 +88673,38 @@ struct MobModeledStateRuntimeReport {
     result_summary: String,
 }
 
+/// The kernel's answer to one probed input, as the fail-closed verdict reads
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum MobKernelOutcome {
+    /// A transition fired. `refusal_effect` names the machine-owned refusal
+    /// effect it emitted for the probed call, if any
+    /// (`MOB_MACHINE_REFUSAL_EFFECTS`).
+    Transition {
+        transition: String,
+        refusal_effect: Option<String>,
+    },
+    /// The kernel weighed every candidate transition and none was enabled.
+    NoMatchingTransition,
+    /// A guard, update or effect called a native helper the test oracle does
+    /// not implement.
+    UnknownNativeHelper { helper: String },
+    /// Any other refusal: payload or state validation, arity, a strict read,
+    /// an ambiguous match. Never accepted.
+    Refused { detail: String },
+    /// The audit could not build the kernel's pre-state or input. Never
+    /// accepted.
+    NotEvaluated { detail: String },
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct MobModeledStateSchemaReport {
     outcome_kind: MobModeledStateOutcomeKind,
     after: Option<MobModeledStateSummary>,
     detail: String,
     result_summary: Option<String>,
+    kernel: MobKernelOutcome,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -88702,6 +88731,10 @@ struct MobModeledStateAuditReport {
     generated_at: String,
     summary: MobModeledStateAuditSummary,
     rows: Vec<MobModeledStateRowReport>,
+    /// Every kernel row next to the runtime outcome it models, for the
+    /// fail-closed verdict.
+    #[serde(skip)]
+    observations: Vec<MobParityObservation>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88744,6 +88777,40 @@ enum MobRuntimeParityProbeInput {
     ConcludeObjective,
 }
 
+// Identities and arguments the runtime probes send and the kernel rows rebuild
+// (`mob_modeled_probe_arguments`), in one place so the two cannot drift.
+const MOB_PARITY_WORKER: &str = "w-1";
+const MOB_PARITY_LEAD: &str = "l-1";
+const MOB_PARITY_CANCEL_TARGET: &str = "cancel-target";
+const MOB_PARITY_SPAWNED: &str = "parity-spawn";
+const MOB_PARITY_ENSURED: &str = "parity-ensure";
+const MOB_PARITY_RECONCILED: &str = "parity-reconcile";
+const MOB_PARITY_OBJECTIVE_OUTCOME: &str = "mob runtime parity objective complete";
+const MOB_PARITY_PROVENANCE_TOOL: &str = "spawn_member";
+const MOB_PARITY_AUDIT_INVOCATION: &str = "mob-runtime-parity";
+const MOB_PARITY_EVENT_CHANNEL_CAPACITY: usize = 32;
+const MOB_PARITY_EVENT_POLL_INTERVAL_MS: u64 = 10;
+
+/// The machine input the `AuthorizeSpawnProfile` probe submits, and the
+/// kernel row rebuilds field by field.
+fn mob_runtime_parity_authorize_spawn_profile_input()
+-> crate::machines::mob_machine::MobMachineInput {
+    crate::machines::mob_machine::MobMachineInput::AuthorizeSpawnProfile {
+        agent_identity: crate::machines::mob_machine::AgentIdentity::from(
+            "parity-authorize-profile",
+        ),
+        profile_name: "worker".to_string(),
+        model: "test-model".to_string(),
+        profile_material_digest: "parity-profile-material".to_string(),
+        tool_config_digest: "parity-tool-config".to_string(),
+        skills_digest: "parity-skills".to_string(),
+        provider_params_digest: None,
+        output_schema_digest: None,
+        external_addressable: false,
+        resolved_spec_digest: None,
+    }
+}
+
 struct MobRuntimeParityFixture {
     handle: MobHandle,
     service: Arc<MockSessionService>,
@@ -88774,7 +88841,7 @@ impl MobRuntimeParityFixture {
             self.handle
                 .spawn(
                     ProfileName::from("worker"),
-                    AgentIdentity::from("w-1"),
+                    AgentIdentity::from(MOB_PARITY_WORKER),
                     None,
                 )
                 .await
@@ -88792,7 +88859,11 @@ impl MobRuntimeParityFixture {
             .is_none()
         {
             self.handle
-                .spawn(ProfileName::from("lead"), AgentIdentity::from("l-1"), None)
+                .spawn(
+                    ProfileName::from("lead"),
+                    AgentIdentity::from(MOB_PARITY_LEAD),
+                    None,
+                )
                 .await
                 .map_err(|error| format!("spawn lead: {error:?}"))?;
         }
@@ -89091,17 +89162,6 @@ async fn mob_runtime_parity_snapshot_summary(
     });
     let representative_fence_token =
         representative.and_then(|entry| entry.binding_atoms().map(|(_, fence)| fence.get()));
-    // Durable voice-intent was a separate domain kernel; it's now owned at the
-    // transport layer via capability-driven realtime (Phase 5G), so the parity
-    // snapshot reports an empty set for this projection.
-    let live_intent_identities: BTreeSet<String> = BTreeSet::new();
-    let live_intent_identity_values = live_intent_identities
-        .iter()
-        .map(|raw| {
-            serde_json::from_str::<serde_json::Value>(raw)
-                .unwrap_or_else(|_| serde_json::Value::String(raw.clone()))
-        })
-        .collect::<Vec<_>>();
     let live_runtime_ids = active_members
         .iter()
         .filter_map(|entry| {
@@ -89158,11 +89218,6 @@ async fn mob_runtime_parity_snapshot_summary(
         })
         .collect::<Vec<_>>();
     let mut formal_available_fields = BTreeMap::new();
-    formal_available_fields.insert(
-        "live_intent_identities".into(),
-        serde_json::to_string(&live_intent_identity_values)
-            .expect("serialize live_intent_identities"),
-    );
     formal_available_fields.insert(
         "live_runtime_ids".into(),
         serde_json::to_string(&live_runtime_id_values).expect("serialize live_runtime_ids"),
@@ -89281,12 +89336,14 @@ async fn mob_runtime_parity_snapshot_summary(
                 "member_last_progress_at_ms",
                 serde_json::to_value(&dsl.member_last_progress_at_ms),
             ),
+            // Keyed by the plain identity, like every other projected
+            // identity map, so the kernel state reads one text per member.
             (
                 "member_last_progress_event",
                 serde_json::to_value(
                     dsl.member_last_progress_event
                         .iter()
-                        .map(|(key, value)| (format!("{key:?}"), format!("{value:?}")))
+                        .map(|(key, value)| (key.0.clone(), format!("{value:?}")))
                         .collect::<BTreeMap<_, _>>(),
                 ),
             ),
@@ -89295,7 +89352,7 @@ async fn mob_runtime_parity_snapshot_summary(
                 serde_json::to_value(
                     dsl.member_health_class
                         .iter()
-                        .map(|(key, value)| (format!("{key:?}"), format!("{value:?}")))
+                        .map(|(key, value)| (key.0.clone(), format!("{value:?}")))
                         .collect::<BTreeMap<_, _>>(),
                 ),
             ),
@@ -89999,7 +90056,6 @@ async fn mob_runtime_parity_snapshot_summary(
         owner_bridge_session_id,
         owner_bridge_destroy_on_archive,
         implicit_delegation_mob,
-        live_intent_identities,
         live_runtime_ids,
         externally_addressable_runtime_ids,
         runtime_fence_tokens,
@@ -90172,9 +90228,6 @@ fn mob_runtime_parity_field_value(
         )),
         "implicit_delegation_mob" => Some(MobRuntimeParityExprValue::Bool(
             snapshot.implicit_delegation_mob,
-        )),
-        "live_intent_identities" => Some(MobRuntimeParityExprValue::Set(
-            snapshot.live_intent_identities.clone(),
         )),
         "live_runtime_ids" => Some(MobRuntimeParityExprValue::Set(
             snapshot.live_runtime_ids.clone(),
@@ -91382,9 +91435,9 @@ async fn build_mob_runtime_parity_fixture() -> MobRuntimeParityFixture {
     MobRuntimeParityFixture {
         handle,
         service,
-        worker_identity: AgentIdentity::from("w-1"),
-        lead_identity: AgentIdentity::from("l-1"),
-        cancel_identity: AgentIdentity::from("cancel-target"),
+        worker_identity: AgentIdentity::from(MOB_PARITY_WORKER),
+        lead_identity: AgentIdentity::from(MOB_PARITY_LEAD),
+        cancel_identity: AgentIdentity::from(MOB_PARITY_CANCEL_TARGET),
         flow_run_id: None,
         submitted_work_ref: None,
         wired_external: false,
@@ -91545,29 +91598,14 @@ async fn mob_runtime_parity_execute_probe(
             .handle
             .spawn(
                 ProfileName::from("worker"),
-                AgentIdentity::from("parity-spawn"),
+                AgentIdentity::from(MOB_PARITY_SPAWNED),
                 None,
             )
             .await
             .map(|_| summarize_mob_runtime_success(probe, "spawned")),
         MobRuntimeParityProbeInput::AuthorizeSpawnProfile => fixture
             .handle
-            .apply_machine_input_effects(
-                crate::machines::mob_machine::MobMachineInput::AuthorizeSpawnProfile {
-                    agent_identity: crate::machines::mob_machine::AgentIdentity::from(
-                        "parity-authorize-profile",
-                    ),
-                    profile_name: "worker".to_string(),
-                    model: "test-model".to_string(),
-                    profile_material_digest: "parity-profile-material".to_string(),
-                    tool_config_digest: "parity-tool-config".to_string(),
-                    skills_digest: "parity-skills".to_string(),
-                    provider_params_digest: None,
-                    output_schema_digest: None,
-                    external_addressable: false,
-                    resolved_spec_digest: None,
-                },
-            )
+            .apply_machine_input_effects(mob_runtime_parity_authorize_spawn_profile_input())
             .await
             .map(|_| summarize_mob_runtime_success(probe, "unit")),
         MobRuntimeParityProbeInput::ClassifyMemberWait => fixture
@@ -91594,13 +91632,13 @@ async fn mob_runtime_parity_execute_probe(
             .map(|_| summarize_mob_runtime_success(probe, "unit")),
         MobRuntimeParityProbeInput::EnsureMember => fixture
             .handle
-            .ensure_member(SpawnMemberSpec::new("worker", "parity-ensure"))
+            .ensure_member(SpawnMemberSpec::new("worker", MOB_PARITY_ENSURED))
             .await
             .map(|_| summarize_mob_runtime_success(probe, "unit")),
         MobRuntimeParityProbeInput::Reconcile => fixture
             .handle
             .reconcile(
-                vec![SpawnMemberSpec::new("worker", "parity-reconcile")],
+                vec![SpawnMemberSpec::new("worker", MOB_PARITY_RECONCILED)],
                 crate::runtime::reconcile::ReconcileOptions::default(),
             )
             .await
@@ -91812,8 +91850,8 @@ async fn mob_runtime_parity_execute_probe(
             let router = fixture
                 .handle
                 .subscribe_mob_events_with_config(MobEventRouterConfig {
-                    poll_interval: Duration::from_millis(10),
-                    channel_capacity: 32,
+                    poll_interval: Duration::from_millis(MOB_PARITY_EVENT_POLL_INTERVAL_MS),
+                    channel_capacity: MOB_PARITY_EVENT_CHANNEL_CAPACITY,
                 })
                 .await?;
             router.cancel();
@@ -91823,12 +91861,12 @@ async fn mob_runtime_parity_execute_probe(
             let authority = meerkat_runtime::mob_operator_authority::with_audit_invocation_id(
                 &meerkat_runtime::mob_operator_authority::create_only_mob_operator_authority()
                     .expect("generated create-only mob authority should be accepted"),
-                "mob-runtime-parity",
+                MOB_PARITY_AUDIT_INVOCATION,
             )
             .expect("generated mob authority should attach audit invocation id");
             fixture
                 .handle
-                .record_operator_action_provenance("spawn_member", &authority)
+                .record_operator_action_provenance(MOB_PARITY_PROVENANCE_TOOL, &authority)
                 .await
                 .map(|()| summarize_mob_runtime_success(probe, "unit"))
         }
@@ -91852,7 +91890,7 @@ async fn mob_runtime_parity_execute_probe(
             .conclude_objective(
                 &fixture.worker_identity,
                 fixture.objective_id,
-                "mob runtime parity objective complete",
+                MOB_PARITY_OBJECTIVE_OUTCOME,
             )
             .await
             .map(|()| summarize_mob_runtime_success(probe, "unit")),
@@ -92260,6 +92298,8 @@ async fn build_mob_runtime_parity_pair_report(
         right_phase: right_phase.schema_name().to_string(),
         summary,
         rows,
+        // This report runs no kernel row.
+        observations: Vec::new(),
     }
 }
 
@@ -92269,6 +92309,7 @@ async fn build_mob_runtime_full_pair_report(
     right_phase: MobRuntimeParityPhase,
 ) -> MobRuntimeParityPairReport {
     let mut rows = Vec::new();
+    let mut observations = Vec::new();
     let surface_only_inputs = mob_schema_input_variant_set(&schema.surface_only_inputs);
     let runtime_internal_inputs = mob_runtime_internal_input_variant_set();
 
@@ -92345,6 +92386,27 @@ async fn build_mob_runtime_full_pair_report(
             }
             (_, note) => note,
         };
+        if let Some(probe) = &probe {
+            let source = format!(
+                "full {}/{}",
+                left_phase.schema_name(),
+                right_phase.schema_name()
+            );
+            for (phase, runtime, schema_side) in [
+                (left_phase, &probe.left, probe.schema_left.as_ref()),
+                (right_phase, &probe.right, probe.schema_right.as_ref()),
+            ] {
+                if let Some(schema_side) = schema_side {
+                    observations.push(MobParityObservation::new(
+                        source.clone(),
+                        phase,
+                        input_variant,
+                        runtime,
+                        schema_side,
+                    ));
+                }
+            }
+        }
 
         rows.push(MobRuntimeParityRowReport {
             input_variant: schema_row.input_variant.as_str().to_string(),
@@ -92393,6 +92455,7 @@ async fn build_mob_runtime_full_pair_report(
         right_phase: right_phase.schema_name().to_string(),
         summary,
         rows,
+        observations,
     }
 }
 
@@ -92554,6 +92617,30 @@ async fn mob_runtime_parity_audit_writers_execute_required_probe_inventory() {
         modeled_report.summary.row_count > 0,
         "modeled-state audit must exercise required typed runtime probes"
     );
+
+    // Fail closed on the kernel's answers, not only on probe coverage: every
+    // kernel row of both audits must reproduce its runtime row or match an
+    // accepted difference, every accepted difference must still occur, and
+    // every probed input must fire a kernel transition somewhere unless a
+    // liveness gap says why it cannot.
+    let observations = full_report
+        .pairs
+        .iter()
+        .flat_map(|pair| pair.observations.iter())
+        .chain(&modeled_report.observations)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(
+        !observations.is_empty(),
+        "the parity audits must run kernel rows"
+    );
+    let failures = mob_parity_audit_failures(&observations);
+    assert!(
+        failures.is_empty(),
+        "MobMachine kernel parity audit failed:\n{}\n\nkernel rows observed:\n{}",
+        failures.join("\n"),
+        mob_parity_observation_table(&observations)
+    );
 }
 
 fn mob_modeled_normalize_json_value(value: serde_json::Value) -> serde_json::Value {
@@ -92584,172 +92671,6 @@ fn mob_modeled_normalize_formal_string(raw: &str) -> String {
         .unwrap_or_else(|_| raw.to_string())
 }
 
-fn mob_modeled_default_kernel_value(
-    ty: &meerkat_machine_schema::TypeRef,
-) -> meerkat_machine_kernels::test_oracle::KernelValue {
-    match ty {
-        meerkat_machine_schema::TypeRef::Bool => {
-            meerkat_machine_kernels::test_oracle::KernelValue::Bool(false)
-        }
-        meerkat_machine_schema::TypeRef::U32 | meerkat_machine_schema::TypeRef::U64 => {
-            meerkat_machine_kernels::test_oracle::KernelValue::U64(0)
-        }
-        meerkat_machine_schema::TypeRef::String => {
-            meerkat_machine_kernels::test_oracle::KernelValue::String(String::new())
-        }
-        meerkat_machine_schema::TypeRef::Named(name) => mob_modeled_named_value(
-            name,
-            if mob_modeled_named_type_is_u64(name.as_str()) {
-                meerkat_machine_kernels::test_oracle::KernelValue::U64(0)
-            } else {
-                meerkat_machine_kernels::test_oracle::KernelValue::String(String::new())
-            },
-        ),
-        meerkat_machine_schema::TypeRef::Enum(name) => {
-            meerkat_machine_kernels::test_oracle::KernelValue::NamedVariant {
-                enum_name: name.clone(),
-                variant: meerkat_machine_schema::identity::EnumVariantId::parse("Unknown")
-                    .expect("valid slug"),
-            }
-        }
-        meerkat_machine_schema::TypeRef::Option(_) => {
-            meerkat_machine_kernels::test_oracle::KernelValue::None
-        }
-        meerkat_machine_schema::TypeRef::Set(_) => {
-            meerkat_machine_kernels::test_oracle::KernelValue::Set(BTreeSet::new())
-        }
-        meerkat_machine_schema::TypeRef::Seq(_) => {
-            meerkat_machine_kernels::test_oracle::KernelValue::Seq(Vec::new())
-        }
-        meerkat_machine_schema::TypeRef::Map(_, _) => {
-            meerkat_machine_kernels::test_oracle::KernelValue::Map(BTreeMap::new())
-        }
-    }
-}
-
-fn mob_modeled_named_type_is_u64(name: &str) -> bool {
-    matches!(name, "FenceToken" | "Generation")
-}
-
-fn mob_modeled_named_value(
-    type_name: &meerkat_machine_schema::identity::NamedTypeId,
-    value: meerkat_machine_kernels::test_oracle::KernelValue,
-) -> meerkat_machine_kernels::test_oracle::KernelValue {
-    if matches!(
-        &value,
-        meerkat_machine_kernels::test_oracle::KernelValue::Named {
-            type_name: existing,
-            ..
-        } if existing == type_name
-    ) {
-        return value;
-    }
-
-    let value = if mob_modeled_named_type_is_u64(type_name.as_str()) {
-        match value {
-            meerkat_machine_kernels::test_oracle::KernelValue::U64(value) => {
-                meerkat_machine_kernels::test_oracle::KernelValue::U64(value)
-            }
-            meerkat_machine_kernels::test_oracle::KernelValue::String(value) => {
-                meerkat_machine_kernels::test_oracle::KernelValue::U64(
-                    serde_json::from_str::<u64>(&value)
-                        .ok()
-                        .or_else(|| value.parse::<u64>().ok())
-                        .unwrap_or_default(),
-                )
-            }
-            _ => meerkat_machine_kernels::test_oracle::KernelValue::U64(0),
-        }
-    } else {
-        match value {
-            meerkat_machine_kernels::test_oracle::KernelValue::String(value) => {
-                meerkat_machine_kernels::test_oracle::KernelValue::String(value)
-            }
-            meerkat_machine_kernels::test_oracle::KernelValue::U64(value) => {
-                meerkat_machine_kernels::test_oracle::KernelValue::String(value.to_string())
-            }
-            other => meerkat_machine_kernels::test_oracle::KernelValue::String(
-                serde_json::to_string(&mob_modeled_json_from_kernel_value(&other))
-                    .unwrap_or_default(),
-            ),
-        }
-    };
-
-    meerkat_machine_kernels::test_oracle::KernelValue::Named {
-        type_name: type_name.clone(),
-        value: Box::new(value),
-    }
-}
-
-fn mob_modeled_coerce_value_to_type(
-    ty: &meerkat_machine_schema::TypeRef,
-    value: meerkat_machine_kernels::test_oracle::KernelValue,
-) -> meerkat_machine_kernels::test_oracle::KernelValue {
-    match ty {
-        meerkat_machine_schema::TypeRef::Named(name) => mob_modeled_named_value(name, value),
-        meerkat_machine_schema::TypeRef::Option(inner) => match value {
-            meerkat_machine_kernels::test_oracle::KernelValue::None => {
-                meerkat_machine_kernels::test_oracle::KernelValue::None
-            }
-            meerkat_machine_kernels::test_oracle::KernelValue::Map(mut entries)
-                if entries.len() == 1
-                    && entries.contains_key(
-                        &meerkat_machine_kernels::test_oracle::KernelValue::String(
-                            "value".to_string(),
-                        ),
-                    ) =>
-            {
-                let key =
-                    meerkat_machine_kernels::test_oracle::KernelValue::String("value".to_string());
-                let inner_value = entries
-                    .remove(&key)
-                    .unwrap_or(meerkat_machine_kernels::test_oracle::KernelValue::None);
-                mob_modeled_option_some(mob_modeled_coerce_value_to_type(inner, inner_value))
-            }
-            other => mob_modeled_option_some(mob_modeled_coerce_value_to_type(inner, other)),
-        },
-        meerkat_machine_schema::TypeRef::Set(inner) => match value {
-            meerkat_machine_kernels::test_oracle::KernelValue::Set(items) => {
-                meerkat_machine_kernels::test_oracle::KernelValue::Set(
-                    items
-                        .into_iter()
-                        .map(|item| mob_modeled_coerce_value_to_type(inner, item))
-                        .collect(),
-                )
-            }
-            other => other,
-        },
-        meerkat_machine_schema::TypeRef::Seq(inner) => match value {
-            meerkat_machine_kernels::test_oracle::KernelValue::Seq(items) => {
-                meerkat_machine_kernels::test_oracle::KernelValue::Seq(
-                    items
-                        .into_iter()
-                        .map(|item| mob_modeled_coerce_value_to_type(inner, item))
-                        .collect(),
-                )
-            }
-            other => other,
-        },
-        meerkat_machine_schema::TypeRef::Map(key_ty, value_ty) => match value {
-            meerkat_machine_kernels::test_oracle::KernelValue::Map(entries) => {
-                meerkat_machine_kernels::test_oracle::KernelValue::Map(
-                    entries
-                        .into_iter()
-                        .map(|(key, value)| {
-                            (
-                                mob_modeled_coerce_value_to_type(key_ty, key),
-                                mob_modeled_coerce_value_to_type(value_ty, value),
-                            )
-                        })
-                        .collect(),
-                )
-            }
-            other => other,
-        },
-        _ => value,
-    }
-}
-
 fn mob_modeled_option_some(
     value: meerkat_machine_kernels::test_oracle::KernelValue,
 ) -> meerkat_machine_kernels::test_oracle::KernelValue {
@@ -92759,119 +92680,189 @@ fn mob_modeled_option_some(
     )]))
 }
 
-fn mob_modeled_json_value_from_raw(raw: &str) -> serde_json::Value {
-    serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
+/// The normalized JSON text of `value`: object keys sorted, no whitespace.
+fn mob_modeled_normalized_json_text(value: serde_json::Value) -> Result<String, String> {
+    serde_json::to_string(&mob_modeled_normalize_json_value(value))
+        .map_err(|error| format!("cannot render normalized JSON: {error}"))
 }
 
-fn mob_modeled_kernel_value_from_json(
-    ty: &meerkat_machine_schema::TypeRef,
-    value: &serde_json::Value,
-) -> meerkat_machine_kernels::test_oracle::KernelValue {
-    match ty {
-        meerkat_machine_schema::TypeRef::Bool => {
-            meerkat_machine_kernels::test_oracle::KernelValue::Bool(
-                value.as_bool().unwrap_or(false),
-            )
-        }
-        meerkat_machine_schema::TypeRef::U32 | meerkat_machine_schema::TypeRef::U64 => {
-            meerkat_machine_kernels::test_oracle::KernelValue::U64(value.as_u64().unwrap_or(0))
-        }
-        meerkat_machine_schema::TypeRef::String => {
-            meerkat_machine_kernels::test_oracle::KernelValue::String(
-                value
-                    .as_str()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| serde_json::to_string(value).unwrap_or_default()),
-            )
-        }
-        meerkat_machine_schema::TypeRef::Named(name)
-            if matches!(name.as_str(), "FenceToken" | "Generation") =>
-        {
-            meerkat_machine_kernels::test_oracle::KernelValue::Named {
-                type_name: name.clone(),
-                value: Box::new(meerkat_machine_kernels::test_oracle::KernelValue::U64(
-                    value.as_u64().unwrap_or(0),
-                )),
+/// The text of a string-backed kernel value decoded from runtime JSON.
+///
+/// The kernel compares such values as opaque strings, so one id must always
+/// have one text: a JSON string is taken as it is, unless it carries a
+/// structured id as JSON text (the snapshot keys maps by runtime id that
+/// way), and a structured id becomes its normalized JSON text.
+fn mob_modeled_atom_text(value: &serde_json::Value) -> Result<String, String> {
+    match value {
+        serde_json::Value::String(text) => match serde_json::from_str::<serde_json::Value>(text) {
+            Ok(structured @ (serde_json::Value::Object(_) | serde_json::Value::Array(_))) => {
+                mob_modeled_normalized_json_text(structured)
             }
+            _ => Ok(text.clone()),
+        },
+        serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+            mob_modeled_normalized_json_text(value.clone())
         }
-        meerkat_machine_schema::TypeRef::Named(name) => {
-            let normalized = value
-                .as_str()
-                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-                .unwrap_or_else(|| value.clone());
-            meerkat_machine_kernels::test_oracle::KernelValue::Named {
-                type_name: name.clone(),
-                value: Box::new(meerkat_machine_kernels::test_oracle::KernelValue::String(
-                    serde_json::to_string(&normalized).unwrap_or_else(|_| "null".into()),
-                )),
-            }
-        }
-        meerkat_machine_schema::TypeRef::Enum(name) => {
-            meerkat_machine_kernels::test_oracle::KernelValue::NamedVariant {
-                enum_name: name.clone(),
-                variant: meerkat_machine_schema::identity::EnumVariantId::parse(
-                    value.as_str().unwrap_or("Unknown"),
-                )
-                .unwrap_or_else(|_| {
-                    meerkat_machine_schema::identity::EnumVariantId::parse("Unknown")
-                        .expect("valid slug")
-                }),
-            }
-        }
-        meerkat_machine_schema::TypeRef::Option(inner) => {
-            if value.is_null() {
-                meerkat_machine_kernels::test_oracle::KernelValue::None
-            } else {
-                mob_modeled_option_some(mob_modeled_kernel_value_from_json(inner, value))
-            }
-        }
-        meerkat_machine_schema::TypeRef::Set(inner) => {
-            let values = value
-                .as_array()
-                .map(|items| {
-                    items
-                        .iter()
-                        .map(|item| mob_modeled_kernel_value_from_json(inner, item))
-                        .collect()
-                })
-                .unwrap_or_default();
-            meerkat_machine_kernels::test_oracle::KernelValue::Set(values)
-        }
-        meerkat_machine_schema::TypeRef::Seq(inner) => {
-            meerkat_machine_kernels::test_oracle::KernelValue::Seq(
-                value
-                    .as_array()
-                    .map(|items| {
-                        items
-                            .iter()
-                            .map(|item| mob_modeled_kernel_value_from_json(inner, item))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-            )
-        }
-        meerkat_machine_schema::TypeRef::Map(key_ty, value_ty) => {
-            let mut entries = BTreeMap::new();
-            if let Some(object) = value.as_object() {
-                for (key, item) in object {
-                    let key_value = mob_modeled_kernel_value_from_json(
-                        key_ty,
-                        &serde_json::Value::String(key.clone()),
-                    );
-                    let value_value = mob_modeled_kernel_value_from_json(value_ty, item);
-                    entries.insert(key_value, value_value);
-                }
-            }
-            meerkat_machine_kernels::test_oracle::KernelValue::Map(entries)
-        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => Err(
+            format!("expected a string or a structured id, found {value}"),
+        ),
     }
 }
 
-fn mob_modeled_kernel_value_from_raw(
+/// Decodes a projected runtime value of the named type `name` into the
+/// kernel's typed value, following the schema's binding for `name`. Fails
+/// rather than inventing a value.
+fn mob_modeled_named_kernel_value(
+    schema: &MachineSchema,
+    name: &meerkat_machine_schema::identity::NamedTypeId,
+    value: &serde_json::Value,
+) -> Result<meerkat_machine_kernels::test_oracle::KernelValue, String> {
+    use meerkat_machine_kernels::test_oracle::KernelValue;
+    use meerkat_machine_schema::{RustTypeAtom, TypePathStructFieldAtom};
+
+    let binding = schema
+        .named_type_binding(name)
+        .ok_or_else(|| format!("named type `{name}` has no binding"))?;
+    let inner = match &binding.rust {
+        RustTypeAtom::Bool => KernelValue::Bool(
+            value
+                .as_bool()
+                .ok_or_else(|| format!("`{name}` expects a bool, found {value}"))?,
+        ),
+        RustTypeAtom::U8 | RustTypeAtom::U16 | RustTypeAtom::U32 | RustTypeAtom::U64 => {
+            KernelValue::U64(
+                value.as_u64().ok_or_else(|| {
+                    format!("`{name}` expects an unsigned integer, found {value}")
+                })?,
+            )
+        }
+        RustTypeAtom::String | RustTypeAtom::TypePath(_) | RustTypeAtom::StringEnum { .. } => {
+            KernelValue::String(
+                mob_modeled_atom_text(value).map_err(|error| format!("`{name}`: {error}"))?,
+            )
+        }
+        RustTypeAtom::TypePathStruct { fields, .. } => {
+            let object = value
+                .as_object()
+                .ok_or_else(|| format!("`{name}` expects an object, found {value}"))?;
+            let mut entries = BTreeMap::new();
+            for field in fields {
+                let item = object
+                    .get(field.name.as_str())
+                    .ok_or_else(|| format!("`{name}` value lacks field `{}`", field.name))?;
+                let decoded = match &field.atom {
+                    TypePathStructFieldAtom::String => KernelValue::String(
+                        item.as_str()
+                            .ok_or_else(|| {
+                                format!("`{name}.{}` expects a string, found {item}", field.name)
+                            })?
+                            .to_owned(),
+                    ),
+                    TypePathStructFieldAtom::Named(field_type) => {
+                        mob_modeled_named_kernel_value(schema, field_type, item)?
+                    }
+                    TypePathStructFieldAtom::OptionalNamed(field_type) => {
+                        if item.is_null() {
+                            KernelValue::None
+                        } else {
+                            mob_modeled_option_some(mob_modeled_named_kernel_value(
+                                schema, field_type, item,
+                            )?)
+                        }
+                    }
+                };
+                entries.insert(KernelValue::String(field.name.as_str().to_owned()), decoded);
+            }
+            KernelValue::Map(entries)
+        }
+        RustTypeAtom::TypePathFieldPresenceSet { .. } | RustTypeAtom::TypePathEnum { .. } => {
+            return Err(format!(
+                "the audit does not decode `{name}`, bound as {:?}",
+                binding.rust
+            ));
+        }
+    };
+    Ok(KernelValue::Named {
+        type_name: name.clone(),
+        value: Box::new(inner),
+    })
+}
+
+/// Decodes a projected runtime JSON value into the kernel's typed value for
+/// `ty`. Fails rather than inventing a value: a projected field the audit
+/// cannot decode stops the kernel row.
+fn mob_modeled_kernel_value_from_json(
+    schema: &MachineSchema,
     ty: &meerkat_machine_schema::TypeRef,
-    raw: &str,
-) -> meerkat_machine_kernels::test_oracle::KernelValue {
-    mob_modeled_kernel_value_from_json(ty, &mob_modeled_json_value_from_raw(raw))
+    value: &serde_json::Value,
+) -> Result<meerkat_machine_kernels::test_oracle::KernelValue, String> {
+    use meerkat_machine_kernels::test_oracle::KernelValue;
+    use meerkat_machine_schema::TypeRef;
+
+    match ty {
+        TypeRef::Bool => value
+            .as_bool()
+            .map(KernelValue::Bool)
+            .ok_or_else(|| format!("expected a bool, found {value}")),
+        TypeRef::U32 | TypeRef::U64 => value
+            .as_u64()
+            .map(KernelValue::U64)
+            .ok_or_else(|| format!("expected an unsigned integer, found {value}")),
+        TypeRef::String => value
+            .as_str()
+            .map(|text| KernelValue::String(text.to_owned()))
+            .ok_or_else(|| format!("expected a string, found {value}")),
+        TypeRef::Named(name) => mob_modeled_named_kernel_value(schema, name, value),
+        TypeRef::Enum(name) => {
+            let variant_name = value
+                .as_str()
+                .ok_or_else(|| format!("expected a `{name}` variant, found {value}"))?;
+            let variant = meerkat_machine_schema::identity::EnumVariantId::parse(variant_name)
+                .map_err(|error| format!("`{variant_name}` is not a variant id: {error:?}"))?;
+            Ok(KernelValue::NamedVariant {
+                enum_name: name.clone(),
+                variant,
+            })
+        }
+        TypeRef::Option(inner) => {
+            if value.is_null() {
+                Ok(KernelValue::None)
+            } else {
+                mob_modeled_kernel_value_from_json(schema, inner, value)
+                    .map(mob_modeled_option_some)
+            }
+        }
+        TypeRef::Set(inner) => value
+            .as_array()
+            .ok_or_else(|| format!("expected an array, found {value}"))?
+            .iter()
+            .map(|item| mob_modeled_kernel_value_from_json(schema, inner, item))
+            .collect::<Result<BTreeSet<_>, _>>()
+            .map(KernelValue::Set),
+        TypeRef::Seq(inner) => value
+            .as_array()
+            .ok_or_else(|| format!("expected an array, found {value}"))?
+            .iter()
+            .map(|item| mob_modeled_kernel_value_from_json(schema, inner, item))
+            .collect::<Result<Vec<_>, _>>()
+            .map(KernelValue::Seq),
+        TypeRef::Map(key_ty, value_ty) => value
+            .as_object()
+            .ok_or_else(|| format!("expected an object, found {value}"))?
+            .iter()
+            .map(|(key, item)| -> Result<_, String> {
+                Ok((
+                    mob_modeled_kernel_value_from_json(
+                        schema,
+                        key_ty,
+                        &serde_json::Value::String(key.clone()),
+                    )?,
+                    mob_modeled_kernel_value_from_json(schema, value_ty, item)?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()
+            .map(KernelValue::Map),
+    }
 }
 
 fn mob_modeled_json_from_kernel_value(
@@ -93020,112 +93011,478 @@ fn mob_modeled_differing_keys(
     keys.into_iter().collect()
 }
 
+/// The kernel pre-state of a probe: the kernel's own initial state, put in
+/// the runtime's phase, with every field the runtime snapshot projects
+/// decoded over it. A field the snapshot does not project keeps the kernel's
+/// declared initial value; nothing is invented.
 fn mob_modeled_kernel_state(
+    kernel: &meerkat_machine_kernels::test_oracle::GeneratedMachineKernel,
     schema: &MachineSchema,
     before: &MobRuntimeParitySnapshotSummary,
-) -> meerkat_machine_kernels::test_oracle::KernelState {
-    let mut fields = BTreeMap::new();
+) -> Result<meerkat_machine_kernels::test_oracle::KernelState, String> {
+    let mut state = kernel
+        .initial_state()
+        .map_err(|error| format!("the kernel refuses its own initial state: {error}"))?;
+    state.phase = meerkat_machine_schema::identity::PhaseId::parse(before.phase.as_str()).map_err(
+        |error| {
+            format!(
+                "runtime phase `{}` is not a phase id: {error:?}",
+                before.phase
+            )
+        },
+    )?;
     for field in &schema.state.fields {
-        let value = before
-            .formal_available_fields
-            .get(field.name.as_str())
-            .map(|raw| mob_modeled_kernel_value_from_raw(&field.ty, raw))
-            .unwrap_or_else(|| mob_modeled_default_kernel_value(&field.ty));
-        fields.insert(
-            field.name.clone(),
-            mob_modeled_coerce_value_to_type(&field.ty, value),
-        );
+        let Some(raw) = before.formal_available_fields.get(field.name.as_str()) else {
+            continue;
+        };
+        let json = serde_json::from_str::<serde_json::Value>(raw)
+            .map_err(|error| format!("projected `{}` is not JSON: {error}", field.name))?;
+        let value = mob_modeled_kernel_value_from_json(schema, &field.ty, &json)
+            .map_err(|error| format!("projected `{}`: {error}", field.name))?;
+        state.fields.insert(field.name.clone(), value);
     }
-
-    meerkat_machine_kernels::test_oracle::KernelState {
-        phase: meerkat_machine_schema::identity::PhaseId::parse(before.phase.as_str())
-            .expect("valid phase slug"),
-        fields,
-    }
+    Ok(state)
 }
 
-fn mob_modeled_named_string(value: String) -> meerkat_machine_kernels::test_oracle::KernelValue {
-    meerkat_machine_kernels::test_oracle::KernelValue::String(value)
-}
-
-fn mob_modeled_representative_identity_value(before: &MobRuntimeParitySnapshotSummary) -> String {
-    before
-        .representative_agent_identity
-        .clone()
-        .unwrap_or_else(|| "\"<agent-identity>\"".to_string())
-}
-
-fn mob_modeled_representative_runtime_value(before: &MobRuntimeParitySnapshotSummary) -> String {
-    before
-        .representative_runtime_id
-        .clone()
-        .unwrap_or_else(|| "\"<runtime-id>\"".to_string())
-}
-
-fn mob_modeled_spawn_runtime_value(identity: &str, generation: u64) -> String {
-    serde_json::json!({
-        "identity": identity,
-        "generation": generation,
+fn mob_modeled_named(
+    type_name: &str,
+    inner: meerkat_machine_kernels::test_oracle::KernelValue,
+) -> Result<meerkat_machine_kernels::test_oracle::KernelValue, String> {
+    let named = meerkat_machine_schema::identity::NamedTypeId::parse(type_name)
+        .map_err(|error| format!("`{type_name}` is not a named type id: {error:?}"))?;
+    Ok(meerkat_machine_kernels::test_oracle::KernelValue::Named {
+        type_name: named,
+        value: Box::new(inner),
     })
-    .to_string()
 }
 
+fn mob_modeled_identity(
+    identity: &str,
+) -> Result<meerkat_machine_kernels::test_oracle::KernelValue, String> {
+    mob_modeled_named(
+        "AgentIdentity",
+        meerkat_machine_kernels::test_oracle::KernelValue::String(identity.to_owned()),
+    )
+}
+
+fn mob_modeled_runtime_id(
+    runtime_id: &str,
+) -> Result<meerkat_machine_kernels::test_oracle::KernelValue, String> {
+    mob_modeled_named(
+        "AgentRuntimeId",
+        meerkat_machine_kernels::test_oracle::KernelValue::String(runtime_id.to_owned()),
+    )
+}
+
+fn mob_modeled_variant(
+    enum_name: &str,
+    variant: &str,
+) -> Result<meerkat_machine_kernels::test_oracle::KernelValue, String> {
+    Ok(
+        meerkat_machine_kernels::test_oracle::KernelValue::NamedVariant {
+            enum_name: meerkat_machine_schema::identity::EnumTypeId::parse(enum_name)
+                .map_err(|error| format!("`{enum_name}` is not an enum id: {error:?}"))?,
+            variant: meerkat_machine_schema::identity::EnumVariantId::parse(variant)
+                .map_err(|error| format!("`{variant}` is not a variant id: {error:?}"))?,
+        },
+    )
+}
+
+fn mob_modeled_optional_string(
+    value: Option<String>,
+) -> meerkat_machine_kernels::test_oracle::KernelValue {
+    value.map_or(
+        meerkat_machine_kernels::test_oracle::KernelValue::None,
+        |text| {
+            mob_modeled_option_some(meerkat_machine_kernels::test_oracle::KernelValue::String(
+                text,
+            ))
+        },
+    )
+}
+
+/// The normalized runtime id text the parity snapshot uses for `identity` at
+/// `generation`.
+fn mob_modeled_runtime_id_text(identity: &str, generation: u64) -> Result<String, String> {
+    mob_modeled_normalized_json_text(serde_json::json!({
+        "generation": generation,
+        "identity": identity,
+    }))
+}
+
+/// A live member of the runtime pre-state, as the kernel rows address it.
+struct MobModeledLiveMember {
+    runtime_id: String,
+    generation: u64,
+    fence_token: u64,
+}
+
+fn mob_modeled_live_member(
+    before: &MobRuntimeParitySnapshotSummary,
+    identity: &str,
+) -> Option<MobModeledLiveMember> {
+    before.live_runtime_ids.iter().find_map(|runtime_id| {
+        let parsed = serde_json::from_str::<serde_json::Value>(runtime_id).ok()?;
+        if parsed.get("identity")?.as_str()? != identity {
+            return None;
+        }
+        Some(MobModeledLiveMember {
+            runtime_id: runtime_id.clone(),
+            generation: parsed.get("generation")?.as_u64()?,
+            fence_token: *before.runtime_fence_tokens.get(runtime_id)?,
+        })
+    })
+}
+
+/// Every live runtime id of the pre-state: the session-bound runtimes the
+/// subscribe probes authorize (every live parity member is session-bound).
+fn mob_modeled_live_runtime_ids(
+    before: &MobRuntimeParitySnapshotSummary,
+) -> Result<meerkat_machine_kernels::test_oracle::KernelValue, String> {
+    before
+        .live_runtime_ids
+        .iter()
+        .map(|runtime_id| mob_modeled_runtime_id(runtime_id.as_str()))
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map(meerkat_machine_kernels::test_oracle::KernelValue::Set)
+}
+
+/// The kickoff objective the runtime pre-state records for `identity`.
+fn mob_modeled_kickoff_objective(
+    before: &MobRuntimeParitySnapshotSummary,
+    identity: &str,
+) -> Option<String> {
+    let raw = before
+        .formal_available_fields
+        .get("member_kickoff_objective_ids")?;
+    let objectives = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    objectives.get(identity)?.as_str().map(str::to_owned)
+}
+
+/// A wiring edge as the kernel carries it, with its two ends. The schema
+/// binds `WiringEdge` as an opaque string; the row writes the JSON text of
+/// the edge with its ends ordered as `WiringEdge::new` orders them.
+fn mob_modeled_wiring_edge(
+    first: &str,
+    second: &str,
+) -> Result<
+    (
+        meerkat_machine_kernels::test_oracle::KernelValue,
+        String,
+        String,
+    ),
+    String,
+> {
+    let edge = crate::machines::mob_machine::WiringEdge::new(
+        crate::machines::mob_machine::AgentIdentity::from(first),
+        crate::machines::mob_machine::AgentIdentity::from(second),
+    );
+    let text = mob_modeled_normalized_json_text(serde_json::json!({
+        "a": edge.a.0.as_str(),
+        "b": edge.b.0.as_str(),
+    }))?;
+    Ok((
+        mob_modeled_named(
+            "WiringEdge",
+            meerkat_machine_kernels::test_oracle::KernelValue::String(text),
+        )?,
+        edge.a.0,
+        edge.b.0,
+    ))
+}
+
+fn mob_modeled_named_from_serde(
+    schema: &MachineSchema,
+    type_name: &str,
+    value: &impl Serialize,
+) -> Result<meerkat_machine_kernels::test_oracle::KernelValue, String> {
+    let json = serde_json::to_value(value)
+        .map_err(|error| format!("cannot serialize `{type_name}`: {error}"))?;
+    let name = meerkat_machine_schema::identity::NamedTypeId::parse(type_name)
+        .map_err(|error| format!("`{type_name}` is not a named type id: {error:?}"))?;
+    mob_modeled_named_kernel_value(schema, &name, &json)
+}
+
+/// The key and edge the lead's wire and unwire of the probe's external peer
+/// carry, built from the same descriptor and DSL types the runtime uses.
+fn mob_modeled_external_peer(
+    schema: &MachineSchema,
+) -> Result<
+    (
+        meerkat_machine_kernels::test_oracle::KernelValue,
+        meerkat_machine_kernels::test_oracle::KernelValue,
+    ),
+    String,
+> {
+    let descriptor = mob_runtime_parity_external_peer();
+    let endpoint = crate::machines::mob_machine::ExternalPeerEndpoint::from(&descriptor);
+    let local = crate::machines::mob_machine::AgentIdentity::from(MOB_PARITY_LEAD);
+    let key =
+        crate::machines::mob_machine::ExternalPeerKey::new(local.clone(), endpoint.name.clone());
+    let edge = crate::machines::mob_machine::ExternalPeerEdge::new(local, endpoint);
+    Ok((
+        mob_modeled_named_from_serde(schema, "ExternalPeerKey", &key)?,
+        mob_modeled_named_from_serde(schema, "ExternalPeerEdge", &edge)?,
+    ))
+}
+
+/// The payload fields a probe pins for its kernel row: the arguments the
+/// probe sends, and the member ids the runtime pre-state holds for them.
+/// Every field left out takes the kernel's typed default
+/// (`GeneratedMachineKernel::default_value`), never a fabricated value.
+fn mob_modeled_probe_arguments(
+    schema: &MachineSchema,
+    before: &MobRuntimeParitySnapshotSummary,
+    probe: MobRuntimeParityProbeInput,
+) -> Result<BTreeMap<&'static str, meerkat_machine_kernels::test_oracle::KernelValue>, String> {
+    use meerkat_machine_kernels::test_oracle::KernelValue;
+
+    let mut pinned = BTreeMap::new();
+    match probe {
+        MobRuntimeParityProbeInput::Spawn => {
+            pinned.insert("agent_identity", mob_modeled_identity(MOB_PARITY_SPAWNED)?);
+            pinned.insert(
+                "agent_runtime_id",
+                mob_modeled_runtime_id(&mob_modeled_runtime_id_text(MOB_PARITY_SPAWNED, 0)?)?,
+            );
+            pinned.insert(
+                "generation",
+                mob_modeled_named("Generation", KernelValue::U64(0))?,
+            );
+        }
+        MobRuntimeParityProbeInput::AuthorizeSpawnProfile => {
+            let crate::machines::mob_machine::MobMachineInput::AuthorizeSpawnProfile {
+                agent_identity,
+                profile_name,
+                model,
+                profile_material_digest,
+                tool_config_digest,
+                skills_digest,
+                provider_params_digest,
+                output_schema_digest,
+                external_addressable,
+                resolved_spec_digest,
+            } = mob_runtime_parity_authorize_spawn_profile_input()
+            else {
+                return Err(
+                    "the AuthorizeSpawnProfile probe no longer submits AuthorizeSpawnProfile"
+                        .to_string(),
+                );
+            };
+            pinned.insert("agent_identity", mob_modeled_identity(&agent_identity.0)?);
+            pinned.insert("profile_name", KernelValue::String(profile_name));
+            pinned.insert("model", KernelValue::String(model));
+            pinned.insert(
+                "profile_material_digest",
+                KernelValue::String(profile_material_digest),
+            );
+            pinned.insert(
+                "tool_config_digest",
+                KernelValue::String(tool_config_digest),
+            );
+            pinned.insert("skills_digest", KernelValue::String(skills_digest));
+            pinned.insert(
+                "provider_params_digest",
+                mob_modeled_optional_string(provider_params_digest),
+            );
+            pinned.insert(
+                "output_schema_digest",
+                mob_modeled_optional_string(output_schema_digest),
+            );
+            pinned.insert(
+                "external_addressable",
+                KernelValue::Bool(external_addressable),
+            );
+            pinned.insert(
+                "resolved_spec_digest",
+                mob_modeled_optional_string(resolved_spec_digest),
+            );
+        }
+        MobRuntimeParityProbeInput::ClassifyMemberWait
+        | MobRuntimeParityProbeInput::ClassifyRetirePendingSpawnDisposition => {
+            pinned.insert("agent_identity", mob_modeled_identity(MOB_PARITY_WORKER)?);
+        }
+        MobRuntimeParityProbeInput::EnsureMember => {
+            pinned.insert("agent_identity", mob_modeled_identity(MOB_PARITY_ENSURED)?);
+        }
+        MobRuntimeParityProbeInput::Reconcile => {
+            pinned.insert(
+                "desired",
+                KernelValue::Set(BTreeSet::from([mob_modeled_identity(
+                    MOB_PARITY_RECONCILED,
+                )?])),
+            );
+            pinned.insert(
+                "retire_stale",
+                KernelValue::Bool(
+                    crate::runtime::reconcile::ReconcileOptions::default().retire_stale,
+                ),
+            );
+        }
+        MobRuntimeParityProbeInput::SubmitWork | MobRuntimeParityProbeInput::CancelAllWork => {
+            pinned.insert("agent_identity", mob_modeled_identity(MOB_PARITY_WORKER)?);
+            if let Some(member) = mob_modeled_live_member(before, MOB_PARITY_WORKER) {
+                pinned.insert(
+                    "agent_runtime_id",
+                    mob_modeled_runtime_id(&member.runtime_id)?,
+                );
+                pinned.insert(
+                    "fence_token",
+                    mob_modeled_named("FenceToken", KernelValue::U64(member.fence_token))?,
+                );
+            }
+            if probe == MobRuntimeParityProbeInput::SubmitWork {
+                pinned.insert("origin", mob_modeled_variant("WorkOrigin", "Internal")?);
+            }
+        }
+        MobRuntimeParityProbeInput::Retire => {
+            pinned.insert("agent_identity", mob_modeled_identity(MOB_PARITY_WORKER)?);
+            if let Some(member) = mob_modeled_live_member(before, MOB_PARITY_WORKER) {
+                pinned.insert(
+                    "agent_runtime_id",
+                    mob_modeled_runtime_id(&member.runtime_id)?,
+                );
+                pinned.insert(
+                    "generation",
+                    mob_modeled_named("Generation", KernelValue::U64(member.generation))?,
+                );
+            }
+        }
+        MobRuntimeParityProbeInput::Respawn => {
+            if let Some(member) = mob_modeled_live_member(before, MOB_PARITY_WORKER) {
+                pinned.insert(
+                    "agent_runtime_id",
+                    mob_modeled_runtime_id(&member.runtime_id)?,
+                );
+            }
+        }
+        MobRuntimeParityProbeInput::WireMembers | MobRuntimeParityProbeInput::UnwireMembers => {
+            let (edge, _, _) = mob_modeled_wiring_edge(MOB_PARITY_WORKER, MOB_PARITY_LEAD)?;
+            pinned.insert("edge", edge);
+        }
+        MobRuntimeParityProbeInput::WireMembersWithTrust => {
+            let (edge, a_identity, b_identity) =
+                mob_modeled_wiring_edge(MOB_PARITY_WORKER, MOB_PARITY_LEAD)?;
+            pinned.insert("edge", edge);
+            pinned.insert("a_identity", mob_modeled_identity(&a_identity)?);
+            pinned.insert("b_identity", mob_modeled_identity(&b_identity)?);
+        }
+        MobRuntimeParityProbeInput::WireExternalPeer
+        | MobRuntimeParityProbeInput::UnwireExternalPeer => {
+            let (key, edge) = mob_modeled_external_peer(schema)?;
+            pinned.insert("key", key);
+            pinned.insert("edge", edge);
+        }
+        // The lead's peer endpoint lives in `member_peer_endpoints`, which the
+        // snapshot does not project: `expected_peer_endpoint` keeps its typed
+        // default.
+        MobRuntimeParityProbeInput::AuthorizeMemberPeerRebind
+        | MobRuntimeParityProbeInput::AuthorizeMemberPeerOverlay
+        | MobRuntimeParityProbeInput::SubscribeAgentEvents => {
+            pinned.insert("agent_identity", mob_modeled_identity(MOB_PARITY_LEAD)?);
+        }
+        MobRuntimeParityProbeInput::SubscribeAllAgentEvents => {
+            pinned.insert(
+                "session_bound_runtimes",
+                mob_modeled_live_runtime_ids(before)?,
+            );
+        }
+        MobRuntimeParityProbeInput::SubscribeMobEvents => {
+            pinned.insert(
+                "channel_capacity",
+                KernelValue::U64(
+                    u64::try_from(MOB_PARITY_EVENT_CHANNEL_CAPACITY)
+                        .map_err(|error| format!("event channel capacity: {error}"))?,
+                ),
+            );
+            pinned.insert(
+                "poll_interval_ms",
+                KernelValue::U64(MOB_PARITY_EVENT_POLL_INTERVAL_MS),
+            );
+            pinned.insert(
+                "session_bound_runtimes",
+                mob_modeled_live_runtime_ids(before)?,
+            );
+        }
+        MobRuntimeParityProbeInput::RecordOperatorActionProvenance => {
+            pinned.insert(
+                "tool_name",
+                KernelValue::String(MOB_PARITY_PROVENANCE_TOOL.to_owned()),
+            );
+            pinned.insert(
+                "audit_invocation_id",
+                mob_modeled_optional_string(Some(MOB_PARITY_AUDIT_INVOCATION.to_owned())),
+            );
+        }
+        MobRuntimeParityProbeInput::SetSpawnPolicy => {
+            // `set_spawn_policy(None)` submits `SetSpawnPolicy { enabled: false }`.
+            pinned.insert("enabled", KernelValue::Bool(false));
+        }
+        MobRuntimeParityProbeInput::ForceCancel => {
+            pinned.insert(
+                "agent_identity",
+                mob_modeled_identity(MOB_PARITY_CANCEL_TARGET)?,
+            );
+        }
+        MobRuntimeParityProbeInput::ConcludeObjective => {
+            pinned.insert("member_id", mob_modeled_identity(MOB_PARITY_WORKER)?);
+            pinned.insert(
+                "outcome",
+                KernelValue::String(MOB_PARITY_OBJECTIVE_OUTCOME.to_owned()),
+            );
+            if let Some(objective_id) = mob_modeled_kickoff_objective(before, MOB_PARITY_WORKER) {
+                pinned.insert("objective_id", KernelValue::String(objective_id));
+            }
+        }
+        // The run seed RunFlow submits comes from the flow definition, and the
+        // run and work ids CancelFlow and CancelWork name are minted by the
+        // runtime: the snapshot carries none of them, so they keep their typed
+        // defaults. The other probes send no payload, or have no input.
+        MobRuntimeParityProbeInput::RunFlow
+        | MobRuntimeParityProbeInput::CancelFlow
+        | MobRuntimeParityProbeInput::CancelWork
+        | MobRuntimeParityProbeInput::RetireAll
+        | MobRuntimeParityProbeInput::Stop
+        | MobRuntimeParityProbeInput::Resume
+        | MobRuntimeParityProbeInput::Complete
+        | MobRuntimeParityProbeInput::Reset
+        | MobRuntimeParityProbeInput::Destroy
+        | MobRuntimeParityProbeInput::Shutdown
+        | MobRuntimeParityProbeInput::ExternalTurn
+        | MobRuntimeParityProbeInput::InternalTurn => {}
+    }
+    Ok(pinned)
+}
+
+/// The kernel input of a probe: the probe's pinned arguments, and the
+/// kernel's typed default for every other declared field.
 fn mob_modeled_kernel_input(
+    kernel: &meerkat_machine_kernels::test_oracle::GeneratedMachineKernel,
     schema: &MachineSchema,
     before: &MobRuntimeParitySnapshotSummary,
     probe: MobRuntimeParityProbeInput,
 ) -> Result<meerkat_machine_kernels::test_oracle::KernelInput, String> {
     let input_variant = mob_runtime_parity_probe_input_variant(probe)
         .ok_or_else(|| format!("{probe:?} has no MobMachine input variant"))?;
-    let variant = meerkat_machine_schema::identity::InputVariantId::parse(input_variant.as_str())
-        .expect("valid variant slug");
-    let input_variant = schema
+    let variant = InputVariantId::parse(input_variant.as_str())
+        .map_err(|error| format!("`{}` is not an input id: {error:?}", input_variant.as_str()))?;
+    let declared = schema
         .inputs
         .variant_named(&variant)
-        .map_err(|err| err.to_string())?;
+        .map_err(|error| error.to_string())?;
+    let mut pinned = mob_modeled_probe_arguments(schema, before, probe)?;
     let mut fields = BTreeMap::new();
-
-    for field in &input_variant.fields {
-        let value = match field.name.as_str() {
-            "agent_identity" => match probe {
-                MobRuntimeParityProbeInput::Spawn => {
-                    mob_modeled_named_string("\"parity-spawn\"".to_string())
-                }
-                _ => mob_modeled_named_string(mob_modeled_representative_identity_value(before)),
-            },
-            "agent_runtime_id" => match probe {
-                MobRuntimeParityProbeInput::Spawn => {
-                    mob_modeled_named_string(mob_modeled_spawn_runtime_value("parity-spawn", 0))
-                }
-                _ => mob_modeled_named_string(mob_modeled_representative_runtime_value(before)),
-            },
-            "fence_token" => {
-                let value = match probe {
-                    MobRuntimeParityProbeInput::Spawn => 1,
-                    MobRuntimeParityProbeInput::Respawn => {
-                        before.representative_fence_token.unwrap_or_default() + 1
-                    }
-                    _ => before.representative_fence_token.unwrap_or_default(),
-                };
-                meerkat_machine_kernels::test_oracle::KernelValue::U64(value)
-            }
-            "generation" => {
-                let value = match probe {
-                    MobRuntimeParityProbeInput::Spawn => 0,
-                    MobRuntimeParityProbeInput::Respawn => 0,
-                    _ => 0,
-                };
-                meerkat_machine_kernels::test_oracle::KernelValue::U64(value)
-            }
-            "work_id" => mob_modeled_named_string("\"<work-id>\"".to_string()),
-            _ => mob_modeled_default_kernel_value(&field.ty),
-        };
-        fields.insert(
-            field.name.clone(),
-            mob_modeled_coerce_value_to_type(&field.ty, value),
-        );
+    for field in &declared.fields {
+        let value = pinned
+            .remove(field.name.as_str())
+            .unwrap_or_else(|| kernel.default_value(&field.ty));
+        fields.insert(field.name.clone(), value);
     }
-
+    if let Some(stray) = pinned.keys().next() {
+        return Err(format!(
+            "{probe:?} pins `{stray}`, which `{variant}` does not declare"
+        ));
+    }
     Ok(meerkat_machine_kernels::test_oracle::KernelInput { variant, fields })
 }
 
@@ -93178,57 +93535,117 @@ fn mob_modeled_transition_refusal_detail(
     }
 }
 
+/// Effects through which a fired MobMachine transition refuses the probed
+/// call: the handle maps each to a `MobError`
+/// (`agent_event_subscription_authority_from_effects`,
+/// `all_agent_event_subscription_authority_from_effects`). A kernel row that
+/// fires one is a refusal.
+const MOB_MACHINE_REFUSAL_EFFECTS: &[&str] = &[
+    "RejectAgentEventSubscription",
+    "RejectAllAgentEventSubscription",
+];
+
+/// The kernel's answer to a refused transition, as the verdict reads it.
+fn mob_modeled_kernel_refusal(
+    error: &meerkat_machine_kernels::test_oracle::TransitionRefusal,
+) -> MobKernelOutcome {
+    match error {
+        meerkat_machine_kernels::test_oracle::TransitionRefusal::NoMatchingTransition {
+            ..
+        } => MobKernelOutcome::NoMatchingTransition,
+        meerkat_machine_kernels::test_oracle::TransitionRefusal::EvaluationError {
+            reason, ..
+        } => match reason
+            .strip_prefix("unknown helper `")
+            .and_then(|rest| rest.strip_suffix('`'))
+        {
+            Some(helper) => MobKernelOutcome::UnknownNativeHelper {
+                helper: helper.to_owned(),
+            },
+            None => MobKernelOutcome::Refused {
+                detail: mob_modeled_transition_refusal_detail(error),
+            },
+        },
+        other => MobKernelOutcome::Refused {
+            detail: mob_modeled_transition_refusal_detail(other),
+        },
+    }
+}
+
+fn mob_modeled_unevaluated_schema_report(
+    before: Option<&MobRuntimeParitySnapshotSummary>,
+    detail: String,
+) -> MobModeledStateSchemaReport {
+    MobModeledStateSchemaReport {
+        outcome_kind: MobModeledStateOutcomeKind::Err,
+        after: mob_modeled_summary_from_runtime_snapshot(before),
+        detail: detail.clone(),
+        result_summary: None,
+        kernel: MobKernelOutcome::NotEvaluated { detail },
+    }
+}
+
 fn mob_modeled_schema_report(
     schema: &MachineSchema,
     runtime: &MobRuntimeParityInvocationReport,
     probe: MobRuntimeParityProbeInput,
 ) -> MobModeledStateSchemaReport {
     let Some(before) = runtime.before.as_ref() else {
-        return MobModeledStateSchemaReport {
-            outcome_kind: MobModeledStateOutcomeKind::Err,
-            after: None,
-            detail: "missing runtime pre-state".to_string(),
-            result_summary: None,
-        };
+        return mob_modeled_unevaluated_schema_report(
+            None,
+            "missing runtime pre-state".to_string(),
+        );
     };
 
-    let state = mob_modeled_kernel_state(schema, before);
-    let input = match mob_modeled_kernel_input(schema, before, probe) {
-        Ok(input) => input,
-        Err(detail) => {
-            return MobModeledStateSchemaReport {
-                outcome_kind: MobModeledStateOutcomeKind::Err,
-                after: None,
-                detail,
-                result_summary: None,
-            };
-        }
-    };
-
-    match meerkat_machine_kernels::test_oracle::GeneratedMachineKernel::new(
+    let kernel = meerkat_machine_kernels::test_oracle::GeneratedMachineKernel::new(
         meerkat_machine_kernels::generated::mob::schema(),
-    )
-    .transition(&state, &input)
-    {
-        Ok(outcome) => MobModeledStateSchemaReport {
-            outcome_kind: MobModeledStateOutcomeKind::Ok,
-            after: Some(mob_modeled_summary_from_kernel_state(
-                schema,
-                &outcome.next_state,
-                before,
-            )),
-            detail: outcome.transition.as_str().to_string(),
-            result_summary: mob_modeled_schema_result_summary(before, probe),
-        },
+    );
+    let prepared = mob_modeled_kernel_state(&kernel, schema, before).and_then(|state| {
+        mob_modeled_kernel_input(&kernel, schema, before, probe).map(|input| (state, input))
+    });
+    let (state, input) = match prepared {
+        Ok(prepared) => prepared,
+        Err(detail) => return mob_modeled_unevaluated_schema_report(Some(before), detail),
+    };
+
+    match kernel.transition(&state, &input) {
+        Ok(outcome) => {
+            let refusal_effect = outcome
+                .effects
+                .iter()
+                .map(|effect| effect.variant.as_str())
+                .find(|variant| MOB_MACHINE_REFUSAL_EFFECTS.contains(variant))
+                .map(str::to_owned);
+            let refused = refusal_effect.is_some();
+            MobModeledStateSchemaReport {
+                outcome_kind: if refused {
+                    MobModeledStateOutcomeKind::Err
+                } else {
+                    MobModeledStateOutcomeKind::Ok
+                },
+                after: Some(mob_modeled_summary_from_kernel_state(
+                    schema,
+                    &outcome.next_state,
+                    before,
+                )),
+                detail: outcome.transition.as_str().to_string(),
+                result_summary: if refused {
+                    None
+                } else {
+                    mob_modeled_schema_result_summary(before, probe)
+                },
+                kernel: MobKernelOutcome::Transition {
+                    transition: outcome.transition.as_str().to_string(),
+                    refusal_effect,
+                },
+            }
+        }
         Err(error) => MobModeledStateSchemaReport {
             outcome_kind: MobModeledStateOutcomeKind::Err,
-            after: Some(MobModeledStateSummary {
-                phase: before.phase.clone(),
-                formal_fields: before.formal_available_fields.clone(),
-                unavailable_fields: before.formal_unavailable_fields.clone(),
-            }),
+            after: mob_modeled_summary_from_runtime_snapshot(Some(before)),
             detail: mob_modeled_transition_refusal_detail(&error),
             result_summary: None,
+            kernel: mob_modeled_kernel_refusal(&error),
         },
     }
 }
@@ -93285,6 +93702,7 @@ async fn write_mob_runtime_modeled_state_audit_report(path: PathBuf) -> MobModel
     let surface_only_inputs = mob_schema_input_variant_set(&schema.surface_only_inputs);
     let runtime_internal_inputs = mob_runtime_internal_input_variant_set();
     let mut rows = Vec::new();
+    let mut observations = Vec::new();
 
     for phase in [
         MobRuntimeParityPhase::Running,
@@ -93315,14 +93733,11 @@ async fn write_mob_runtime_modeled_state_audit_report(path: PathBuf) -> MobModel
                             "required runtime probe missing; non-surface-only omissions fail closed"
                                 .to_string(),
                     },
-                    schema: MobModeledStateSchemaReport {
-                        outcome_kind: MobModeledStateOutcomeKind::Err,
-                        after: None,
-                        detail:
-                            "required runtime probe missing; non-surface-only omissions fail closed"
-                                .to_string(),
-                        result_summary: None,
-                    },
+                    schema: mob_modeled_unevaluated_schema_report(
+                        None,
+                        "required runtime probe missing; non-surface-only omissions fail closed"
+                            .to_string(),
+                    ),
                 });
                 continue;
             };
@@ -93331,20 +93746,23 @@ async fn write_mob_runtime_modeled_state_audit_report(path: PathBuf) -> MobModel
                 .await
                 .expect("mob runtime modeled-state probe should succeed");
             let schema_report = mob_modeled_schema_report(&schema, &runtime, probe);
-            let runtime_report = mob_modeled_runtime_report(&runtime);
-            let differing_keys =
-                mob_modeled_differing_keys(&runtime_report.after, &schema_report.after);
-            let aligned = runtime_report.outcome_kind == schema_report.outcome_kind
-                && differing_keys.is_empty();
+            let observation = MobParityObservation::new(
+                "modeled-state".to_string(),
+                phase,
+                input_variant,
+                &runtime,
+                &schema_report,
+            );
 
             rows.push(MobModeledStateRowReport {
                 phase: phase.schema_name().to_string(),
                 input_variant: input_variant_name.to_string(),
-                aligned,
-                differing_keys,
-                runtime: runtime_report,
+                aligned: observation.aligned(),
+                differing_keys: observation.differing_keys.clone(),
+                runtime: mob_modeled_runtime_report(&runtime),
                 schema: schema_report,
             });
+            observations.push(observation);
         }
     }
 
@@ -93374,6 +93792,7 @@ async fn write_mob_runtime_modeled_state_audit_report(path: PathBuf) -> MobModel
         generated_at: Utc::now().to_rfc3339(),
         summary,
         rows,
+        observations,
     };
 
     std::fs::write(
@@ -93383,6 +93802,792 @@ async fn write_mob_runtime_modeled_state_audit_report(path: PathBuf) -> MobModel
     .expect("write modeled-state audit report");
 
     report
+}
+
+/// One kernel row of the audits next to the runtime outcome it models.
+#[derive(Debug, Clone)]
+struct MobParityObservation {
+    source: String,
+    phase: MobRuntimeParityPhase,
+    input: SchemaMobMachineInputVariant,
+    runtime: MobRuntimeParityOutcomeKind,
+    kernel: MobKernelOutcome,
+    differing_keys: Vec<String>,
+}
+
+impl MobParityObservation {
+    fn new(
+        source: String,
+        phase: MobRuntimeParityPhase,
+        input: SchemaMobMachineInputVariant,
+        runtime: &MobRuntimeParityInvocationReport,
+        schema: &MobModeledStateSchemaReport,
+    ) -> Self {
+        let runtime_report = mob_modeled_runtime_report(runtime);
+        Self {
+            source,
+            phase,
+            input,
+            runtime: runtime.outcome_kind,
+            kernel: schema.kernel.clone(),
+            differing_keys: mob_modeled_differing_keys(&runtime_report.after, &schema.after),
+        }
+    }
+
+    /// The runtime and the kernel agree: both took the call and leave the
+    /// same projected after-state, or both refused it (no enabled
+    /// transition, or a transition that emits a machine-owned refusal).
+    fn aligned(&self) -> bool {
+        self.differing_keys.is_empty()
+            && matches!(
+                (self.runtime, &self.kernel),
+                (
+                    MobRuntimeParityOutcomeKind::Ok,
+                    MobKernelOutcome::Transition {
+                        refusal_effect: None,
+                        ..
+                    }
+                ) | (
+                    MobRuntimeParityOutcomeKind::Err,
+                    MobKernelOutcome::NoMatchingTransition
+                        | MobKernelOutcome::Transition {
+                            refusal_effect: Some(_),
+                            ..
+                        }
+                )
+            )
+    }
+
+    fn describe(&self) -> String {
+        format!(
+            "{} row {} {}: runtime {:?}, kernel {:?}, differing keys {:?}",
+            self.source,
+            self.phase.schema_name(),
+            self.input.as_str(),
+            self.runtime,
+            self.kernel,
+            self.differing_keys
+        )
+    }
+}
+
+/// What the kernel answers on a probed (phase, input) cell whose runtime
+/// outcome it does not reproduce.
+#[derive(Debug, Clone, Copy)]
+enum AcceptedMobKernelOutcome {
+    /// The kernel fires `transition`; its projected after-state differs from
+    /// the runtime's on exactly `differing_keys` (`phase` included).
+    Transition {
+        transition: &'static str,
+        differing_keys: &'static [&'static str],
+    },
+    /// The kernel fires `transition`, which emits the machine-owned refusal
+    /// `effect`, and differs from the runtime's after-state on exactly
+    /// `differing_keys`.
+    RefusalEffect {
+        transition: &'static str,
+        effect: &'static str,
+        differing_keys: &'static [&'static str],
+    },
+    /// No transition is enabled.
+    NoMatchingTransition,
+    /// The kernel refuses because the test oracle does not implement this
+    /// native helper; it must be listed in `KERNEL_UNIMPLEMENTED_NATIVE_HELPERS`.
+    UnknownNativeHelper(&'static str),
+}
+
+impl AcceptedMobKernelOutcome {
+    fn matches(self, observation: &MobParityObservation) -> bool {
+        let keys_match = |expected: &[&str]| {
+            observation.differing_keys.len() == expected.len()
+                && expected
+                    .iter()
+                    .all(|key| observation.differing_keys.iter().any(|found| found == key))
+        };
+        match (self, &observation.kernel) {
+            (
+                Self::Transition {
+                    transition,
+                    differing_keys,
+                },
+                MobKernelOutcome::Transition {
+                    transition: found,
+                    refusal_effect: None,
+                },
+            ) => found == transition && keys_match(differing_keys),
+            (
+                Self::RefusalEffect {
+                    transition,
+                    effect,
+                    differing_keys,
+                },
+                MobKernelOutcome::Transition {
+                    transition: found,
+                    refusal_effect: Some(found_effect),
+                },
+            ) => found == transition && found_effect == effect && keys_match(differing_keys),
+            (Self::NoMatchingTransition, MobKernelOutcome::NoMatchingTransition) => true,
+            (
+                Self::UnknownNativeHelper(helper),
+                MobKernelOutcome::UnknownNativeHelper { helper: found },
+            ) => found == helper,
+            _ => false,
+        }
+    }
+}
+
+/// A runtime/kernel disagreement the audit accepts on one probed
+/// (phase, input) cell, with the reason it is accepted. A cell whose
+/// observation differs from its entry, or an entry no observation shows,
+/// fails the audit.
+struct AcceptedMobParityDifference {
+    phase: MobRuntimeParityPhase,
+    input: SchemaMobMachineInputVariant,
+    runtime: MobRuntimeParityOutcomeKind,
+    kernel: AcceptedMobKernelOutcome,
+    reason: &'static str,
+}
+
+/// The projected fields the runtime's spawn ladder changes and a single
+/// kernel input does not: the new member's runtime id, fence token and
+/// kickoff objective.
+const MOB_PARITY_SPAWN_LADDER_KEYS: &[&str] = &[
+    "live_runtime_ids",
+    "member_kickoff_objective_ids",
+    "objective_owner_ids",
+    "runtime_fence_tokens",
+];
+
+const MOB_PARITY_IDENTITY_PROJECTION_GAP: &str = "projection gap: every arm the runtime takes \
+     binds the member through identity_to_runtime, which the runtime snapshot does not project, \
+     so no arm is enabled from the projected pre-state";
+const MOB_PARITY_ADAPTIVE_NATIVE_GAP: &str = "kernel gap: the arm's adaptive_lifecycle_drained \
+     guard calls mob_machine_adaptive_lifecycle_drained, which the test oracle does not implement \
+     (KERNEL_UNIMPLEMENTED_NATIVE_HELPERS)";
+const MOB_PARITY_SESSION_BOUND_NATIVE_GAP: &str = "kernel gap: the session_bound_runtimes_match \
+     guard calls mob_machine_session_bound_live_runtime_ids_match, which the test oracle does not \
+     implement (KERNEL_UNIMPLEMENTED_NATIVE_HELPERS)";
+const MOB_PARITY_EXTERNAL_PEER_NATIVE_GAP: &str = "kernel gap: the external_peer_key_matches_edge \
+     guard calls mob_machine_external_peer_key_matches_edge, which the test oracle does not \
+     implement (KERNEL_UNIMPLEMENTED_NATIVE_HELPERS)";
+const MOB_PARITY_MISSING_MEMBER_GAP: &str = "projection gap: identity_to_runtime is not \
+     projected, so the kernel takes the missing-member arm and refuses the subscription the \
+     runtime grants";
+
+/// Every probed (phase, input) cell on which the kernel does not reproduce
+/// the runtime today, and why. Each entry names the exact kernel outcome, so
+/// implementing a native helper or projecting another field turns its entry
+/// stale and fails the audit until the entry goes.
+const ACCEPTED_MOB_PARITY_DIFFERENCES: &[AcceptedMobParityDifference] = &[
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Running,
+        input: SchemaMobMachineInputVariant::CommitSpawnMembership,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::NoMatchingTransition,
+        reason: "single-input row: the spawn probe drives the spawn-exec ladder, and every \
+                 CommitSpawnMembership arm needs the spawn_exec_phase that BeginSpawnExec opens; \
+                 spawn_exec_phase is not projected",
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Running,
+        input: SchemaMobMachineInputVariant::EnsureMember,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::Transition {
+            transition: "EnsureMemberRunningMissing",
+            differing_keys: MOB_PARITY_SPAWN_LADDER_KEYS,
+        },
+        reason: "single-input row: EnsureMember records the desired member and requests its \
+                 spawn; the runtime then spawns it through inputs the row does not replay. To \
+                 confirm at validation: the differing keys, read from the 2026-10-30 reports",
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Running,
+        input: SchemaMobMachineInputVariant::Reconcile,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::Transition {
+            transition: "ReconcileRunning",
+            differing_keys: MOB_PARITY_SPAWN_LADDER_KEYS,
+        },
+        reason: "single-input row: Reconcile computes the members to spawn; the runtime then \
+                 spawns the missing member through inputs the row does not replay. To confirm \
+                 at validation: the differing keys, read from the 2026-10-30 reports",
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Running,
+        input: SchemaMobMachineInputVariant::SubmitWork,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::NoMatchingTransition,
+        reason: MOB_PARITY_IDENTITY_PROJECTION_GAP,
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Running,
+        input: SchemaMobMachineInputVariant::CancelFlow,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::NoMatchingTransition,
+        reason: "projection gap: CancelFlowRunning needs the run in run_status, which the \
+                 runtime snapshot does not project",
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Running,
+        input: SchemaMobMachineInputVariant::Retire,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::NoMatchingTransition,
+        reason: MOB_PARITY_IDENTITY_PROJECTION_GAP,
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Stopped,
+        input: SchemaMobMachineInputVariant::Retire,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::NoMatchingTransition,
+        reason: MOB_PARITY_IDENTITY_PROJECTION_GAP,
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Completed,
+        input: SchemaMobMachineInputVariant::Retire,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::NoMatchingTransition,
+        reason: "intended: MobMachine has no Retire arm from Completed, and the handle answers \
+                 the retire of an absent incarnation Ok without submitting a machine input \
+                 (`Retirement is idempotent` in handle.rs)",
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Running,
+        input: SchemaMobMachineInputVariant::Respawn,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::Transition {
+            transition: "RespawnRunning",
+            differing_keys: MOB_PARITY_SPAWN_LADDER_KEYS,
+        },
+        reason: "single-input row: RespawnRunning only exposes the pending spawn; the runtime \
+                 then retires the member and spawns its next generation through inputs the row \
+                 does not replay. To confirm at validation: the differing keys, read from the \
+                 2026-10-30 reports",
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Running,
+        input: SchemaMobMachineInputVariant::RetireAll,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
+            "mob_machine_adaptive_lifecycle_drained",
+        ),
+        reason: MOB_PARITY_ADAPTIVE_NATIVE_GAP,
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Stopped,
+        input: SchemaMobMachineInputVariant::RetireAll,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
+            "mob_machine_adaptive_lifecycle_drained",
+        ),
+        reason: MOB_PARITY_ADAPTIVE_NATIVE_GAP,
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Completed,
+        input: SchemaMobMachineInputVariant::RetireAll,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
+            "mob_machine_adaptive_lifecycle_drained",
+        ),
+        reason: MOB_PARITY_ADAPTIVE_NATIVE_GAP,
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Running,
+        input: SchemaMobMachineInputVariant::WireMembers,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::UnknownNativeHelper("mob_machine_wiring_edge_a"),
+        reason: "kernel gap: the edge_endpoints_seated_or_held guard calls \
+                 mob_machine_wiring_edge_a, which the test oracle does not implement \
+                 (KERNEL_UNIMPLEMENTED_NATIVE_HELPERS)",
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Running,
+        input: SchemaMobMachineInputVariant::WireMembersWithTrust,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
+            "mob_machine_wiring_edge_matches_members",
+        ),
+        reason: "kernel gap: the edge_matches_members guard calls \
+                 mob_machine_wiring_edge_matches_members, which the test oracle does not \
+                 implement (KERNEL_UNIMPLEMENTED_NATIVE_HELPERS)",
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Running,
+        input: SchemaMobMachineInputVariant::WireExternalPeer,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
+            "mob_machine_external_peer_key_matches_edge",
+        ),
+        reason: MOB_PARITY_EXTERNAL_PEER_NATIVE_GAP,
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Running,
+        input: SchemaMobMachineInputVariant::UnwireExternalPeer,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
+            "mob_machine_external_peer_key_matches_edge",
+        ),
+        reason: MOB_PARITY_EXTERNAL_PEER_NATIVE_GAP,
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Running,
+        input: SchemaMobMachineInputVariant::AuthorizeMemberPeerRebind,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::NoMatchingTransition,
+        reason: MOB_PARITY_IDENTITY_PROJECTION_GAP,
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Running,
+        input: SchemaMobMachineInputVariant::AuthorizeMemberPeerOverlay,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::NoMatchingTransition,
+        reason: MOB_PARITY_IDENTITY_PROJECTION_GAP,
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Running,
+        input: SchemaMobMachineInputVariant::CancelAllWork,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::NoMatchingTransition,
+        reason: MOB_PARITY_IDENTITY_PROJECTION_GAP,
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Running,
+        input: SchemaMobMachineInputVariant::Stop,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
+            "mob_machine_adaptive_lifecycle_drained",
+        ),
+        reason: "kernel gap: StopRunning's adaptive_lifecycle_drained guard calls \
+                 mob_machine_adaptive_lifecycle_drained (KERNEL_UNIMPLEMENTED_NATIVE_HELPERS); \
+                 once it is implemented the single-input row still lacks the \
+                 BeginPlacedCompletionLifecycleQuiesce step the public stop submits first",
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Running,
+        input: SchemaMobMachineInputVariant::Complete,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
+            "mob_machine_adaptive_lifecycle_drained",
+        ),
+        reason: "kernel gap: CompleteRunning's adaptive_lifecycle_drained guard calls \
+                 mob_machine_adaptive_lifecycle_drained (KERNEL_UNIMPLEMENTED_NATIVE_HELPERS); \
+                 once it is implemented the single-input row still lacks the \
+                 BeginPlacedCompletionLifecycleQuiesce step the public complete submits first",
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Running,
+        input: SchemaMobMachineInputVariant::Reset,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
+            "mob_machine_adaptive_lifecycle_drained",
+        ),
+        reason: MOB_PARITY_ADAPTIVE_NATIVE_GAP,
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Stopped,
+        input: SchemaMobMachineInputVariant::Reset,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
+            "mob_machine_adaptive_lifecycle_drained",
+        ),
+        reason: MOB_PARITY_ADAPTIVE_NATIVE_GAP,
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Completed,
+        input: SchemaMobMachineInputVariant::Reset,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
+            "mob_machine_adaptive_lifecycle_drained",
+        ),
+        reason: MOB_PARITY_ADAPTIVE_NATIVE_GAP,
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Running,
+        input: SchemaMobMachineInputVariant::Destroy,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
+            "mob_machine_adaptive_lifecycle_drained",
+        ),
+        reason: MOB_PARITY_ADAPTIVE_NATIVE_GAP,
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Stopped,
+        input: SchemaMobMachineInputVariant::Destroy,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
+            "mob_machine_adaptive_lifecycle_drained",
+        ),
+        reason: MOB_PARITY_ADAPTIVE_NATIVE_GAP,
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Completed,
+        input: SchemaMobMachineInputVariant::Destroy,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
+            "mob_machine_adaptive_lifecycle_drained",
+        ),
+        reason: MOB_PARITY_ADAPTIVE_NATIVE_GAP,
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Running,
+        input: SchemaMobMachineInputVariant::SubscribeAgentEvents,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::RefusalEffect {
+            transition: "SubscribeAgentEventsMissingMemberRunning",
+            effect: "RejectAgentEventSubscription",
+            differing_keys: &[],
+        },
+        reason: MOB_PARITY_MISSING_MEMBER_GAP,
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Stopped,
+        input: SchemaMobMachineInputVariant::SubscribeAgentEvents,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::RefusalEffect {
+            transition: "SubscribeAgentEventsMissingMemberStopped",
+            effect: "RejectAgentEventSubscription",
+            differing_keys: &[],
+        },
+        reason: MOB_PARITY_MISSING_MEMBER_GAP,
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Running,
+        input: SchemaMobMachineInputVariant::SubscribeAllAgentEvents,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
+            "mob_machine_session_bound_live_runtime_ids_match",
+        ),
+        reason: MOB_PARITY_SESSION_BOUND_NATIVE_GAP,
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Stopped,
+        input: SchemaMobMachineInputVariant::SubscribeAllAgentEvents,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
+            "mob_machine_session_bound_live_runtime_ids_match",
+        ),
+        reason: MOB_PARITY_SESSION_BOUND_NATIVE_GAP,
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Completed,
+        input: SchemaMobMachineInputVariant::SubscribeAllAgentEvents,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
+            "mob_machine_session_bound_live_runtime_ids_match",
+        ),
+        reason: MOB_PARITY_SESSION_BOUND_NATIVE_GAP,
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Running,
+        input: SchemaMobMachineInputVariant::SubscribeMobEvents,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
+            "mob_machine_session_bound_live_runtime_ids_match",
+        ),
+        reason: MOB_PARITY_SESSION_BOUND_NATIVE_GAP,
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Stopped,
+        input: SchemaMobMachineInputVariant::SubscribeMobEvents,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
+            "mob_machine_session_bound_live_runtime_ids_match",
+        ),
+        reason: MOB_PARITY_SESSION_BOUND_NATIVE_GAP,
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Completed,
+        input: SchemaMobMachineInputVariant::SubscribeMobEvents,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
+            "mob_machine_session_bound_live_runtime_ids_match",
+        ),
+        reason: MOB_PARITY_SESSION_BOUND_NATIVE_GAP,
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Running,
+        input: SchemaMobMachineInputVariant::Shutdown,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
+            "mob_machine_adaptive_lifecycle_drained",
+        ),
+        reason: MOB_PARITY_ADAPTIVE_NATIVE_GAP,
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Stopped,
+        input: SchemaMobMachineInputVariant::Shutdown,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
+            "mob_machine_adaptive_lifecycle_drained",
+        ),
+        reason: MOB_PARITY_ADAPTIVE_NATIVE_GAP,
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Completed,
+        input: SchemaMobMachineInputVariant::Shutdown,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::UnknownNativeHelper(
+            "mob_machine_adaptive_lifecycle_drained",
+        ),
+        reason: MOB_PARITY_ADAPTIVE_NATIVE_GAP,
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Running,
+        input: SchemaMobMachineInputVariant::ForceCancel,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::NoMatchingTransition,
+        reason: MOB_PARITY_IDENTITY_PROJECTION_GAP,
+    },
+    AcceptedMobParityDifference {
+        phase: MobRuntimeParityPhase::Stopped,
+        input: SchemaMobMachineInputVariant::Resume,
+        runtime: MobRuntimeParityOutcomeKind::Ok,
+        kernel: AcceptedMobKernelOutcome::NoMatchingTransition,
+        reason: "projection gap: ResumeStopped needs the Stop intent the public stop records in \
+                 placed_completion_lifecycle_intent, which the runtime snapshot does not project",
+    },
+];
+
+/// Probed inputs for which no kernel row fires a transition today, and why.
+/// Every other probed input must have at least one kernel row that fires a
+/// transition (one emitting a machine-owned refusal counts: the kernel
+/// answered), so an oracle that refuses or matches nothing cannot pass. An
+/// entry whose input does fire a transition is stale.
+const MOB_PARITY_KERNEL_LIVENESS_GAPS: &[(SchemaMobMachineInputVariant, &str)] = &[
+    (
+        SchemaMobMachineInputVariant::CommitSpawnMembership,
+        "only Running has arms, and they need the spawn_exec_phase BeginSpawnExec opens, which \
+         the single-input row does not replay",
+    ),
+    (
+        SchemaMobMachineInputVariant::SubmitWork,
+        MOB_PARITY_IDENTITY_PROJECTION_GAP,
+    ),
+    (
+        SchemaMobMachineInputVariant::CancelFlow,
+        "only Running has an arm, and it needs run_status, which the snapshot does not project",
+    ),
+    (
+        SchemaMobMachineInputVariant::Retire,
+        MOB_PARITY_IDENTITY_PROJECTION_GAP,
+    ),
+    (
+        SchemaMobMachineInputVariant::RetireAll,
+        MOB_PARITY_ADAPTIVE_NATIVE_GAP,
+    ),
+    (
+        SchemaMobMachineInputVariant::WireMembers,
+        "only Running has arms, and they call mob_machine_wiring_edge_a, which the test oracle \
+         does not implement",
+    ),
+    (
+        SchemaMobMachineInputVariant::WireMembersWithTrust,
+        "only Running has arms, and they call mob_machine_wiring_edge_matches_members, which the \
+         test oracle does not implement",
+    ),
+    (
+        SchemaMobMachineInputVariant::WireExternalPeer,
+        MOB_PARITY_EXTERNAL_PEER_NATIVE_GAP,
+    ),
+    (
+        SchemaMobMachineInputVariant::UnwireExternalPeer,
+        MOB_PARITY_EXTERNAL_PEER_NATIVE_GAP,
+    ),
+    (
+        SchemaMobMachineInputVariant::AuthorizeMemberPeerRebind,
+        MOB_PARITY_IDENTITY_PROJECTION_GAP,
+    ),
+    (
+        SchemaMobMachineInputVariant::AuthorizeMemberPeerOverlay,
+        MOB_PARITY_IDENTITY_PROJECTION_GAP,
+    ),
+    (
+        SchemaMobMachineInputVariant::CancelAllWork,
+        MOB_PARITY_IDENTITY_PROJECTION_GAP,
+    ),
+    (
+        SchemaMobMachineInputVariant::Stop,
+        MOB_PARITY_ADAPTIVE_NATIVE_GAP,
+    ),
+    (
+        SchemaMobMachineInputVariant::Resume,
+        "only Stopped has an arm, and it needs the Stop intent in \
+         placed_completion_lifecycle_intent, which the snapshot does not project",
+    ),
+    (
+        SchemaMobMachineInputVariant::Complete,
+        MOB_PARITY_ADAPTIVE_NATIVE_GAP,
+    ),
+    (
+        SchemaMobMachineInputVariant::Reset,
+        MOB_PARITY_ADAPTIVE_NATIVE_GAP,
+    ),
+    (
+        SchemaMobMachineInputVariant::Destroy,
+        MOB_PARITY_ADAPTIVE_NATIVE_GAP,
+    ),
+    (
+        SchemaMobMachineInputVariant::SubscribeAllAgentEvents,
+        MOB_PARITY_SESSION_BOUND_NATIVE_GAP,
+    ),
+    (
+        SchemaMobMachineInputVariant::SubscribeMobEvents,
+        MOB_PARITY_SESSION_BOUND_NATIVE_GAP,
+    ),
+    (
+        SchemaMobMachineInputVariant::Shutdown,
+        MOB_PARITY_ADAPTIVE_NATIVE_GAP,
+    ),
+    (
+        SchemaMobMachineInputVariant::ForceCancel,
+        MOB_PARITY_IDENTITY_PROJECTION_GAP,
+    ),
+];
+
+/// The fail-closed verdict over every kernel row of both audits. Returns
+/// one line per failure; empty means the kernel answered every probed row
+/// the way the runtime did or the way an accepted difference says it does.
+fn mob_parity_audit_failures(observations: &[MobParityObservation]) -> Vec<String> {
+    let mut failures = Vec::new();
+
+    for (index, accepted) in ACCEPTED_MOB_PARITY_DIFFERENCES.iter().enumerate() {
+        let cell = format!("{:?} {}", accepted.phase, accepted.input.as_str());
+        if accepted.reason.trim().is_empty() {
+            failures.push(format!("accepted difference {cell} has no written reason"));
+        }
+        if ACCEPTED_MOB_PARITY_DIFFERENCES[..index]
+            .iter()
+            .any(|earlier| earlier.phase == accepted.phase && earlier.input == accepted.input)
+        {
+            failures.push(format!("accepted difference {cell} is listed twice"));
+        }
+        if let AcceptedMobKernelOutcome::UnknownNativeHelper(helper) = accepted.kernel
+            && !meerkat_machine_kernels::test_oracle::KERNEL_UNIMPLEMENTED_NATIVE_HELPERS
+                .iter()
+                .any(|(gap, _)| *gap == helper)
+        {
+            failures.push(format!(
+                "accepted difference {cell} blames `{helper}`, which \
+                 KERNEL_UNIMPLEMENTED_NATIVE_HELPERS does not list"
+            ));
+        }
+    }
+
+    let mut used = vec![false; ACCEPTED_MOB_PARITY_DIFFERENCES.len()];
+    for observation in observations {
+        if let MobKernelOutcome::Refused { detail } | MobKernelOutcome::NotEvaluated { detail } =
+            &observation.kernel
+        {
+            failures.push(format!(
+                "{}: the kernel row failed outside what the audit accepts: {detail}",
+                observation.describe()
+            ));
+            continue;
+        }
+        if observation.aligned() {
+            continue;
+        }
+        let accepted = ACCEPTED_MOB_PARITY_DIFFERENCES.iter().position(|accepted| {
+            accepted.phase == observation.phase && accepted.input == observation.input
+        });
+        match accepted {
+            Some(index)
+                if ACCEPTED_MOB_PARITY_DIFFERENCES[index].runtime == observation.runtime
+                    && ACCEPTED_MOB_PARITY_DIFFERENCES[index]
+                        .kernel
+                        .matches(observation) =>
+            {
+                used[index] = true;
+            }
+            Some(index) => failures.push(format!(
+                "{}: differs from its accepted difference (runtime {:?}, kernel {:?})",
+                observation.describe(),
+                ACCEPTED_MOB_PARITY_DIFFERENCES[index].runtime,
+                ACCEPTED_MOB_PARITY_DIFFERENCES[index].kernel
+            )),
+            None => failures.push(format!(
+                "{}: the runtime and the kernel disagree and no accepted difference covers it",
+                observation.describe()
+            )),
+        }
+    }
+    for (accepted, was_used) in ACCEPTED_MOB_PARITY_DIFFERENCES
+        .iter()
+        .zip(used.iter().copied())
+    {
+        if !was_used {
+            failures.push(format!(
+                "stale accepted difference {:?} {}: no kernel row shows runtime {:?} with kernel \
+                 {:?}",
+                accepted.phase,
+                accepted.input.as_str(),
+                accepted.runtime,
+                accepted.kernel
+            ));
+        }
+    }
+
+    let mut observed = BTreeSet::new();
+    let mut fired = BTreeSet::new();
+    for observation in observations {
+        observed.insert(observation.input);
+        if matches!(observation.kernel, MobKernelOutcome::Transition { .. }) {
+            fired.insert(observation.input);
+        }
+    }
+    for input in &observed {
+        let gap = MOB_PARITY_KERNEL_LIVENESS_GAPS
+            .iter()
+            .find(|(gap_input, _)| gap_input == input);
+        match (fired.contains(input), gap) {
+            (true, Some(_)) => failures.push(format!(
+                "stale liveness gap {}: a kernel row fires one of its transitions",
+                input.as_str()
+            )),
+            (false, None) => failures.push(format!(
+                "no kernel row fires a {} transition, and MOB_PARITY_KERNEL_LIVENESS_GAPS gives \
+                 no reason",
+                input.as_str()
+            )),
+            (true, None) | (false, Some(_)) => {}
+        }
+    }
+    for (input, reason) in MOB_PARITY_KERNEL_LIVENESS_GAPS {
+        if reason.trim().is_empty() {
+            failures.push(format!(
+                "liveness gap {} has no written reason",
+                input.as_str()
+            ));
+        }
+        if !observed.contains(input) {
+            failures.push(format!(
+                "stale liveness gap {}: no kernel row probes it",
+                input.as_str()
+            ));
+        }
+    }
+
+    failures
+}
+
+/// Every distinct kernel row, one line each, to rebuild the accepted
+/// differences from when the audit fails.
+fn mob_parity_observation_table(observations: &[MobParityObservation]) -> String {
+    observations
+        .iter()
+        .map(|observation| {
+            format!(
+                "{:<9} {:<38} runtime {:?} kernel {:?} differing keys {:?}",
+                observation.phase.schema_name(),
+                observation.input.as_str(),
+                observation.runtime,
+                observation.kernel,
+                observation.differing_keys
+            )
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 async fn write_mob_runtime_full_parity_audit_report(path: PathBuf) -> MobRuntimeParityAuditReport {
