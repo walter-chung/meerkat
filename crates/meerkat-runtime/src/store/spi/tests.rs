@@ -1148,11 +1148,13 @@ async fn a_dispatch_on_a_stopped_writer_waits_for_the_reacquire() {
     );
 }
 
-// Unrun until the candidate's validation. A re-acquire whose acquire answers
-// a store error restores nothing: the dispatch reads the window closed at
-// once, without waiting out its bound, and the realm is not poisoned.
+// Unrun until the candidate's validation. A re-acquire whose acquires keep
+// answering a store error restores nothing, and nothing shows another
+// writer: the dispatch tries again every renew interval until its bound
+// (13 s here), then reads the window closed, and the realm is not poisoned.
+// Before, the dispatch read the window closed at the first failed attempt.
 #[tokio::test(start_paused = true)]
-async fn a_dispatch_on_a_stopped_writer_refuses_when_the_reacquire_fails() {
+async fn a_dispatch_on_a_stopped_writer_retries_a_failing_reacquire_until_its_bound() {
     use meerkat_core::host_store::SelfFence;
     let timing = FenceTiming::try_new(Duration::from_secs(1), Duration::from_secs(3)).unwrap();
     let host = Arc::new(TestHost::with_timing(timing));
@@ -1169,12 +1171,48 @@ async fn a_dispatch_on_a_stopped_writer_refuses_when_the_reacquire_fails() {
     );
     let started = tokio::time::Instant::now();
     let window = realm.dispatch_window().await;
-    assert!(!window.is_open(), "the re-acquire failed: {window:?}");
+    let waited = started.elapsed();
+    assert!(!window.is_open(), "no re-acquire succeeded: {window:?}");
     assert!(window.renew_failed);
     assert!(
-        started.elapsed() < Duration::from_millis(100),
-        "a failed re-acquire refuses at once: {:?}",
-        started.elapsed()
+        waited >= realm.dispatch_wait_bound()
+            && waited < realm.dispatch_wait_bound() + Duration::from_millis(100),
+        "a failing re-acquire is tried again until the bound: {waited:?}"
+    );
+    assert!(realm.realm_poisoned().is_none());
+}
+
+// Unrun until the candidate's validation. A re-acquire whose first acquires
+// answer a store error and a later one succeeds resumes the writer: the
+// dispatch tries again until then, and reads the window open well within its
+// bound. Before, the dispatch read the window closed at the first failed
+// attempt.
+#[tokio::test(start_paused = true)]
+async fn a_dispatch_proceeds_once_a_later_reacquire_succeeds() {
+    use meerkat_core::host_store::SelfFence;
+    let timing = FenceTiming::try_new(Duration::from_secs(1), Duration::from_secs(3)).unwrap();
+    let host = Arc::new(TestHost::with_timing(timing));
+    let (realm, _store) = open(&host).await;
+    {
+        let mut faults = host.faults.lock().unwrap();
+        faults.renew_unavailable = 1;
+        faults.acquire_unavailable = 3;
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !realm.lease_is_live(),
+        "the failed renew stopped the writer"
+    );
+    let started = tokio::time::Instant::now();
+    let window = realm.dispatch_window().await;
+    let waited = started.elapsed();
+    assert!(
+        window.is_open(),
+        "a later re-acquire resumed the writer: {window:?}"
+    );
+    assert!(
+        waited < Duration::from_secs(5),
+        "within a few renew intervals: {waited:?}"
     );
     assert!(realm.realm_poisoned().is_none());
 }
