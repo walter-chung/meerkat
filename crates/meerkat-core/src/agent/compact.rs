@@ -1154,6 +1154,10 @@ pub(crate) struct RequestBound {
     /// The shortened results, in request order. Empty when the bound only
     /// gave back whole the results an earlier bound of the request shortened.
     pub(crate) results: Vec<BoundedToolResult>,
+    /// The index of the first request row that carries a shortened result;
+    /// `None` when the request carries none. The rows before it are the
+    /// request's own rows as composed.
+    pub(crate) first_shortened_row: Option<usize>,
     /// The limit that set the share each result keeps.
     pub(crate) axis: ToolResultBoundAxis,
     /// Each shortened result as the request carries it, with the whole result
@@ -1281,6 +1285,7 @@ pub(crate) fn bound_open_run_tool_results_for_request(
     };
     let mut messages = Vec::with_capacity(request.len());
     let mut shortened = Vec::new();
+    let mut first_shortened_row = None;
     let mut pairs = Vec::new();
     let mut changed = false;
     for (offset, message) in request.iter().enumerate() {
@@ -1315,6 +1320,7 @@ pub(crate) fn bound_open_run_tool_results_for_request(
             changed |= bounded != *result;
             pairs.push((bounded.clone(), source.clone()));
             shortened.push(fact);
+            first_shortened_row = first_shortened_row.or(Some(offset));
             row.push(bounded);
         }
         messages.push(Message::ToolResults {
@@ -1327,6 +1333,7 @@ pub(crate) fn bound_open_run_tool_results_for_request(
         bound: RequestBound {
             run_id: run_id.clone(),
             results: shortened,
+            first_shortened_row,
             axis,
             whole: pairs,
         },
@@ -4174,6 +4181,11 @@ mod tests {
                 total_bytes: 600_000,
             }]
         );
+        assert_eq!(
+            bound.first_shortened_row,
+            Some(4),
+            "the result's row is the first the request carries shortened"
+        );
         let Some(AgentEvent::ToolResultsBoundedForRequest {
             run_id: announced_run,
             results: announced,
@@ -4359,18 +4371,25 @@ mod tests {
             call_row(Some(&run), "tc_1"),
             result_row("tc_1", 300_000),
         ];
-        let bounded = bound_open_run_tool_results_for_request(
+        let BoundedRunRequest {
+            messages: bounded,
+            bound,
+        } = bound_open_run_tool_results_for_request(
             &request,
             &run,
             over_cap(700_000, 100_000),
             &[],
         )
-        .expect("the over-cap request is bounded")
-        .messages;
+        .expect("the over-cap request is bounded");
         assert_eq!(
             bounded[2], request[2],
             "the earlier run's result is untouched"
         );
         assert_ne!(bounded[6], request[6], "the open run's result is bounded");
+        assert_eq!(
+            bound.first_shortened_row,
+            Some(6),
+            "the first row the request carries shortened is the open run's"
+        );
     }
 }

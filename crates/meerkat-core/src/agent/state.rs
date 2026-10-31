@@ -92,10 +92,10 @@ struct LlmRetryRequest<'a> {
     /// the whole result it was cut from, so a bound against a model
     /// fallback's limits cuts from the whole results again.
     bounded_whole: Vec<(crate::types::ToolResult, crate::types::ToolResult)>,
-    /// Whether the request the provider answers carried the open run's tool
-    /// results shortened; a bound against a model fallback's limits sets it
-    /// anew.
-    request_bounded: &'a mut bool,
+    /// The first row of the request the provider answers that carries one of
+    /// the open run's tool results shortened (`None` when it carries every
+    /// result whole); a bound against a model fallback's limits sets it anew.
+    request_shortened_from: &'a mut Option<usize>,
     tools: Arc<[Arc<ToolDef>]>,
     max_tokens: u32,
     temperature: Option<f32>,
@@ -277,10 +277,17 @@ type TurnEffectsFuture<'a> =
 /// This is the commit-time binding rule applied one door earlier: a mismatch
 /// here can only mean a lying or confused adapter, and no shape of it implies
 /// the committed transcript is corrupt.
+///
+/// `shortened_from` is the first row of the request that carried one of the
+/// open run's tool results shortened for that request only. A claim past it
+/// anchors a prefix the transcript never held (the transcript keeps the
+/// results whole), so it is dropped unreported: it can never bind, and its
+/// discard would describe a fault that does not exist.
 fn promote_cache_breakpoint_claims(
     claims: &[crate::ProviderCacheBreakpointClaim],
     active_provider: crate::Provider,
     active_model: &str,
+    shortened_from: Option<usize>,
 ) -> (
     Vec<crate::AuthoredCacheBreakpoint>,
     Vec<crate::DiscardedCacheBreakpoint>,
@@ -302,6 +309,11 @@ fn promote_cache_breakpoint_claims(
                 &breakpoint,
                 crate::CacheBreakpointDiscardReason::EvidenceUnusable { detail },
             ));
+            continue;
+        }
+        if shortened_from.is_some_and(|row| {
+            breakpoint.boundary().message_count() > u64::try_from(row).unwrap_or(u64::MAX)
+        }) {
             continue;
         }
         authored.push(breakpoint);
@@ -841,11 +853,13 @@ struct CallingLlmTurnCtx<'a> {
     responding_operation_id: &'a mut Option<crate::OperationId>,
     model_operation_sequence: &'a mut u64,
     deferred_tool_failure: &'a mut Option<crate::session::DeferredToolBatchFailure>,
-    /// Whether the model request this boundary sent carried the open run's
-    /// own tool results shortened for it only: its answer then anchors no
-    /// input projection. Set when the request is sent, and again when a
-    /// retry sends it bounded anew.
-    request_bounded: bool,
+    /// The first row of the model request this boundary sent that carried
+    /// one of the open run's own tool results shortened for it only, or
+    /// `None` when it carried every result whole. The answer to a shortened
+    /// request anchors no input projection, and a provider cache breakpoint
+    /// past that row is not promoted. Set when the request is sent, and again
+    /// when a retry sends it bounded anew.
+    request_shortened_from: Option<usize>,
     turn_count: u32,
     tool_call_count: u32,
 }
@@ -3322,7 +3336,7 @@ where
             event_tx,
             messages,
             mut bounded_whole,
-            request_bounded,
+            request_shortened_from,
             tools,
             max_tokens,
             temperature,
@@ -3524,7 +3538,7 @@ where
                 }) = bounded
                 {
                     fallback_bound_notice = bound.notice().map(Box::new);
-                    *request_bounded = fallback_bound_notice.is_some();
+                    *request_shortened_from = bound.first_shortened_row;
                     bounded_whole = std::mem::take(&mut bound.whole);
                     fallback_unbounded_request = Some(Box::new(UnboundedRequest {
                         pressure: request_pressure,
@@ -6723,7 +6737,7 @@ where
                         responding_operation_id: &mut responding_operation_id,
                         model_operation_sequence: &mut model_operation_sequence,
                         deferred_tool_failure: &mut deferred_tool_failure,
-                        request_bounded: false,
+                        request_shortened_from: None,
                         turn_count,
                         tool_call_count,
                     };
@@ -8382,13 +8396,13 @@ where
         }
         // The request goes out bounded: announce the bound, record that the
         // transcript holds content a request could not carry (the next run's
-        // first request would carry it whole again), and keep the answer from
+        // first request would carry it whole again), keep the answer from
         // anchoring the input projection, since its count understates the
-        // transcript.
+        // transcript, and keep the cache breakpoints past its first shortened
+        // row from being promoted, since the transcript never held their
+        // prefix.
         let bound = unbounded_request.map(|unbounded| unbounded.bound);
-        ctx.request_bounded = bound
-            .as_ref()
-            .is_some_and(|bound| !bound.results.is_empty());
+        ctx.request_shortened_from = bound.as_ref().and_then(|bound| bound.first_shortened_row);
         if let Some(notice) = bound
             .as_ref()
             .and_then(crate::agent::compact::RequestBound::notice)
@@ -8405,7 +8419,7 @@ where
                 event_tx: ctx.event_tx,
                 messages: request_messages,
                 bounded_whole,
-                request_bounded: &mut ctx.request_bounded,
+                request_shortened_from: &mut ctx.request_shortened_from,
                 tools: call_tool_defs,
                 max_tokens: prepared.effective_max_tokens,
                 temperature: prepared.effective_temperature,
@@ -8895,7 +8909,10 @@ where
         // so a breakpoint the provider authored over it is evidence about that
         // request only. It can never bind to the transcript, and reporting it
         // as a discarded anchor on every turn would describe a fault that does
-        // not exist. Such claims are therefore not promoted at all.
+        // not exist. Such claims are therefore not promoted at all. A request
+        // that carried the open run's results shortened differs from the
+        // transcript only from its first shortened row: the claims past it
+        // are dropped the same way, and the ones before it bind as usual.
         let turn_cache_breakpoint_claims = if self.requests_carry_output_schema_projection() {
             &[][..]
         } else {
@@ -8906,6 +8923,7 @@ where
                 turn_cache_breakpoint_claims,
                 response_provider,
                 &response_model,
+                ctx.request_shortened_from,
             );
         // A FAULT MAY ONLY TERMINALIZE WHAT IT ACTUALLY INVALIDATES.
         //
@@ -9058,7 +9076,7 @@ where
                 turn_usage.presented_tokens(),
                 response_provider,
                 &response_model,
-                ctx.request_bounded,
+                ctx.request_shortened_from.is_some(),
             );
             self.session.record_turn_usage(turn_usage);
             self.run_request_usage.push(turn_usage.clone());
@@ -11453,8 +11471,12 @@ mod tests {
         // A lying adapter yields untrustworthy EVIDENCE, not a corrupt
         // transcript: the claim is discarded and the turn's content still
         // commits. The proof is never promoted into durable evidence.
-        let (authored, discarded) =
-            promote_cache_breakpoint_claims(&[claim], crate::Provider::OpenAI, "active-model");
+        let (authored, discarded) = promote_cache_breakpoint_claims(
+            &[claim],
+            crate::Provider::OpenAI,
+            "active-model",
+            None,
+        );
         assert!(
             authored.is_empty(),
             "a mismatched claim must never be promoted into durable evidence"
