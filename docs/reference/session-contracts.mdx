@@ -968,7 +968,7 @@ dispatch, at a commit or while a suspended run waits), the live session is
 torn down, the store keeps the session's inputs as last committed for that
 owner, and every waiter in this process of an input the store keeps gets
 `RequeuedAcrossStop` too (see
-[Durable runs](/guides/durable-runs#one-writer-fenced)).
+[Durable runs](/guides/durable-runs#one-writer%2C-fenced)).
 
 A run the gap suspended before its first round commit starts again from its
 inputs under the same run id, and publishes `run_started` again with no
