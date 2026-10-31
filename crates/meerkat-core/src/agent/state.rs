@@ -16886,6 +16886,81 @@ mod tests {
         );
     }
 
+    /// A host that swaps in a durable snapshot of the session (a live sync
+    /// after a transcript edit) reloads the cadence the snapshot carries: the
+    /// input anchor and the context refusal the agent held for the replaced
+    /// transcript are gone, the next check sees neither, and the next answer
+    /// anchors again on the snapshot's transcript.
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn a_reloaded_cadence_drops_stale_transcript_facts_and_the_next_answer_anchors_again() {
+        let client = Arc::new(PresentingClient::refusing(5_000, &["second"]));
+        let compactor = Arc::new(RecordingDiscardingCompactor::new(|_| false));
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .compactor(compactor.clone())
+            .build_standalone(client, Arc::new(NoTools), Arc::new(NoopStore))
+            .await;
+
+        agent.run("first".into()).await.unwrap();
+        assert!(agent.run("second".into()).await.is_err(), "refused");
+        assert!(agent.compaction_cadence.last_answered_request.is_some());
+        assert!(
+            agent
+                .compaction_cadence
+                .last_context_refusal_boundary_index
+                .is_some()
+        );
+
+        // The host edits the stored transcript, which drops both facts from
+        // the stored cadence, and syncs the live agent to it.
+        let mut snapshot = agent.session().clone();
+        let edited_at = snapshot
+            .messages()
+            .iter()
+            .position(
+                |message| matches!(message, Message::User(user) if user.text_content() == "second"),
+            )
+            .expect("the refused prompt");
+        snapshot
+            .commit_transcript_rewrite(
+                crate::TranscriptRewriteSelection::MessageRange {
+                    start: edited_at,
+                    end: edited_at + 1,
+                },
+                vec![Message::User(UserMessage::text("edited".to_string()))],
+                crate::TranscriptRewriteReason::new("unit-test"),
+                Some("unit-test".to_string()),
+                None,
+            )
+            .unwrap();
+        *agent.session_mut() = snapshot;
+        agent.reload_compaction_cadence().unwrap();
+        assert_eq!(agent.compaction_cadence.last_answered_request, None);
+        assert_eq!(
+            agent.compaction_cadence.last_context_refusal_boundary_index,
+            None
+        );
+
+        agent.run("third".into()).await.unwrap();
+        let check = compactor.at(2);
+        assert_eq!(check.projected_input_tokens, None, "no stale anchor");
+        assert_eq!(
+            check.last_context_refusal_boundary_index, None,
+            "no stale refusal"
+        );
+        let anchor = agent
+            .compaction_cadence
+            .last_answered_request
+            .clone()
+            .expect("the answer anchors again");
+        assert_eq!(
+            anchor.transcript_rows,
+            u64::try_from(agent.session().messages().len() - 1).unwrap(),
+            "on the snapshot's transcript, before its answer"
+        );
+        assert_eq!(persisted_cadence(agent.session()), agent.compaction_cadence);
+    }
+
     #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn reused_session_follow_up_run_can_compact_before_first_llm_call() {
