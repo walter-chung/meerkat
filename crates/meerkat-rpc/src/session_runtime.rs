@@ -10077,6 +10077,27 @@ impl SessionRuntime {
                 data: None,
             })?;
 
+        // A runtime-loop dispatch holds the turn-finalization boundary, so a
+        // live actor ahead of the store holds the image of a run that ended
+        // without a boundary commit (failed, cancelled, or suspended at a
+        // store fence gap). Bring it to the committed image with the session
+        // service's own turn-entry step before choosing a path, as the other
+        // runtime executors' turn entry does: the cold rebuild below assumes
+        // no live actor, and over one it would fail the dispatch, which the
+        // runtime counts as a failed stage attempt. An actor that cannot be
+        // synchronized is discarded by the same step.
+        if pending_session.is_none()
+            && matches!(
+                llm_reconfigure_boundary,
+                LlmReconfigureBoundaryOwnership::AlreadyHeld
+            )
+        {
+            let _discarded = self
+                .service
+                .synchronize_live_session_for_runtime_turn(session_id)
+                .await
+                .map_err(session_error_to_rpc)?;
+        }
         if pending_session.is_none()
             && !self
                 .live_session_is_stale(session_id, llm_reconfigure_boundary.staleness_position())
