@@ -356,6 +356,45 @@ them.
   cadence the agent's session carries; a host that swaps in a durable
   snapshot of the session calls it after the swap.
 
+- `meerkat`: `GovernedHelperAdmissionFence::create_idempotent_after_owner_change`
+  (async), the host-level retry of a governed helper admission's
+  contention. The fence runs inside the WorkGraph store call and never
+  waits: while another writer holds the publication its check excludes
+  owner changes on (a reservation of the writer that has not published), or
+  an owner change is in progress there, it refuses as `Unavailable` with
+  nothing run or committed. The new form makes the keyed create through a
+  new fence for each attempt (a fence serves one attempt), always the same
+  idempotent `create_idempotent_with_fence`. It waits, outside every lock
+  and store transaction, and tries again after an attempt that refused for
+  one of these: on the prepared path, an exclusion refused while the
+  publication named such a change or hold; on the dispatch and entered
+  paths, a refusal to rebuild (`ReprepareRequired`), which, as Core's
+  waiting step forms do, it waits out for a change or hold in progress, or
+  with none named after a 1 ms pause. Every wait is `wait_after_stale_read`
+  of one `OwnerChangeChurn` per call (2 s and three free rebuilds, clamped
+  to the `budget_remaining` passed, which the caller reads right before the
+  call: the deadline is armed after the first attempt). A fence built with
+  `from_dispatch` waits with that dispatch context's own churn
+  (`ToolDispatchContext::owner_change_churn`), so its waits also report to
+  the host's operation refusal observer on the call's surface, without an
+  operation id; prepared and entered fences trace their waits only. The
+  caller awaits it holding no lock or store transaction of its own. It
+  answers success, `Denied` and every other `Unavailable` (a refusal to
+  rebuild inside the prepared path's own exclusion, clock or custody
+  unavailable, a poisoned publication) at once, and returns the last
+  `Unavailable` once a wait is not settled. `refusal()` on the fence it was
+  called on reads the answered attempt's reason, and that fence serves this
+  one admission. Each wait is traced at site `helper_admission`, and
+  dropping the future commits nothing an attempt did not commit itself.
+
+- `meerkat-core`: `EnteredDispatchOperation::work_authorization`, the
+  entered operation's governed work context: the dispatch's own, as
+  `GovernedDispatchOperation::work_authorization` returns it. Its
+  `owner_change_in_progress` names an owner change in progress on the
+  work's publication, or another actor's hold of the work owners'
+  exclusion, which a step refused to rebuild waits for; the waiting helper
+  admission reads it for entered fences.
+
 ### Fixed
 
 - `meerkat-core` and `meerkat-session`: one tool result no longer carries a
@@ -654,6 +693,23 @@ them.
   it, with no migration step. A schedule deleted before this release keeps
   the set it was deleted with: a deleted schedule is never revised, and a
   repeated delete changes nothing.
+
+- `meerkat-core`, `meerkat`, `meerkat-authorization`: the documentation of
+  `OwnerChangeChurn::wait_after_stale_read` said that a genuine
+  `Unavailable` is final and never waits, without naming the `Unavailable`
+  that is not genuine. A governed helper admission fence's contention (its
+  refusal while another writer holds the publication, or an owner change is
+  in progress there) is retryable at the host level: a new fence and the
+  same idempotent create after that wait, taken outside every lock and
+  store transaction, as
+  `GovernedHelperAdmissionFence::create_idempotent_after_owner_change` does.
+  The wait's documentation and `HelperAdmissionRefusal::Unavailable` now say
+  so. `AdmittedWorkPolicyOwner` and `OperationPolicyOwner` now say that an
+  `Unavailable` answer is final where it is asked (at a controller's model
+  request it ends the run with nothing sent), so an owner never answers its
+  own transient lock contention that way: it waits briefly for its own lock
+  or reads an immutable snapshot, and keeps `Unavailable` for when it
+  genuinely cannot answer.
 
 ### Upgrade notes
 
