@@ -1654,14 +1654,18 @@ async fn a_foreign_batch_at_the_reacquire_refuses_the_dispatch() {
 
 /// The wait is bounded: a re-acquire whose listing takes 12 s outlasts the
 /// 5 s dispatch wait bound, so the direct turn fails with a retryable store
-/// error after that one wait, its run stopped and suspended there. Another
+/// error after that one wait, its run stopped and suspended there. The
+/// session keeps its live session, as a suspended runtime run does. Another
 /// direct turn asked while the fence stays closed is refused busy
 /// (`SESSION_BUSY`): no run starts beside the suspended one while it is
 /// marked resumable. The re-acquire itself goes on and resumes the writer
 /// once its listing answers; the runtime then settles the stopped run,
-/// which never asks the model again, and the next direct turn completes.
-/// Before, the turn failed only after a second wait, its closing save's, and
-/// its terminal's write met the gap, which left the session repair-blocked.
+/// which never asks the model again, and the next direct turn completes on
+/// the live session, brought to the settled store. Before, the turn failed
+/// only after a second wait, its closing save's, and its terminal's write
+/// met the gap, which left the session repair-blocked; and a failed direct
+/// turn discarded its live session, so the next direct turn, which recovers
+/// no stored session itself, could not run.
 #[tokio::test]
 async fn a_direct_turn_fails_retryably_when_its_reacquire_outlasts_the_bound() {
     let run = run_with_stop(
@@ -1674,6 +1678,14 @@ async fn a_direct_turn_fails_retryably_when_its_reacquire_outlasts_the_bound() {
     assert_eq!(run.dispatched, 1, "the call ran once, before the stop");
     assert_eq!(run.model_requests, 1, "no model call after the stop");
     assert!(!run.poisoned_after, "a slow listing poisons nothing");
+    assert!(
+        run.row
+            .service
+            .has_live_session_under_runtime_turn_boundary(&run.row.session_id)
+            .await
+            .expect("read the session's live authority"),
+        "the suspended direct run's live session stays, for its settlement and the next turn"
+    );
     let during_the_gap = run.row.run_direct_turn("probe again").await;
     assert!(
         matches!(
