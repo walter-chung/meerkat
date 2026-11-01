@@ -330,13 +330,16 @@ impl CopilotAliases {
 /// items it accepts). A group is aliased only when it is complete on both
 /// sides, k = m: walking the completed items in their given order, each
 /// takes the first terminal item of its group, in output order, that no
-/// earlier one took. Pairing inside a complete group is immaterial: the
-/// blocks are lowered from the terminal items, each keeping its own id and
-/// ciphertext, and every pairing covers the same terminal ids, which carry
-/// the same visible content, so the coverage checks and the streamed-id
-/// reconciliation in the client give the same result. Array positions are
-/// never used to decide which items are the same; inside a complete group
-/// they only pick one of these equivalent pairings.
+/// earlier one took. Pairing inside a complete group is immaterial to the
+/// verdicts and the committed blocks: the blocks are lowered from the
+/// terminal items, each keeping its own id and ciphertext, and every pairing
+/// covers the same terminal ids, which carry the same visible content, so
+/// the coverage checks in the client give the same verdicts. The live events
+/// match too, unless a streamed id of one item is the terminal id of
+/// another, where the client's one-pass streamed-id reconciliation depends
+/// on the slot order. Array positions are never used to decide which items
+/// are the same; inside a complete group they only pick one of these
+/// pairings.
 ///
 /// Otherwise a re-identified completed item is refused, by its group:
 /// - m = 0: as a re-identification with different content when an unclaimed
@@ -429,7 +432,7 @@ pub(crate) fn copilot_item_aliases<'a>(
             };
             let Some(target) = target else {
                 return Err(malformed(format!(
-                    "terminal Responses output has no one-to-one match for re-identified completed {kind} item '{done_id}' ({group_completed} completed, {} terminal items with the same content)",
+                    "terminal Responses output has no one-to-one match for re-identified completed {kind} item '{done_id}' ({group_completed} re-identified completed and {} unclaimed terminal items with the same content)",
                     group_terminal.len()
                 )));
             };
@@ -1320,6 +1323,43 @@ mod tests {
         );
     }
 
+    /// A group with a kept member: the completed item whose id the terminal
+    /// output keeps is neither aliased nor counted, so its re-identified twin
+    /// is aliased to the one unclaimed terminal item, and the response is
+    /// accepted.
+    #[tokio::test]
+    async fn copilot_group_with_a_kept_member_aliases_only_the_reidentified_one() {
+        let (events, output) = copilot_reasoning_response(
+            &[("B", None), ("C", None)],
+            &[("B", None), ("J", None)],
+            false,
+        );
+        let completed = events
+            .iter()
+            .filter(|event| event["type"] == "response.output_item.done")
+            .map(|event| &event["item"]);
+        let aliases = copilot_item_aliases(&output, completed).unwrap();
+        assert_eq!(aliases.terminal_id("reasoning", "B"), "B", "B is kept");
+        assert_eq!(aliases.terminal_id("reasoning", "C"), "J", "C is now J");
+        let (client, server) = copilot_stub(events).await;
+        let result = LlmClientAdapter::new(Arc::new(client), "gpt-5.5".into())
+            .stream_response(&[], &[], 1000, None, None)
+            .await;
+        server.abort();
+        let result =
+            result.unwrap_or_else(|error| panic!("the kept item and its twin both match: {error}"));
+        assert_eq!(
+            result.blocks(),
+            lower_items(&output, Some("resp_1")).unwrap(),
+            "the blocks are the terminal items"
+        );
+        assert_replayed_reasoning(
+            result.into_message(),
+            &[("B", "cipher-B"), ("J", "cipher-J")],
+            "kept member",
+        );
+    }
+
     /// Copilot rotates a function call's item id on every event while its
     /// call_id stays: the call is identified by call_id, with no alias.
     #[tokio::test]
@@ -1538,6 +1578,19 @@ mod tests {
                     ])),
                 ],
                 "no one-to-one match for re-identified completed reasoning item 'C'",
+            ),
+            (
+                "group too few terminal",
+                vec![
+                    done_at(0, &reasoning("B", "Plan", "c1")),
+                    done_at(1, &reasoning("C", "Plan", "c2")),
+                    done_at(2, &reasoning("D", "Plan", "c3")),
+                    completed(json!([
+                        reasoning("I", "Plan", "c4"),
+                        reasoning("J", "Plan", "c5")
+                    ])),
+                ],
+                "no one-to-one match for re-identified completed reasoning item 'D'",
             ),
             (
                 "unrelated reasoning completion",
