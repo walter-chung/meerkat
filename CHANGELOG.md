@@ -380,6 +380,15 @@ them.
 
 ### Fixed
 
+- `rkat`: `rkat run` and `rkat run --resume` with the default `--stdin auto`
+  no longer block forever on a stdin that is not a terminal and stays open
+  without writing, as some launchers, supervisors and agent harnesses pass.
+  The run read stdin to end of file before anything else and printed nothing.
+  Now stdin is read on its own thread; input that has not started within 2 s
+  is skipped with one warning naming `--stdin blob` and `--stdin off`, and
+  input that started is read to end of file as before. `--stdin blob` still
+  waits for end of file and prints one notice after 2 s (see Upgrade notes).
+
 - `meerkat-mob`, `meerkat-rpc`: a mob member's run kept open at a committed
   round, by a requeue stop or a crash, whose input carries a per-turn LLM
   selection (a model, provider, self-hosted server, provider params or auth
@@ -792,6 +801,11 @@ them.
   address space; pages are committed only when touched.
 
 ### Upgrade notes
+
+- A producer that pipes into `rkat run` but starts writing more than 2 s
+  after launch must pass `--stdin blob`; with the default `--stdin auto` that
+  late input is now skipped with a warning. Launchers that hand `rkat run`
+  an open stdin they never write can pass `--stdin off` to skip the wait.
 
 - Size the worker stacks of the runtime your mobs and RPC session runtimes
   run on for the tools you compose: the turns of mob members and of the
