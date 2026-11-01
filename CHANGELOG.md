@@ -59,8 +59,9 @@ them.
   run's stop intent, and an ambient `CancelAfterBoundary` of an attached
   session that holds a run marked resumable, with no run current and no
   unregister draining, records the stop intent on that run.
-  `StartConversationRun` from `Idle`, `Initializing` or `Attached` (a run
-  the runtime did not prepare: a direct turn's) is refused while a run is
+  `StartConversationRun` from `Idle`, `Initializing` or `Attached`, and
+  `StartImmediateAppend` from `Initializing` or `Attached` (a run the
+  runtime did not prepare: a direct turn's) are refused while a run is
   marked resumable, as `Prepare` refuses another run
   (`no_other_resumable_run`); the session service refuses such a direct
   turn with `SessionError::Busy` before it reaches the machine.

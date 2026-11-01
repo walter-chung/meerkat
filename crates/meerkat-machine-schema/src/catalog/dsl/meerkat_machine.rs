@@ -22425,6 +22425,9 @@ macro_rules! meerkat_catalog_machine_dsl {
                 || self.turn_phase == TurnPhase::Cancelled
             }
             guard "run_starts_not_held" { self.run_start_holds == EmptySet }
+            // No direct run starts beside a run marked resumable, as for
+            // StartConversationRun above.
+            guard "no_other_resumable_run" { self.resumable_run_id == None }
             update {
                 self.current_run_id = Some(run_id);
                 if self.run_stop_requested != Some(run_id) {
@@ -22479,6 +22482,9 @@ macro_rules! meerkat_catalog_machine_dsl {
                 || self.turn_phase == TurnPhase::Cancelled
             }
             guard "run_starts_not_held" { self.run_start_holds == EmptySet }
+            // No direct run starts beside a run marked resumable, as for
+            // StartConversationRun above.
+            guard "no_other_resumable_run" { self.resumable_run_id == None }
             update {
                 self.current_run_id = Some(run_id);
                 if self.run_stop_requested != Some(run_id) {
