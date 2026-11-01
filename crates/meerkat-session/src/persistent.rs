@@ -26877,6 +26877,11 @@ mod tests {
     struct ResumeProbe {
         resumed: std::sync::Mutex<Vec<(RunId, RunCheckpointReceipt)>>,
         run_start_input_ids: std::sync::Mutex<Vec<Vec<InputId>>>,
+        /// When set, a resume reports that it entered and then never
+        /// returns, so the resumed run stays in flight until its session
+        /// task is dropped.
+        hold_resume: AtomicBool,
+        resume_entered: tokio::sync::Notify,
     }
 
     fn resume_probes()
@@ -26885,6 +26890,17 @@ mod tests {
             std::sync::Mutex<std::collections::HashMap<SessionId, Arc<ResumeProbe>>>,
         > = std::sync::OnceLock::new();
         PROBES.get_or_init(Default::default)
+    }
+
+    type HeldSessionContexts = std::sync::Mutex<
+        std::collections::HashMap<SessionId, Arc<dyn meerkat_core::handles::SessionContextHandle>>,
+    >;
+
+    /// Session-context handles a dummy agent hands its session task, once,
+    /// by session; none by default.
+    fn held_session_contexts() -> &'static HeldSessionContexts {
+        static HELD: std::sync::OnceLock<HeldSessionContexts> = std::sync::OnceLock::new();
+        HELD.get_or_init(Default::default)
     }
 
     fn probe_resume(session_id: &SessionId) -> Arc<ResumeProbe> {
@@ -26981,6 +26997,10 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push((input.run_id, input.receipt));
+            if probe.hold_resume.load(Ordering::SeqCst) {
+                probe.resume_entered.notify_one();
+                std::future::pending::<()>().await;
+            }
             Ok(RunResult {
                 text: "resumed".to_string(),
                 session_id,
@@ -27192,6 +27212,15 @@ mod tests {
         ) -> Result<(), meerkat_core::error::AgentError> {
             let _ = state;
             Ok(())
+        }
+
+        fn session_context_handle(
+            &self,
+        ) -> Option<Arc<dyn meerkat_core::handles::SessionContextHandle>> {
+            held_session_contexts()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&self.session_id())
         }
 
         fn session_id(&self) -> SessionId {
@@ -42003,6 +42032,219 @@ mod tests {
             whole_blob_tail_run(&runtime_store, &session_id).await,
             None,
             "the ordinary run's tail is discarded before the replay"
+        );
+    }
+
+    /// A resumed WholeBlob run whose host's runtime stops while the run is in
+    /// flight ends with that runtime, as a crash would end it: the apply
+    /// degrades the session's registration and keeps the run's tail, so the
+    /// runtime loop writes nothing more for the run and the next start resumes
+    /// it. Asked while the stopping runtime still drops the session task, a
+    /// lost host runtime check that answered "not ended" sent the turn down a
+    /// resumed run's failure path instead: the tail is kept, but the failure
+    /// stops the executor, and outside a requeue unregister an executor stop
+    /// ends the run's inputs and the inputs queued behind it as stopped (the
+    /// kept resumed run's repair row above), so the next start never runs
+    /// them.
+    ///
+    /// The actor runs on a host's runtime and the apply on another runtime of
+    /// the process. The session task's session-context handle holds the
+    /// task's drop after the turn's result sender went and before its command
+    /// receiver goes, so the apply's check runs in that gap.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_resumed_run_its_host_runtime_stops_under_is_left_to_the_next_start() {
+        use meerkat_core::SessionCheckpointer as _;
+
+        // Reports that the session task's control is being dropped, then holds
+        // the dropping thread until the row releases it, for at most the
+        // bound so a red row cannot hold the stopping runtime for good.
+        struct HeldContextDrop {
+            dropping: std::sync::Mutex<std::sync::mpsc::Sender<()>>,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+
+        impl Drop for HeldContextDrop {
+            fn drop(&mut self) {
+                let _ = self
+                    .dropping
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .send(());
+                let _ = self
+                    .release
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .recv_timeout(std::time::Duration::from_secs(10));
+            }
+        }
+
+        impl meerkat_core::handles::SessionContextHandle for HeldContextDrop {
+            fn context_advanced(
+                &self,
+                _updated_at_ms: u64,
+            ) -> Result<bool, meerkat_core::handles::DslTransitionError> {
+                Ok(true)
+            }
+
+            fn current_watermark_ms(&self) -> u64 {
+                0
+            }
+
+            fn install_observer(
+                &self,
+                _observer: Arc<dyn meerkat_core::handles::SessionContextAdvancedObserver>,
+            ) {
+            }
+
+            fn install_observer_with_baseline(
+                &self,
+                _observer: Arc<dyn meerkat_core::handles::SessionContextAdvancedObserver>,
+            ) -> u64 {
+                0
+            }
+        }
+
+        let wait = std::time::Duration::from_secs(10);
+        // The host's runtime, which creates the resumed run's actor and so
+        // runs its session task, and another runtime of the process, which
+        // outlives it.
+        let host = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("the host's runtime");
+        let process = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("the process's runtime");
+        let runtime_store = Arc::new(InMemoryRuntimeStore::new());
+        let service = process.block_on(async {
+            Arc::new(PersistentSessionService::new(
+                CheckpointerHoldingBuilder::new(DummyBuilder),
+                4,
+                Arc::new(MemoryStore::new()),
+                runtime_store.clone(),
+                memory_blob_store(),
+            ))
+        });
+        let run_id = RunId::new();
+        let mut tail = Session::new();
+        tail.push(Message::User(UserMessage::text(
+            "the run's prompt".to_string(),
+        )));
+        let session_id = tail.id().clone();
+        let (dropping_tx, dropping_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let held: Arc<dyn meerkat_core::handles::SessionContextHandle> =
+            Arc::new(HeldContextDrop {
+                dropping: std::sync::Mutex::new(dropping_tx),
+                release: std::sync::Mutex::new(release_rx),
+            });
+        held_session_contexts()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id.clone(), held);
+        let probe = probe_resume(&session_id);
+        probe.hold_resume.store(true, Ordering::SeqCst);
+
+        // The actor a restart seeds for the run, on the host's runtime. Its
+        // round is checkpointed through its own checkpointer, so the store
+        // holds the run's WholeBlob provisional tail and the actor's receipt
+        // names its own image.
+        host.block_on(async {
+            service
+                .create_session(resume_request(with_resumed_run_cursor(tail, &run_id)))
+                .await
+                .expect("create the resumed run's actor on the host's runtime");
+            let checkpointer = service
+                .live_checkpointers
+                .lock()
+                .await
+                .get(&session_id)
+                .cloned()
+                .and_then(|checkpointer| checkpointer.upgrade())
+                .expect("the created actor registers its checkpointer");
+            let mut round = service
+                .inner
+                .export_session(&session_id)
+                .await
+                .expect("the created actor exports its session");
+            checkpointer
+                .checkpoint_run(&mut round, &run_id, None)
+                .await
+                .expect("the round checkpoints")
+                .expect("a durable session writes a provisional tail");
+        });
+
+        // The runtime dispatches the resumed run from another runtime of the
+        // process; the run reaches the agent and stays in flight. The session
+        // is registered on the service's runtime machine meanwhile, as its
+        // runtime-backed host registers it.
+        let process_handle = process.handle().clone();
+        let applying = {
+            let service = Arc::clone(&service);
+            let session_id = session_id.clone();
+            let run_id = run_id.clone();
+            std::thread::spawn(move || {
+                process_handle.block_on(async move {
+                    service
+                        .apply_runtime_turn(
+                            &session_id,
+                            run_id,
+                            resume_run_request(),
+                            RunApplyBoundary::RunStart,
+                            vec![InputId::new()],
+                        )
+                        .await
+                })
+            })
+        };
+        let adapter = process.block_on(async {
+            tokio::time::timeout(wait, probe.resume_entered.notified())
+                .await
+                .expect("the resumed dispatch reaches the agent");
+            let adapter = service
+                .canonical_runtime_adapter()
+                .expect("the service binds its runtime machine");
+            adapter
+                .register_session(session_id.clone())
+                .await
+                .expect("the session registers on the bound machine");
+            adapter
+        });
+
+        // The host's runtime stops. Its sweep drops the session task: the
+        // turn and its result sender first, then the task's control, which
+        // holds the drop before the command receiver goes. The apply's check
+        // runs in that gap.
+        let stopping = std::thread::spawn(move || host.shutdown_timeout(wait));
+        dropping_rx
+            .recv_timeout(wait)
+            .expect("the stopping runtime drops the session task's control");
+        let applied = applying.join().expect("the apply's thread ends");
+        let executor_stop =
+            matches!(&applied, Err(error) if error.requests_runtime_executor_stop());
+        let reload_required = process
+            .block_on(adapter.durability_reload_required(&session_id))
+            .is_some();
+        let tail_kept =
+            process.block_on(whole_blob_tail_run(&runtime_store, &session_id)) == Some(run_id);
+        drop(release_tx);
+        stopping.join().expect("the host's runtime stops");
+        let resumed = !probe
+            .resumed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty();
+
+        assert_eq!(
+            (resumed, executor_stop, reload_required, tail_kept),
+            (true, false, true, true),
+            "a resumed run whose host runtime stopped under it is left to the next start: the \
+             apply degrades the registration and keeps the tail instead of stopping the \
+             executor, whose stop would end the run's inputs"
         );
     }
 
