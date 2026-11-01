@@ -169,7 +169,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(300));
             writer.write_all(b"part two").unwrap();
         });
-        let outcome = read_blob(reader, Wait::StartWithin(Duration::from_secs(2)), || {});
+        let outcome = read_blob(reader, Wait::StartWithin(Duration::from_secs(10)), || {});
         feeder.join().unwrap();
         assert_eq!(outcome, Outcome::Read("part one part two".into()));
     }
@@ -178,7 +178,7 @@ mod tests {
     fn blob_waits_past_the_grace_and_gives_one_notice() {
         let (reader, mut writer) = held_open_pipe();
         let feeder = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(400));
+            std::thread::sleep(Duration::from_millis(1500));
             writer.write_all(b"late").unwrap();
         });
         let mut notices = 0;

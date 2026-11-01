@@ -12,12 +12,13 @@
 )]
 
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const DEADLINE: Duration = Duration::from_secs(30);
+const REALM: &str = "stdin-held-open";
 
 fn rkat_binary() -> PathBuf {
     if let Some(path) = std::env::var_os("CARGO_BIN_EXE_rkat") {
@@ -58,18 +59,36 @@ fn roots() -> Roots {
     }
 }
 
-/// A stdio MCP server that never answers the handshake.
-fn write_silent_mcp_server(project: &Path) {
-    let stub = project.join("silent-mcp-server.sh");
-    std::fs::write(&stub, "#!/bin/sh\nexec 2>/dev/null\nsleep 600\n").unwrap();
+/// A stdio MCP server that never answers the handshake (`/bin/sleep` with a
+/// marker argument unique to this test process), listed in the realm's own
+/// config document, which is trusted on every platform, unlike a project
+/// `.rkat/mcp.toml`.
+fn write_silent_mcp_server(roots: &Roots) {
+    let realm = roots.state.join(REALM);
+    std::fs::create_dir_all(&realm).unwrap();
     std::fs::write(
-        project.join(".rkat/mcp.toml"),
+        realm.join("config.toml"),
         format!(
-            "[[servers]]\nname = \"silent\"\ncommand = \"/bin/sh\"\nargs = [\"{}\"]\nconnect_timeout_secs = 2\n",
-            stub.display()
+            "[[tools.mcp_servers]]\nname = \"silent\"\ncommand = \"/bin/sleep\"\nargs = [\"{}\"]\nenv = {{}}\nconnect_timeout_secs = 2\naccess = {{ allowed_operations = [\"noop\"] }}\n",
+            silent_server_marker()
         ),
     )
     .unwrap();
+}
+
+/// The silent server's sleep argument: 600 s plus a fraction unique to this
+/// test process, so the test can find and stop exactly its own server.
+fn silent_server_marker() -> String {
+    format!("600.{}", std::process::id())
+}
+
+/// Stop the silent server if it is still running: `rkat` stops it when the
+/// run ends, but a killed `rkat` leaves it behind. Best effort.
+fn stop_silent_server() {
+    let _ = Command::new("pkill")
+        .arg("-f")
+        .arg(format!("sleep {}", silent_server_marker()))
+        .status();
 }
 
 /// Run `rkat` with `extra` root flags and `run_args`, its stdin a pipe this
@@ -83,7 +102,7 @@ fn run_with_held_open_stdin(roots: &Roots, extra: &[&str], run_args: &[&str]) ->
         .env("RKAT_TEST_CLIENT", "1")
         .env_remove("RUST_LOG")
         .arg("--realm")
-        .arg("stdin-held-open")
+        .arg(REALM)
         .arg("--context-root")
         .arg(&roots.project)
         .arg("--state-root")
@@ -111,6 +130,7 @@ fn run_with_held_open_stdin(roots: &Roots, extra: &[&str], run_args: &[&str]) ->
         if started.elapsed() > DEADLINE {
             let _ = child.kill();
             let _ = child.wait();
+            stop_silent_server();
             panic!(
                 "rkat run did not finish within {DEADLINE:?} with stdin held open; stdout:\n{}\nstderr:\n{}",
                 String::from_utf8_lossy(&collect(stdout)),
@@ -185,19 +205,30 @@ fn r2_stdin_off_ignores_a_held_open_stdin() {
 }
 
 /// R3: the same under workspace confinement beside a stdio MCP server that
-/// never answers: the run still finishes and the confinement report prints.
+/// never answers, which `--wait-for-mcp` makes the run wait for, up to its
+/// 2 s connect timeout. The run still finishes; the server was launched and
+/// stayed silent (the timeout, not an early exit, ends the wait); and the
+/// confinement report prints.
 #[test]
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn r3_auto_under_workspace_confinement_with_a_silent_stdio_server() {
     let roots = roots();
-    write_silent_mcp_server(&roots.project);
-    let output =
-        run_with_held_open_stdin(&roots, &["--confinement", "workspace"], &["Reply with OK."]);
+    write_silent_mcp_server(&roots);
+    let output = run_with_held_open_stdin(
+        &roots,
+        &["--confinement", "workspace"],
+        &["--wait-for-mcp", "Reply with OK."],
+    );
+    stop_silent_server();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
         "status={} stderr:\n{stderr}",
         output.status
+    );
+    assert!(
+        stderr.contains("Timed out connecting to 'silent'"),
+        "the silent stdio server was launched and never answered; stderr:\n{stderr}"
     );
     assert!(
         stderr.contains("mcp_stdio confinement: requested workspace"),

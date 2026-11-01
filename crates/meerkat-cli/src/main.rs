@@ -31,8 +31,8 @@ mod mcp;
 mod mob_host;
 mod resume_args;
 mod shutdown_signal;
-#[cfg(feature = "comms")]
 mod stdin_blob;
+#[cfg(feature = "comms")]
 mod stdin_events;
 mod storage_migrate;
 mod stream_renderer;
