@@ -459,7 +459,7 @@
         "description": "Events emitted during agent execution\n\nThese events form the streaming API for consumers.",
         "oneOf": [
           {
-            "description": "Agent run started",
+            "description": "Agent run started.\n\nA durable run that a store fence gap suspended before its first round\ncommit starts again from its inputs, under the same run id, once the\nfence is back, and publishes `run_started` again with no terminal in\nbetween. An observer reads a repeated `run_started` for a run id that\nhas no terminal yet as that run starting over, and drops what it\nreceived for the run id before.",
             "properties": {
               "identity": {
                 "$ref": "#/components/schemas/TranscriptMessageIdentity",
@@ -1994,7 +1994,7 @@
             "type": "object"
           },
           {
-            "description": "A durable run resumed from its run cursor after a restart, in place of\n`run_started`: the same run continues under its run id, and its\nterminal follows as for any run.\n\nAt `tools_pending` the run takes the round's staged assistant message\nas the model's response and dispatches its tool calls again under\ntheir call ids; nothing is published again for the staged message (no\n`tool_call_requested`, no `turn_completed`). At `awaiting_model` the\nrun continues with its next model call, after the last committed\nround.",
+            "description": "A durable run resumed from its run cursor, in place of `run_started`:\nafter a restart, or in the same process once a store fence gap that\nsuspended it ended. The same run continues under its run id, and its\nterminal follows as for any run.\n\nAt `tools_pending` the run takes the round's staged assistant message\nas the model's response and dispatches its tool calls again under\ntheir call ids; nothing is published again for the staged message (no\n`tool_call_requested`, no `turn_completed`). At `awaiting_model` the\nrun continues with its next model call, after the last committed\nround.",
             "properties": {
               "resume_point": {
                 "$ref": "#/components/schemas/RunResumePointKind"

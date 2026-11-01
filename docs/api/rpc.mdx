@@ -1477,7 +1477,12 @@ The call returns once every contributor has reached its terminal. The receipt
 - `stopped`: the run was current. `contributors` lists every input bound to it,
   with the delivered `completion` class and the committed `terminal` class. A
   cancelled joined steer reports `completion: "runtime_terminated"` with
-  `terminal: "cancelled"`; read `terminal` for the lifecycle fact.
+  `terminal: "cancelled"`; read `terminal` for the lifecycle fact. A run a
+  store fence gap suspended, one a restart left open that has not resumed
+  yet, or one whose session store's writer is stopped, is stopped without
+  waiting: `contributors` is empty, the run never resumes, and its inputs
+  end `cancelled` when the runtime settles it (once the store takes writes
+  again, after a gap); read their outcome later.
 - `not_current`: the run is no longer (or never was) current. Nothing was
   touched, and newer runs and queued input are not interrupted.
 - `not_stoppable`: the run is still bound, but a runtime stop or teardown owns
@@ -3178,8 +3183,8 @@ live transport's realtime observations. See
 
 | Event | Description |
 |-------|-------------|
-| `run_started` | Agent execution began |
-| `run_resumed` | Since 0.9.5: a run continued after a restart from its last committed round, under its original run id; carries `run_id`, `round` and `resume_point` (`tools_pending` or `awaiting_model`). See [Durable runs](/guides/durable-runs#after-a-crash) |
+| `run_started` | Agent execution began. A repeated `run_started` for a run id that has no terminal yet means that run started over from its inputs (a durable run a store fence gap suspended before its first round commit, run again once the fence is back): drop what you received for that run id before |
+| `run_resumed` | Since 0.9.5: a run continued from its last committed round, under its original run id, after a restart or, in the same process, once a store fence gap that suspended it ended; carries `run_id`, `round` and `resume_point` (`tools_pending` or `awaiting_model`). See [Durable runs](/guides/durable-runs#after-a-crash) |
 | `run_completed` | Agent run finished |
 | `extraction_succeeded` | Structured-output extraction succeeded after a completed run; `request_usage` has one usage row per extraction request |
 | `extraction_failed` | Structured-output extraction failed after a completed run; `request_usage` has one usage row per answered extraction request |

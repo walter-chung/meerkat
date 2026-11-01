@@ -2789,6 +2789,48 @@ struct SessionHandle {
     live_close_notices: std::sync::Mutex<Option<mpsc::UnboundedSender<LiveChannelClosedNotice>>>,
 }
 
+/// Suspends the live run of one session from outside the session service,
+/// as a graceful requeue stop does
+/// ([`EphemeralSessionService::suspend_run_if_current`]): the session task
+/// drops the run's turn at its next await point and ends it suspended, with
+/// no terminal and no closing write. The session's store checkpointer holds
+/// one, for a run whose writer's fence stayed closed through its whole
+/// dispatch wait with no other writer found (a store fence gap).
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+#[derive(Clone)]
+pub(crate) struct RunSuspensionHandle {
+    turn_admission: Arc<std::sync::Mutex<TurnAdmissionSlot>>,
+    turn_state_handle: Option<Arc<dyn TurnStateHandle>>,
+    interrupt_notify: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+impl RunSuspensionHandle {
+    /// Ask the session task to drop `run_id`'s turn and end it suspended.
+    /// `false`, with nothing asked, when `run_id` is not the session's
+    /// active run or the turn admission refuses the interrupt.
+    pub(crate) fn suspend_if_current(&self, run_id: &RunId) -> bool {
+        let woke = {
+            let mut slot = lock_turn_admission(&self.turn_admission);
+            let active_run_id = self
+                .turn_state_handle
+                .as_deref()
+                .and_then(|turn_state| turn_state.snapshot().active_run_id);
+            if active_run_id.as_ref() != Some(run_id) {
+                return false;
+            }
+            match slot.request_suspend() {
+                Ok(woke) => woke,
+                Err(_) => return false,
+            }
+        };
+        if woke {
+            wake_interrupt_notify(&self.interrupt_notify);
+        }
+        true
+    }
+}
+
 /// Cancellation-safe custody of one generated turn-admission claim.
 ///
 /// Public turns claim the canonical slot before awaiting the outer runtime
@@ -4692,6 +4734,26 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
                     wake_interrupt_notify(&handle.interrupt_notify);
                 }
                 Ok(true)
+            })
+            .await
+    }
+
+    /// A handle that suspends the live run of session `id` as
+    /// [`Self::suspend_run_if_current`] does, without this service: the
+    /// session's store checkpointer holds it, so a run whose writer's fence
+    /// stayed closed through its whole dispatch wait with no other writer
+    /// found (a store fence gap) is dropped at that wait and ends suspended.
+    /// `None` while no actor of the session is live.
+    #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+    pub(crate) async fn run_suspension_handle(
+        &self,
+        id: &SessionId,
+    ) -> Option<RunSuspensionHandle> {
+        self.sessions
+            .with_handle(id, |handle| RunSuspensionHandle {
+                turn_admission: Arc::clone(&handle.turn_admission),
+                turn_state_handle: handle.turn_state_handle.clone(),
+                interrupt_notify: Arc::clone(&handle.interrupt_notify),
             })
             .await
     }
@@ -11747,11 +11809,12 @@ async fn session_task<A: SessionAgent>(
                     // Clear the exact work context synchronously before custom
                     // cancellation callbacks or event publication can suspend.
                     agent.clear_work_authorization();
-                    // An interrupt a graceful requeue stop asked as a
-                    // suspension ends the dropped run suspended: no terminal
-                    // and no closing write, so its last round commit stays its
-                    // resume point. An agent without durable rounds cannot
-                    // suspend, and its run is cancelled as for a hard
+                    // An interrupt asked as a suspension (by a graceful
+                    // requeue stop, or by the session's checkpointer for a
+                    // store fence gap) ends the dropped run suspended: no
+                    // terminal and no closing write, so its last round commit
+                    // stays its resume point. An agent without durable rounds
+                    // cannot suspend, and its run is cancelled as for a hard
                     // interrupt.
                     let suspension = if interrupted
                         && lock_turn_admission(&control.turn_admission).suspend_requested()

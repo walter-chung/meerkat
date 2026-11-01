@@ -98935,6 +98935,10 @@ mod delivery_scope_gates;
 /// Each in-loop durability fail-stop records its own cause.
 #[cfg(not(target_arch = "wasm32"))]
 mod fail_stop_cause;
+/// A member's turn over a host store realm whose writer meets a store fence
+/// gap: the member's run is suspended, and runs once the fence is back.
+#[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+mod fence_gap_member;
 /// Role-targeted flow runs dispatch only to their admitted members; every
 /// refusal and shortfall is typed.
 #[cfg(not(target_arch = "wasm32"))]
