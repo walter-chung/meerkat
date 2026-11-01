@@ -599,8 +599,10 @@ async fn run_runtime_backed_initial_turn_with_machine_boundary_mode<
 /// recovery, a failed agent build) ends nothing a later start would run. If
 /// the registration admitted live work (an admission, a deduplicated
 /// resubmission, a recycle), the machine stops every input instead, so a
-/// turn its caller saw refused never runs later. A direct initial turn
-/// leaves no input to keep or stop.
+/// turn its caller saw refused never runs later. The inputs bound to a run
+/// the registration marked resumable whose stop was asked end as stopped
+/// either way, so that run never resumes. A direct initial turn leaves no
+/// input to keep or stop.
 async fn rollback_prepared_runtime_registration(
     prepared: &mut meerkat_runtime::PreparedSessionMaterialization,
 ) {
@@ -1235,7 +1237,8 @@ async fn materialize_prepared_session_actor_transaction_with_admission<
         .await;
     // Refused before it admitted anything: the rollback keeps every input the
     // registration recovered, so a held durable tail stays held with its
-    // inputs open.
+    // inputs open. The inputs bound to a run the registration marked
+    // resumable whose stop was asked still end as stopped.
     let result = match create_result {
         Ok(result) => result,
         Err(error) => {
@@ -2145,6 +2148,28 @@ impl<B: SessionAgentBuilder + 'static> CoreExecutorInterruptHandle
     ) -> Result<bool, CoreExecutorError> {
         self.service
             .interrupt_run_with_machine_authority(
+                &self.session_id,
+                expected_run_id,
+                self.adapter.session_control_authority(),
+            )
+            .await
+            .or_else(|error| match error {
+                SessionError::NotRunning { .. } => Ok(false),
+                error => Err(error),
+            })
+            .map_err(|error| CoreExecutorError::control_failed_runtime(error.to_string()))
+    }
+
+    /// Suspend the exact run, as a graceful requeue stop asks and a stop at a
+    /// store fence gap does: the turn is dropped as a hard interrupt drops
+    /// it, and the run ends suspended, its last round commit kept.
+    async fn suspend_run_if_current(
+        &self,
+        expected_run_id: &meerkat_core::RunId,
+        _reason: String,
+    ) -> Result<bool, CoreExecutorError> {
+        self.service
+            .suspend_run_with_machine_authority(
                 &self.session_id,
                 expected_run_id,
                 self.adapter.session_control_authority(),

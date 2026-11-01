@@ -26,6 +26,10 @@ mod governed;
 )]
 #[path = "session_runtime/committed_reads_tests.rs"]
 mod committed_reads_tests;
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::large_futures)]
+#[path = "session_runtime/fence_gap_tests.rs"]
+mod fence_gap_tests;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -10237,6 +10241,27 @@ impl SessionRuntime {
                 data: None,
             })?;
 
+        // A runtime-loop dispatch holds the turn-finalization boundary, so a
+        // live actor ahead of the store holds the image of a run that ended
+        // without a boundary commit (failed, cancelled, or suspended at a
+        // store fence gap). Bring it to the committed image with the session
+        // service's own turn-entry step before choosing a path, as the other
+        // runtime executors' turn entry does: the cold rebuild below assumes
+        // no live actor, and over one it would fail the dispatch, which the
+        // runtime counts as a failed stage attempt. An actor that cannot be
+        // synchronized is discarded by the same step.
+        if pending_session.is_none()
+            && matches!(
+                llm_reconfigure_boundary,
+                LlmReconfigureBoundaryOwnership::AlreadyHeld
+            )
+        {
+            let _discarded = self
+                .service
+                .synchronize_live_session_for_runtime_turn(session_id)
+                .await
+                .map_err(session_error_to_rpc)?;
+        }
         if pending_session.is_none()
             && !self
                 .live_session_is_stale(session_id, llm_reconfigure_boundary.staleness_position())
@@ -10993,7 +11018,9 @@ impl SessionRuntime {
                         // Nothing was admitted (a no-turn materialization),
                         // so the rollback keeps every input the registration
                         // recovered (rollback_now): a refused resume ends
-                        // nothing a later start would run.
+                        // nothing a later start would run. The inputs bound
+                        // to a run the registration marked resumable whose
+                        // stop was asked still end as stopped.
                         let rollback = prepared.rollback_now().await;
                         #[cfg(feature = "mcp")]
                         runtime.mcp_sessions.write().await.remove(&id);
@@ -15933,11 +15960,12 @@ fn completion_outcome_to_rpc_result(
 /// The JSON-RPC answer of a waiter failure, from its generated resolution.
 ///
 /// An internal failure answers `-32603` with the generated reason and whether
-/// the input is resumable. A session that is not running answers `-32003`: a
-/// graceful stop kept the input durably queued for the session's next start,
-/// and `data` names the input, the stop's time and `kind` and `reason`
-/// `requeued_across_stop`. Do not resubmit such an input; the same
-/// idempotency key after the restart re-attaches to it.
+/// the input is resumable. A session that is not running the input answers
+/// `-32003`: a graceful stop kept the input durably queued for the session's
+/// next start, or a store fence gap kept it queued until the store's fence is
+/// re-acquired, and `data` names the input, the stop's (or the gap's) time
+/// and `kind` and `reason` `requeued_across_stop`. Do not resubmit such an
+/// input; the same idempotency key re-attaches to it.
 fn runtime_completion_wait_failure_rpc_error(
     error: &meerkat_runtime::completion::CompletionWaitError,
     authority: meerkat_runtime::meerkat_machine::RuntimeCompletionWaitFailureAuthority,

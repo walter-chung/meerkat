@@ -8741,10 +8741,12 @@ struct AskedRegistration {
 /// context the restore bound to it. The unregister keeps every input the
 /// registration recovered from the store for the next start, as a refused
 /// materialization's rollback does (stopped instead once it served live
-/// work). `Ok(false)` means a successor already replaced the registration:
-/// the successor, and the operation binding it owns, are left alone. The
-/// answer is the typed refusal. A failed abort, removal or release is
-/// reported as cleanup uncertainty, never as a clean refusal.
+/// work); either way, the inputs bound to a run the registration marked
+/// resumable whose stop was asked end as stopped. `Ok(false)` means a
+/// successor already replaced the registration: the successor, and the
+/// operation binding it owns, are left alone. The answer is the typed
+/// refusal. A failed abort, removal or release is reported as cleanup
+/// uncertainty, never as a clean refusal.
 #[cfg(feature = "runtime-adapter")]
 async fn settle_restored_member_refusal(
     restored: RestoredMemberRefusalCleanup,
@@ -8769,7 +8771,9 @@ async fn settle_restored_member_refusal(
     // The host refused the restored registration before it served: its
     // unregister keeps every input the registration recovered from the store
     // for the next start, unless it served live work, when the machine stops
-    // every input instead.
+    // every input instead. Either way, the inputs bound to a run the
+    // registration marked resumable whose stop was asked end as stopped, so
+    // no later start resumes that run.
     let removed = match asked
         .machine
         .unregister_session_registration_until_terminal_with_queued_inputs_if_current(

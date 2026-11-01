@@ -2,6 +2,8 @@ load("@crates//:defs.bzl", "aliases", "all_crate_deps")
 
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_proc_macro", "rust_test")
 
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
 load("//tools/bazel:workspace_lints.bzl", "WORKSPACE_LINT_RUSTC_FLAGS")
 
 
@@ -2427,6 +2429,10 @@ rust_test(
         "unit",
     ],
     size = "large",
+    args = [
+        "--skip",
+        "service_factory::host_store_fence_tests::",
+    ],
     exec_properties = {"test.network": "external"},
     data = [
         "//:test_fixtures",
@@ -2492,6 +2498,45 @@ rust_test(
         normal = True,
         normal_dev = True,
     ),
+)
+
+sh_test(
+    name = "meerkat_host_store_fence_unit_test",
+    srcs = [
+        "//tools/bazel:run_rust_test_module.sh",
+    ],
+    args = [
+        "$(rootpath :meerkat_unit_test)",
+        "service_factory::host_store_fence_tests::",
+    ],
+    tags = [
+        "fast",
+        "unit",
+    ],
+    size = "large",
+    data = [
+        ":meerkat_unit_test",
+        "//:test_fixtures",
+        "//:workspace_cargo_manifests",
+        "//:workspace_metadata",
+        "//crates/meerkat-mob:cargo_manifest",
+        "//crates/meerkat-mob:package_runfiles",
+        "//crates/meerkat-openai:cargo_manifest",
+        "//crates/meerkat-openai:package_runfiles",
+        "//crates/meerkat-runtime:cargo_manifest",
+        "//crates/meerkat-runtime:package_runfiles",
+        "//crates/meerkat:cargo_manifest",
+        "//tests/fixtures/machine-dsl-tests:package_runfiles",
+        "//tests/fixtures/mcp-test-server:mcp_test_server_bin",
+        "//tests/fixtures/mcp-test-server:package_runfiles",
+        "//tests/fixtures/surface-build-fixtures:package_runfiles",
+        ":package_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "8388608",
+        "RUST_TEST_THREADS": "1",
+        "MEERKAT_MCP_TEST_SERVER": "$(rootpath //tests/fixtures/mcp-test-server:mcp_test_server_bin)",
+    },
 )
 
 rust_test(
@@ -11403,6 +11448,7 @@ test_suite(
         ":live_staleness_under_tail_test",
         ":mcp_confinement_feedback_test",
         ":mcp_oauth_host_canary_test",
+        ":meerkat_host_store_fence_unit_test",
         ":meerkat_unit_test",
         ":openai_stop_reasons_test",
         ":persistence_contract_test",

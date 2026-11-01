@@ -4374,7 +4374,9 @@ impl MeerkatMachine {
     /// authority, and a stale binding can never unregister a same-SessionId
     /// replacement. The rollback keeps every input the registration recovered
     /// from the store, unless the registration served live work, in which
-    /// case the machine stops every input
+    /// case the machine stops every input. Either way, the inputs bound to a
+    /// run the registration marked resumable whose stop was asked end as
+    /// stopped, so no later start resumes that run
     /// ([`PreparedSessionMaterialization::rollback_now`](super::PreparedSessionMaterialization::rollback_now)).
     pub async fn unregister_session_if_bindings_owned_registration(
         &self,
@@ -4463,8 +4465,10 @@ impl MeerkatMachine {
     /// materialization rollback) keeps every input the registration
     /// recovered from the store exactly as the store holds it, Stop ends
     /// every non-terminal input. The machine records a requested Keep as
-    /// Stop once the registration served live work. A claim on a registration
-    /// it did not insert only clears the claim, and the disposition is unused.
+    /// Stop once the registration served live work. Either way, the inputs
+    /// bound to a run the registration marked resumable whose stop was asked
+    /// end as stopped. A claim on a registration it did not insert only
+    /// clears the claim, and the disposition is unused.
     pub(super) async fn abort_prepared_session_materialization_claim(
         &self,
         session_id: &SessionId,
@@ -6090,7 +6094,9 @@ impl MeerkatMachine {
     /// The candidate never served, so its unregister asks to keep every input
     /// the registration recovered from the store, as a pending attachment's
     /// abort does; the machine grants that only while the registration served
-    /// no live work, and stops every input otherwise.
+    /// no live work, and stops every input otherwise. Either way, the inputs
+    /// bound to a run the registration marked resumable whose stop was asked
+    /// end as stopped.
     async fn cleanup_unserved_executor_attachment(
         self: &Arc<Self>,
         witness: &RuntimeExecutorAttachmentWitness,
@@ -8170,7 +8176,8 @@ impl MeerkatMachine {
     /// attachment never served, so its unregister asks to keep every input
     /// the registration recovered from the store; the machine grants that
     /// only while the registration served no live work, and stops every
-    /// input otherwise.
+    /// input otherwise. Either way, the inputs bound to a run the
+    /// registration marked resumable whose stop was asked end as stopped.
     pub(super) async fn abort_pending_executor_attachment(
         self: &Arc<Self>,
         witness: RuntimeExecutorAttachmentWitness,
@@ -9077,9 +9084,10 @@ impl MeerkatMachine {
             // An attachment that never served is retired by its exact startup
             // or pending owner, whose unregister keeps every input the
             // registration recovered from the store, unless the registration
-            // served live work. A cleanup claimed here first would run the
-            // stop before that unregister began, and so end those inputs as
-            // stopped.
+            // served live work (the inputs bound to a run it marked resumable
+            // whose stop was asked end as stopped either way). A cleanup
+            // claimed here first would run the stop before that unregister
+            // began, and so end those inputs as stopped.
             return Ok(RuntimeLoopTeardownWait::Settled);
         } else {
             // A spontaneous loop exit can hand off a machine-managed executor
