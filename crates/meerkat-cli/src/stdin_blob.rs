@@ -71,6 +71,9 @@ where
         Wait::StartWithin(grace) => match chunks.recv_timeout(grace) {
             Ok(event) => Some(event),
             Err(mpsc::RecvTimeoutError::Disconnected) => None,
+            // Input that arrives after this give-up may still be read by the
+            // detached reader: one chunk at most, discarded when its send
+            // fails. Nothing else reads stdin in `run`, so nothing is lost.
             Err(mpsc::RecvTimeoutError::Timeout) => return Outcome::NotStarted,
         },
         Wait::UntilEof { notice_after } => match chunks.recv_timeout(notice_after) {
@@ -93,7 +96,12 @@ where
         }
         next = chunks.recv().ok();
     }
-    Outcome::Read(String::from_utf8_lossy(&bytes).into_owned())
+    // Invalid UTF-8 fails as `read_to_string` did, so the caller warns and
+    // runs without stdin instead of passing mangled input on.
+    match String::from_utf8(bytes) {
+        Ok(text) => Outcome::Read(text),
+        Err(_) => Outcome::Failed("stream did not contain valid UTF-8".into()),
+    }
 }
 
 #[cfg(test)]
@@ -126,6 +134,19 @@ mod tests {
             || {},
         );
         assert_eq!(outcome, Outcome::Read(String::new()));
+    }
+
+    #[test]
+    fn invalid_utf8_fails_like_read_to_string() {
+        let outcome = read_blob(
+            Cursor::new(vec![b'o', b'k', 0xff, 0xfe]),
+            Wait::StartWithin(AUTO_GRACE),
+            || {},
+        );
+        assert_eq!(
+            outcome,
+            Outcome::Failed("stream did not contain valid UTF-8".into())
+        );
     }
 
     #[test]
