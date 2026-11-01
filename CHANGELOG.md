@@ -526,6 +526,18 @@ them.
 
 ### Fixed
 
+- `meerkat-session`: a turn in flight when an embedding host's runtime stops
+  is now treated as ended with that runtime. The check a runtime loop uses
+  for this (`session_task_ended_with_its_runtime`) also required the session
+  task's command channel to be closed, but a stopping runtime drops the
+  task's future in pieces and the turn's result sender goes before the
+  command receiver. In that gap the loop read "not ended" and took the
+  failed turn's path: an ordinary run discarded its provisional tail and
+  replayed its inputs from the prompt, so tool calls that had already
+  committed ran again, and a resumed run stopped its executor, which ended
+  its inputs and the inputs queued behind it. The runtime's stop alone now
+  decides it.
+
 - `meerkat-core` and `meerkat-session`: one tool result no longer carries a
   session's next request past the model's context window unnoticed. The
   compaction check runs before every request, but the provider's count it
