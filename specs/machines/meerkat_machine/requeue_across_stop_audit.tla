@@ -105,8 +105,9 @@
 \* process otherwise starts the marked run again (Prepare), resumes it
 \* (ResumeRun) and starts its turn again. While the run is suspended, and once
 \* it is settled, a direct turn (one the runtime did not prepare: no batch,
-\* never a resumed run) may start a run of its own (StartConversationRun under
-\* another run id, AuditDirectRun, from the phase the suspension left). The
+\* never a resumed run) may start a run of its own under another run id,
+\* AuditDirectRun, from the phase the suspension left: a conversation run
+\* (StartConversationRun) or an immediate append (StartImmediateAppend). The
 \* path runs twice: with an executor attached (the ToAttached arm) and, from a
 \* separate setup that starts the run with none attached and explores nothing
 \* else, without (the ToIdle arm, where no runtime is bound, so no direct run
@@ -144,13 +145,14 @@
 \* AmbientCancelledGapRunSettled: a run suspended with no intent standing and
 \* never stopped while suspended is still settled as cancelled after an
 \* ambient cancel of it, so that cancel stands as its stop intent; and
-\* DirectRunStartsAfterSettlement: once the stopped run is settled, a direct
-\* run starts. The runner's --mutants mode seeds seventeen defects, at least
-\* one per invariant, into a copy of the generated model (or, for the
-\* serve-before-settle control, the audit's settlement order) and requires TLC
-\* to refuse each with the invariant it breaks, and eleven stop-intent,
-\* fence-gap and direct-start defects, each checked against its target
-\* invariant alone.
+\* DirectRunStartsAfterSettlement and DirectAppendStartsAfterSettlement: once
+\* the stopped run is settled, a direct conversation run, and a direct
+\* immediate append, starts. The runner's --mutants mode seeds seventeen
+\* defects, at least one per invariant, into a copy of the generated model
+\* (or, for the serve-before-settle control, the audit's settlement order)
+\* and requires TLC to refuse each with the invariant it breaks, and twelve
+\* stop-intent, fence-gap and direct-start defects, each checked against its
+\* target invariant alone.
 \*
 \* The TLC config is DERIVED from the generated ci.cfg on every run by
 \* requeue_across_stop_audit.sh. No audit step repeats without bound (the run
@@ -659,9 +661,11 @@ AuditGapSettleStopped ==
                    audit_gap_intent_at_suspend, audit_gap_stopped, audit_gap_resumed_stopped>>
 
 \* A direct turn (one the runtime did not prepare: no batch, never a resumed
-\* run) starts a run of its own while the suspended run waits for the fence,
-\* or once it is settled: the machine starts it only once the mark has ended.
-\* With no runtime bound (the idle path) no direct run starts at all.
+\* run) starts a run of its own, a conversation run or an immediate append,
+\* while the suspended run waits for the fence, or once it is settled: the
+\* machine starts it only once the mark has ended. With no runtime bound (the
+\* idle path) no direct conversation run starts, and an immediate append has
+\* no Idle arm.
 AuditGapDirectStart ==
     /\ audit_stage = "Gap"
     /\ audit_gap_suspended
@@ -669,6 +673,8 @@ AuditGapDirectStart ==
     /\ \/ StartConversationRunIdleWithBinding(AuditDirectRun, "ConversationTurn", "conversation", FALSE, FALSE, 0)
        \/ StartConversationRunInitializing(AuditDirectRun, "ConversationTurn", "conversation", FALSE, FALSE, 0)
        \/ StartConversationRunAttached(AuditDirectRun, "ConversationTurn", "conversation", FALSE, FALSE, 0)
+       \/ StartImmediateAppendInitializing(AuditDirectRun)
+       \/ StartImmediateAppendAttached(AuditDirectRun)
     /\ KeepAudit
 
 \* Once the fence is back, the same process starts the marked run again,
@@ -1139,10 +1145,17 @@ AuditWitnessAmbientCancelledGapRunSettled ==
     /\ ~audit_gap_stopped
 
 \* Once the stopped run is settled (its mark ends), a direct turn starts a
-\* run of its own.
+\* conversation run of its own.
 AuditWitnessDirectRunStartsAfterSettlement ==
     /\ audit_gap_settled = "Cancelled"
     /\ current_run_id = Some(AuditDirectRun)
+    /\ primitive_kind = Some("ConversationTurn")
+
+\* The same for a direct immediate append.
+AuditWitnessDirectAppendStartsAfterSettlement ==
+    /\ audit_gap_settled = "Cancelled"
+    /\ current_run_id = Some(AuditDirectRun)
+    /\ primitive_kind = Some("ImmediateAppend")
 
 NotAuditWitnessSuspendedRunResumes == ~AuditWitnessSuspendedRunResumes
 NotAuditWitnessFenceGapRunResumes == ~AuditWitnessFenceGapRunResumes
@@ -1151,4 +1164,5 @@ NotAuditWitnessStoppedSuspendedRunEnds == ~AuditWitnessStoppedSuspendedRunEnds
 NotAuditWitnessStoppedGapRunSettled == ~AuditWitnessStoppedGapRunSettled
 NotAuditWitnessAmbientCancelledGapRunSettled == ~AuditWitnessAmbientCancelledGapRunSettled
 NotAuditWitnessDirectRunStartsAfterSettlement == ~AuditWitnessDirectRunStartsAfterSettlement
+NotAuditWitnessDirectAppendStartsAfterSettlement == ~AuditWitnessDirectAppendStartsAfterSettlement
 ====

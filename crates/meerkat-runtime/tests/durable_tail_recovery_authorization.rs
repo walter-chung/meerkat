@@ -1125,6 +1125,61 @@ fn no_direct_run_starts_while_a_run_is_marked_resumable() {
     }
 }
 
+/// A direct immediate append (a run the runtime did not prepare, which
+/// appends without a model call) never starts while a run is marked
+/// resumable either, from the phases it starts from, under a run id of its
+/// own or the marked run's, for the reasons a direct conversation run does
+/// not. Once the mark ends, the same start is accepted. Unrun: written while
+/// Cargo is not run.
+#[test]
+fn no_immediate_append_starts_while_a_run_is_marked_resumable() {
+    let marked = mm_dsl::RunId("run-marked".to_string());
+    let direct = mm_dsl::RunId("run-direct-append".to_string());
+    let start = |run_id: &mm_dsl::RunId| mm_dsl::MeerkatMachineInput::StartImmediateAppend {
+        run_id: run_id.clone(),
+    };
+    for phase in [
+        mm_dsl::MeerkatPhase::Initializing,
+        mm_dsl::MeerkatPhase::Attached,
+    ] {
+        let state = |resumable_run_id: Option<mm_dsl::RunId>| mm_dsl::MeerkatMachineState {
+            lifecycle_phase: phase,
+            session_id: Some(mm_dsl::SessionId("session-recovery".to_string())),
+            turn_phase: mm_dsl::TurnPhase::Ready,
+            resumable_run_id,
+            ..Default::default()
+        };
+        for run_id in [&direct, &marked] {
+            let mut authority =
+                mm_dsl::MeerkatMachineAuthority::recover_from_state(state(Some(marked.clone())))
+                    .unwrap_or_else(|err| {
+                        panic!("{phase:?} seed state must be recoverable: {err:?}")
+                    });
+            assert!(
+                mm_dsl::MeerkatMachineMutator::apply(&mut authority, start(run_id)).is_err(),
+                "{phase:?}: no immediate append {run_id:?} starts while a run is marked resumable"
+            );
+            assert_eq!(authority.state().resumable_run_id, Some(marked.clone()));
+            assert_eq!(authority.state().current_run_id, None);
+            assert_eq!(authority.state().lifecycle_phase, phase);
+        }
+        let mut authority = mm_dsl::MeerkatMachineAuthority::recover_from_state(state(None))
+            .unwrap_or_else(|err| panic!("{phase:?} seed state must be recoverable: {err:?}"));
+        mm_dsl::MeerkatMachineMutator::apply(&mut authority, start(&direct)).unwrap_or_else(
+            |err| panic!("{phase:?}: with no run marked an immediate append starts: {err:?}"),
+        );
+        assert_eq!(authority.state().current_run_id, Some(direct.clone()));
+        assert_eq!(
+            authority.state().primitive_kind,
+            Some(mm_dsl::TurnPrimitiveKind::ImmediateAppend)
+        );
+        assert_eq!(
+            authority.state().lifecycle_phase,
+            mm_dsl::MeerkatPhase::Running
+        );
+    }
+}
+
 /// A graceful requeue stop suspends a durable session's in-flight run: the
 /// run stops being current, the pre-run phase returns, and the run is marked
 /// resumable, with no turn terminal. A run whose turn terminal is already

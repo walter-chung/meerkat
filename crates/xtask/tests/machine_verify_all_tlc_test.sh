@@ -291,14 +291,15 @@ fi
 # stands as its stop intent, as an ambient cancel of the suspended run does,
 # that a run whose stop was asked never resumes and is settled only as
 # cancelled, that a requeue stop keeps nothing of a run whose stop or
-# ambient cancel was asked, and that no direct run starts while the
-# suspended run is marked resumable (one starts once it is settled), while
-# the same process resumes any other suspended run and starts its turn
-# again. It requires fourteen witnesses reached, a graceful end and a crash
-# among them; its --mutants mode (by hand) refuses seventeen seeded defects
-# against every invariant but the two stop-intent ones and eleven
-# stop-intent, fence-gap and direct-start defects each against its target
-# invariant alone. 32 steps reach the deepest witness.
+# ambient cancel was asked, and that no direct run (a conversation run or an
+# immediate append) starts while the suspended run is marked resumable (each
+# starts once it is settled), while the same process resumes any other
+# suspended run and starts its turn again. It requires fifteen witnesses
+# reached, a graceful end and a crash among them; its --mutants mode (by
+# hand) refuses seventeen seeded defects against every invariant but the
+# two stop-intent ones and twelve stop-intent, fence-gap and direct-start
+# defects each against its target invariant alone. 32 steps reach the
+# deepest witness.
 requeue_across_stop_audit="${workspace_root}/specs/machines/meerkat_machine/requeue_across_stop_audit.sh"
 if [[ ! -x "${requeue_across_stop_audit}" ]]; then
   echo "error: requeue-across-stop audit runner is missing from workspace runfiles: ${requeue_across_stop_audit}" >&2

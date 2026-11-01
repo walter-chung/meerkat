@@ -26,7 +26,7 @@
 # overlaps Retain, a requeued wait-failure arm that writes state, is
 # guarded on the session or answers any failure, a suspend of a run whose
 # turn terminal is published, and a staged-row normalization that requeues
-# the suspended run's input. It then seeds eleven stop-intent, fence-gap and
+# the suspended run's input. It then seeds twelve stop-intent, fence-gap and
 # direct-start defects (a fence-gap suspension that leaves the run's turn
 # mid-flight, one that spends a stage attempt, one that ignores the draining
 # registration, one that drops a cancel the run accepted before the gap, one
@@ -34,10 +34,11 @@
 # suspends a run whose turn already ended, one that unbinds the run's input,
 # a resume of a run whose stop was asked, a requeue stop that keeps the input
 # of a resumable run whose stop was asked, a settlement of a stopped run as a
-# refused resume, and a direct run start beside a run marked resumable) and
-# checks each against its target invariant alone, with the generated
-# invariants and the audit's others left out of that run. An anchor this
-# script expects but cannot find fails the run.
+# refused resume, a direct conversation run start beside a run marked
+# resumable, and a direct immediate append start beside one) and checks each
+# against its target invariant alone, with the generated invariants and the
+# audit's others left out of that run. An anchor this script expects but
+# cannot find fails the run.
 set -euo pipefail
 
 usage="usage: requeue_across_stop_audit.sh <max-steps> [--mutants] [extra tlc args...]"
@@ -224,7 +225,7 @@ for witness in RetainedRunsAfterGracefulStop RetainedRunsAfterCrash ExpiredSettl
   StagedNotRetained StopAbandonsEligible PlainStopAbandons RequeuedWaitAnswered \
   SuspendedRunResumes FenceGapRunResumes IdleFenceGapRunResumes \
   StoppedSuspendedRunEnds StoppedGapRunSettled AmbientCancelledGapRunSettled \
-  DirectRunStartsAfterSettlement; do
+  DirectRunStartsAfterSettlement DirectAppendStartsAfterSettlement; do
   cfg="${work_dir}/witness-${witness}.cfg"
   write_cfg "${cfg}" TRUE "
   NotAuditWitness${witness}"
@@ -805,6 +806,22 @@ for arm in (
     "StartConversationRunInitializing",
     "StartConversationRunAttached",
 ):
+    text = edit_arm(
+        text,
+        arm,
+        lambda line: line == "    /\\ (resumable_run_id = None)",
+        lambda line, _: "    /\\ TRUE",
+    )
+open(path, "w").write(text)
+PY
+
+  # The same for a direct immediate append, from Initializing and Attached.
+  mutate_target immediate_append_beside_marked_run AuditOnlyTheMarkedRunStarts <<'PY'
+import os
+from gap_mutation import edit_arm
+path = os.environ["MODEL"]
+text = open(path).read()
+for arm in ("StartImmediateAppendInitializing", "StartImmediateAppendAttached"):
     text = edit_arm(
         text,
         arm,
