@@ -1006,6 +1006,278 @@ mod tests {
         assert_eq!(input[0]["encrypted_content"], "terminal-cipher");
     }
 
+    /// A Copilot response of reasoning items and then an answer: each
+    /// `(id, summary)` of `completed` completes under that id at its own
+    /// output index, and the terminal response carries `terminal` in that
+    /// order, then the answer. Every reasoning item has a ciphertext of its
+    /// own, `cipher-<id>`. With `streamed`, each completed lifecycle is first
+    /// added under its own canonical id and completes its summary in the
+    /// stream. Returns the events and the terminal output.
+    fn copilot_reasoning_response(
+        completed: &[(&str, Option<&str>)],
+        terminal: &[(&str, Option<&str>)],
+        streamed: bool,
+    ) -> (Vec<Value>, Vec<Value>) {
+        let reasoning = |id: &str, summary: Option<&str>| {
+            let summary = match summary {
+                Some(text) => json!([{"type":"summary_text","text":text}]),
+                None => json!([]),
+            };
+            json!({"type":"reasoning","id":id,"summary":summary,"encrypted_content":format!("cipher-{id}")})
+        };
+        let mut events = vec![json!({"type":"response.created","response":{"id":"resp_1"}})];
+        for (index, &(id, summary)) in completed.iter().enumerate() {
+            let event =
+                |kind: &str, item: Value| json!({"type":kind,"output_index":index,"item":item});
+            if streamed {
+                events.push(event(
+                    "response.output_item.added",
+                    reasoning(&format!("A{index}"), summary),
+                ));
+                if let Some(text) = summary {
+                    events.push(json!({"type":"response.reasoning_summary_text.delta","output_index":index,"delta":text}));
+                }
+                events.push(event(
+                    "response.reasoning_summary.done",
+                    reasoning(&format!("S{index}"), summary),
+                ));
+            }
+            events.push(event("response.output_item.done", reasoning(id, summary)));
+        }
+        let answer = message("msg_1", "final_answer", "Done.");
+        let output: Vec<Value> = terminal
+            .iter()
+            .map(|&(id, summary)| reasoning(id, summary))
+            .chain([answer.clone()])
+            .collect();
+        let index = completed.len();
+        events.extend([
+            json!({"type":"response.output_item.added","output_index":index,"item":answer}),
+            json!({"type":"response.output_text.delta","item_id":"msg_1","output_index":index,"delta":"Done."}),
+            json!({"type":"response.output_item.done","output_index":index,"item":answer}),
+            json!({"type":"response.completed","response":{"id":"resp_1","status":"completed",
+                "output":output,
+                "usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}),
+        ]);
+        (events, output)
+    }
+
+    /// Asserts that `assistant` replays exactly the reasoning items
+    /// `expected`, as `(id, encrypted_content)` pairs in replay order.
+    fn assert_replayed_reasoning(
+        assistant: meerkat_core::BlockAssistantMessage,
+        expected: &[(&str, &str)],
+        case: &str,
+    ) {
+        let client = OpenAiClient::new("unused".into());
+        let projected = client
+            .project_replay_messages(&[Message::BlockAssistant(assistant)])
+            .unwrap();
+        let body = client
+            .build_request_body(&LlmRequest::new("gpt-5.5", projected))
+            .unwrap();
+        let replayed: Vec<(&str, &str)> = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["type"] == "reasoning")
+            .map(|item| {
+                (
+                    item["id"].as_str().unwrap(),
+                    item["encrypted_content"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            replayed, expected,
+            "{case}: each terminal reasoning id replays with its own ciphertext"
+        );
+    }
+
+    /// Two reasoning items with the same visible fields (no summary, or the
+    /// same summary), each re-identified with fresh ciphertexts, are one
+    /// group with as many completed as terminal items: accepted, the blocks
+    /// are the terminal items, and each terminal id replays with its own
+    /// ciphertext, in terminal order.
+    #[tokio::test]
+    async fn copilot_identical_reasoning_items_are_matched_as_a_group() {
+        for (shape, summary) in [
+            ("empty summaries", None),
+            ("identical summaries", Some("Plan")),
+        ] {
+            let (events, output) = copilot_reasoning_response(
+                &[("B", summary), ("C", summary)],
+                &[("I", summary), ("J", summary)],
+                false,
+            );
+            let (client, server) = copilot_stub(events).await;
+            let result = LlmClientAdapter::new(Arc::new(client), "gpt-5.5".into())
+                .stream_response(&[], &[], 1000, None, None)
+                .await;
+            server.abort();
+            let result = result.unwrap_or_else(|error| {
+                panic!("{shape}: the terminal pair is the completed pair: {error}")
+            });
+            assert_eq!(
+                result.blocks(),
+                lower_items(&output, Some("resp_1")).unwrap(),
+                "{shape}: the blocks are the terminal items"
+            );
+            assert_replayed_reasoning(
+                result.into_message(),
+                &[("I", "cipher-I"), ("J", "cipher-J")],
+                shape,
+            );
+        }
+    }
+
+    /// The same groups with streamed reasoning: each lifecycle is added under
+    /// its own canonical id and completes its summary in the stream, so the
+    /// streamed ids reconcile with the group's terminal ids. Accepted, and
+    /// each reasoning item completes once in the live events.
+    #[tokio::test]
+    async fn copilot_identical_reasoning_group_reconciles_its_streamed_ids() {
+        for (shape, summary) in [
+            ("empty summaries", None),
+            ("identical summaries", Some("Plan")),
+        ] {
+            let (events, output) = copilot_reasoning_response(
+                &[("B", summary), ("C", summary)],
+                &[("I", summary), ("J", summary)],
+                true,
+            );
+            let (client, server) = copilot_stub(events).await;
+            let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+            let result =
+                LlmClientAdapter::with_event_channel(Arc::new(client), "gpt-5.5".into(), tx)
+                    .stream_response(&[], &[], 1000, None, None)
+                    .await;
+            server.abort();
+            let result = result.unwrap_or_else(|error| {
+                panic!("{shape}: the streamed group is the terminal group: {error}")
+            });
+            assert_eq!(
+                result.blocks(),
+                lower_items(&output, Some("resp_1")).unwrap(),
+                "{shape}: the blocks are the terminal items"
+            );
+            let completions = std::iter::from_fn(|| rx.try_recv().ok())
+                .filter(|event| matches!(event, meerkat_core::AgentEvent::ReasoningComplete { .. }))
+                .count();
+            assert_eq!(
+                completions, 2,
+                "{shape}: each reasoning item completes once"
+            );
+        }
+    }
+
+    /// Two identical messages, each re-identified on every event of its
+    /// lifecycle, are one group: accepted, the terminal identities are kept,
+    /// and each visible text streams once.
+    #[tokio::test]
+    async fn copilot_identical_messages_are_matched_as_a_group() {
+        let at = |id: &str| message(id, "final_answer", "Done.");
+        let output = [at("G0"), at("G1")];
+        let events = vec![
+            json!({"type":"response.created","response":{"id":"resp_1"}}),
+            json!({"type":"response.output_item.added","output_index":0,"item":at("A0")}),
+            json!({"type":"response.output_text.delta","item_id":"D0","output_index":0,"delta":"Done."}),
+            json!({"type":"response.output_item.done","output_index":0,"item":at("F0")}),
+            json!({"type":"response.output_item.added","output_index":1,"item":at("A1")}),
+            json!({"type":"response.output_text.delta","item_id":"D1","output_index":1,"delta":"Done."}),
+            json!({"type":"response.output_item.done","output_index":1,"item":at("F1")}),
+            json!({"type":"response.completed","response":{"id":"resp_1","status":"completed",
+                "output":output,
+                "usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}),
+        ];
+        let (client, server) = copilot_stub(events).await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let result = LlmClientAdapter::with_event_channel(Arc::new(client), "gpt-5.5".into(), tx)
+            .stream_response(&[], &[], 1000, None, None)
+            .await;
+        server.abort();
+        let result = result.unwrap_or_else(|error| {
+            panic!("the terminal messages are the completed messages: {error}")
+        });
+        assert_eq!(
+            result.blocks(),
+            lower_items(&output, Some("resp_1")).unwrap(),
+            "the terminal identities are kept for replay"
+        );
+        let mut visible = String::new();
+        while let Ok(event) = rx.try_recv() {
+            if let meerkat_core::AgentEvent::TextDelta { delta, .. } = event {
+                visible.push_str(&delta);
+            }
+        }
+        assert_eq!(visible, "Done.Done.", "each visible text streams once");
+    }
+
+    /// A group beside a distinct reasoning item in one response: the pair
+    /// without a summary is matched as a group and the summarized item on its
+    /// own, streamed or not.
+    #[tokio::test]
+    async fn copilot_reasoning_group_beside_a_distinct_item_is_accepted() {
+        for streamed in [false, true] {
+            let (events, output) = copilot_reasoning_response(
+                &[("B", None), ("E", Some("Plan")), ("C", None)],
+                &[("I", None), ("K", Some("Plan")), ("J", None)],
+                streamed,
+            );
+            let (client, server) = copilot_stub(events).await;
+            let result = LlmClientAdapter::new(Arc::new(client), "gpt-5.5".into())
+                .stream_response(&[], &[], 1000, None, None)
+                .await;
+            server.abort();
+            let result = result.unwrap_or_else(|error| {
+                panic!("streamed {streamed}: the group and the distinct item both match: {error}")
+            });
+            assert_eq!(
+                result.blocks(),
+                lower_items(&output, Some("resp_1")).unwrap(),
+                "streamed {streamed}: the blocks are the terminal items"
+            );
+        }
+    }
+
+    /// Distinguishable reasoning items match by content, never by position:
+    /// with the two re-identified items listed in the other order by the
+    /// terminal output, each completed item is aliased to the terminal item
+    /// with its content, and the blocks follow the terminal order with each
+    /// terminal id and ciphertext kept together.
+    #[tokio::test]
+    async fn copilot_reordered_terminal_items_match_by_content() {
+        let (events, output) = copilot_reasoning_response(
+            &[("B", Some("A plan")), ("C", Some("B plan"))],
+            &[("J", Some("B plan")), ("I", Some("A plan"))],
+            false,
+        );
+        let completed = events
+            .iter()
+            .filter(|event| event["type"] == "response.output_item.done")
+            .map(|event| &event["item"]);
+        let aliases = copilot_item_aliases(&output, completed).unwrap();
+        assert_eq!(aliases.terminal_id("reasoning", "B"), "I", "'A plan' is I");
+        assert_eq!(aliases.terminal_id("reasoning", "C"), "J", "'B plan' is J");
+        let (client, server) = copilot_stub(events).await;
+        let result = LlmClientAdapter::new(Arc::new(client), "gpt-5.5".into())
+            .stream_response(&[], &[], 1000, None, None)
+            .await;
+        server.abort();
+        let result = result
+            .unwrap_or_else(|error| panic!("each completed item has its terminal item: {error}"));
+        assert_eq!(
+            result.blocks(),
+            lower_items(&output, Some("resp_1")).unwrap(),
+            "the blocks follow the terminal order"
+        );
+        assert_replayed_reasoning(
+            result.into_message(),
+            &[("J", "cipher-J"), ("I", "cipher-I")],
+            "reordered",
+        );
+    }
+
     /// Copilot rotates a function call's item id on every event while its
     /// call_id stays: the call is identified by call_id, with no alias.
     #[tokio::test]
@@ -1199,6 +1471,31 @@ mod tests {
                     ])),
                 ],
                 "no one-to-one match for re-identified completed reasoning item 'B'",
+            ),
+            (
+                "group too many terminal",
+                vec![
+                    done_at(0, &reasoning("B", "Plan", "c1")),
+                    done_at(1, &reasoning("C", "Plan", "c2")),
+                    completed(json!([
+                        reasoning("I", "Plan", "c3"),
+                        reasoning("J", "Plan", "c4"),
+                        reasoning("K", "Plan", "c5")
+                    ])),
+                ],
+                "no one-to-one match for re-identified completed reasoning item 'B'",
+            ),
+            (
+                "group member changed",
+                vec![
+                    done_at(0, &reasoning("B", "Plan", "c1")),
+                    done_at(1, &reasoning("C", "Plan", "c2")),
+                    completed(json!([
+                        reasoning("I", "Plan", "c3"),
+                        reasoning("J", "Other", "c4")
+                    ])),
+                ],
+                "no one-to-one match for re-identified completed reasoning item 'C'",
             ),
             (
                 "unrelated reasoning completion",
