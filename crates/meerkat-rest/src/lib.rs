@@ -13678,6 +13678,64 @@ mod tests {
         assert_eq!(occurrence.phase, OccurrencePhase::Misfired);
     }
 
+    /// `GET /schedules` is a host contract, not the model's tool reply: it
+    /// lists every schedule, unpaged, each the whole public wire schedule
+    /// (its full target and action, its policies and planning state), and
+    /// never machine state. Control row: the schedule tools' bounded
+    /// summaries and pages do not move it.
+    #[tokio::test]
+    async fn rest_schedule_listing_keeps_every_full_public_schedule() {
+        let temp = TempDir::new().unwrap();
+        let state = AppState::load_from(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        let prompt = "full rest listing body ".repeat(200);
+        let mut args = missing_target_schedule_tool_args();
+        args["trigger"] = json!({
+            "type": "once",
+            "due_at_utc": (Utc::now() + Duration::days(1)).to_rfc3339(),
+        });
+        args["target"]["action"]["prompt"] = json!(prompt);
+        let mut created = Vec::new();
+        for _ in 0..55 {
+            let request: meerkat::CreateScheduleRequest =
+                serde_json::from_value(args.clone()).expect("valid schedule request");
+            let schedule = state
+                .schedule_service
+                .create(request)
+                .await
+                .expect("create schedule");
+            created.push(schedule.schedule_id);
+        }
+
+        let Json(listed) = list_schedules(State(state.clone()))
+            .await
+            .expect("GET /schedules");
+        let listed = serde_json::to_value(listed).expect("listing json");
+        assert!(
+            listed.get("page").is_none(),
+            "GET /schedules has no tool page: {listed}"
+        );
+        let rows = listed["schedules"].as_array().expect("schedules array");
+        assert_eq!(rows.len(), 55, "every schedule, unpaged");
+        for schedule_id in &created {
+            let stored = state
+                .schedule_service
+                .get(schedule_id)
+                .await
+                .expect("stored schedule");
+            let expected = serde_json::to_value(meerkat_contracts::wire::Schedule::from(&stored))
+                .expect("public wire schedule");
+            let row = rows
+                .iter()
+                .find(|row| row["schedule_id"] == expected["schedule_id"])
+                .expect("every created schedule is listed");
+            assert_eq!(row, &expected, "the whole public wire schedule");
+            assert_eq!(row["target"]["action"]["prompt"], json!(prompt));
+            assert!(row.get("machine_state").is_none(), "{row}");
+        }
+    }
+
     /// A schedule host shutdown that lands after a handler's host start
     /// leaves no live host to judge identity targets: the direct create maps
     /// to the same 503 the schedule tools return.

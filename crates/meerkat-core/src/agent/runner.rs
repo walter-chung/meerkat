@@ -1410,6 +1410,22 @@ where
         &mut self.session
     }
 
+    /// Adopt the compaction cadence the agent's session carries.
+    ///
+    /// The agent keeps its cadence beside the session and writes it back at
+    /// every boundary. A host that swaps in a durable snapshot of the session
+    /// (a live-session sync after a transcript edit) calls this after the
+    /// swap, so the cadence follows the transcript it measures instead of
+    /// writing back an input anchor or a context refusal recorded on the
+    /// transcript the snapshot replaced.
+    pub fn reload_compaction_cadence(
+        &mut self,
+    ) -> Result<(), crate::agent::compact::CompactionCadenceError> {
+        self.compaction_cadence =
+            crate::agent::compact::load_compaction_cadence(&mut self.session)?;
+        Ok(())
+    }
+
     /// Read host-only tool observations without borrowing the running Agent.
     pub fn tool_application_observation_reader(
         &self,
