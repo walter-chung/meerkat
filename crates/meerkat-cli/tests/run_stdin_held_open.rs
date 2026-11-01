@@ -87,7 +87,7 @@ fn silent_server_marker() -> String {
 fn stop_silent_server() {
     let _ = Command::new("pkill")
         .arg("-f")
-        .arg(format!("sleep {}", silent_server_marker()))
+        .arg(format!("^[^ ]*/sleep 600\\.{}$", std::process::id()))
         .status();
 }
 
@@ -206,9 +206,10 @@ fn r2_stdin_off_ignores_a_held_open_stdin() {
 
 /// R3: the same under workspace confinement beside a stdio MCP server that
 /// never answers, which `--wait-for-mcp` makes the run wait for, up to its
-/// 2 s connect timeout. The run still finishes; the server was launched and
-/// stayed silent (the timeout, not an early exit, ends the wait); and the
-/// confinement report prints.
+/// 2 s connect timeout. The run still finishes and the confinement report
+/// prints. Where the host enforces confinement, the server was launched and
+/// stayed silent (the timeout, not an early exit, ends the wait); where it
+/// cannot, the report says so and the launch is refused.
 #[test]
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn r3_auto_under_workspace_confinement_with_a_silent_stdio_server() {
@@ -226,10 +227,20 @@ fn r3_auto_under_workspace_confinement_with_a_silent_stdio_server() {
         "status={} stderr:\n{stderr}",
         output.status
     );
-    assert!(
-        stderr.contains("Timed out connecting to 'silent'"),
-        "the silent stdio server was launched and never answered; stderr:\n{stderr}"
-    );
+    // A host that cannot enforce workspace confinement (for example one that
+    // refuses unprivileged user namespaces) refuses the confined launch; the
+    // run must still finish there, so only the launch check depends on it.
+    if stderr.contains("mcp_stdio confinement: requested workspace, enforced by") {
+        assert!(
+            stderr.contains("Timed out connecting to 'silent'"),
+            "the silent stdio server was launched and never answered; stderr:\n{stderr}"
+        );
+    } else {
+        assert!(
+            stderr.contains("cannot be enforced on this host"),
+            "the confinement report states why the launch is refused; stderr:\n{stderr}"
+        );
+    }
     assert!(
         stderr.contains("mcp_stdio confinement: requested workspace"),
         "the confinement report prints; stderr:\n{stderr}"
