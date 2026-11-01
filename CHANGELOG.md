@@ -446,13 +446,16 @@ them.
     recorded and the machine suspends it
     (`MeerkatMachine::stop_and_suspend_service_turn_for_fence_gap`), so
     nothing of it is written while the gap lasts, it never resumes, and the
-    runtime settles it as cancelled once the fence is back. The turn fails
-    with a retryable `StoreError` after that one wait, instead of the
-    teardown class. Before, it failed only after a second wait, its closing
-    save's, and its terminal's write met the gap and left the session
-    repair-blocked. Until the run is settled, a direct turn of the session
-    is refused with `SessionError::Busy` (`SESSION_BUSY`), as it is while a
-    restart's open run has not resumed or been settled. A closing save is
+    runtime settles it as cancelled once the fence is back, publishing its
+    run terminal. The session keeps its live session, as for a suspended
+    runtime run, so its next direct turn runs on it, brought to the settled
+    store. The turn fails with a retryable `StoreError` after that one
+    wait, instead of the teardown class. Before, it failed only after a
+    second wait, its closing save's, and its terminal's write met the gap
+    and left the session repair-blocked. Until the run is settled, a direct
+    turn of the session is refused with `SessionError::Busy`
+    (`SESSION_BUSY`), as it is while a restart's open run has not resumed
+    or been settled. A closing save is
     written after the run's final answer and terminal, so it cannot suspend
     the run: a closing save still refused after its one wait keeps the
     teardown class, and the turn fails (see Known limitations);
@@ -666,16 +669,13 @@ them.
   `RequeuedAcrossStop`. A cancel at the next boundary accepted just before
   that suspension can likewise fail when its dispatch to the dropped turn
   fails, while the run is still settled as cancelled once the fence is
-  back. A direct turn's run that a gap stopped publishes no run terminal on
-  the session's event stream: its turn is answered with the refusal, and
-  the settlement's terminal finds no live session (the failed turn
-  discarded it). A gap met while a run re-bases its session is not
-  suspended: the re-base's outcome is unknown, and the session reloads as
-  before. A closing save still
-  refused after its one wait (a gap that outlasts the wait after a run's
-  final answer) keeps the teardown class, and the turn fails: the turn's
-  terminal is recorded before that save, so the run cannot be suspended
-  there; the wait and its one retry are the protection. At a gap a stop or
+  back. A gap met while a run re-bases its session is not suspended: the
+  re-base's outcome is unknown, and the session reloads as before. A
+  closing save still refused after its one wait (a gap that outlasts the
+  wait after a run's final answer) keeps the teardown class, and the turn
+  fails: the turn's terminal is recorded before that save, so the run
+  cannot be suspended there; the wait and its one retry are the
+  protection. At a gap a stop or
   an interrupt falls back to the hard interrupt, which the gap undoes with
   a reload that resumes the stopped run, in three cases: an executor that
   cannot suspend a run (`CoreExecutorInterruptHandle::suspend_run_if_current`

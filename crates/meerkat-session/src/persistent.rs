@@ -1125,6 +1125,39 @@ struct StoreCheckpointer {
     run_suspension: std::sync::OnceLock<crate::ephemeral::RunSuspensionHandle>,
 }
 
+/// How a direct service turn failed, as the machine-service turn's inner
+/// step returns it.
+enum ServiceTurnFailure {
+    /// The turn failed with this error, its admission returned when the turn
+    /// did not take it. The live session is discarded, unless the error is
+    /// the session's absence or the turn's terminal receipt is still owed.
+    Failed(
+        SessionError,
+        Option<crate::ephemeral::RuntimeContextAdmissionGuard>,
+    ),
+    /// A store fence gap stopped and suspended the turn's run, which fails
+    /// the turn with this error. The live session stays, as a suspended
+    /// runtime run's does, for the runtime's settlement of the run and for
+    /// the next turn, whose entry brings it to the settled store.
+    SuspendedAtFenceGap(SessionError),
+}
+
+impl
+    From<(
+        SessionError,
+        Option<crate::ephemeral::RuntimeContextAdmissionGuard>,
+    )> for ServiceTurnFailure
+{
+    fn from(
+        (error, admission): (
+            SessionError,
+            Option<crate::ephemeral::RuntimeContextAdmissionGuard>,
+        ),
+    ) -> Self {
+        Self::Failed(error, admission)
+    }
+}
+
 /// Whether a direct service turn is open on a store checkpointer's actor,
 /// and what a store fence gap did to its run.
 #[derive(Debug)]
@@ -12170,15 +12203,13 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             .await;
         match result {
             Ok(result) => Ok(result),
-            Err((error, admission))
-                if self
-                    .service_turn_error_requires_machine_terminal_receipt(id, &error)
-                    .await =>
-            {
-                Err((error, admission))
-            }
-            Err((error, admission)) => {
-                if !matches!(error, SessionError::NotFound { .. }) {
+            Err(ServiceTurnFailure::SuspendedAtFenceGap(error)) => Err((error, None)),
+            Err(ServiceTurnFailure::Failed(error, admission)) => {
+                if !matches!(error, SessionError::NotFound { .. })
+                    && !self
+                        .service_turn_error_requires_machine_terminal_receipt(id, &error)
+                        .await
+                {
                     let _ = self
                         .discard_live_session_under_runtime_turn_boundary(id)
                         .await;
@@ -12485,13 +12516,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         mut admission: Option<crate::ephemeral::RuntimeContextAdmissionGuard>,
         protocol: MachineServiceTurnCommitProtocol<'_>,
         turn_identity: &meerkat_runtime::MachineServiceTurnIdentity,
-    ) -> Result<
-        RunResult,
-        (
-            SessionError,
-            Option<crate::ephemeral::RuntimeContextAdmissionGuard>,
-        ),
-    > {
+    ) -> Result<RunResult, ServiceTurnFailure> {
         let recovery_gate = self.recovery_gate_for_session(id).await;
         let turn_guard = recovery_gate.lock().await;
         let _ = self
@@ -12547,17 +12572,15 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                         .and_then(|turn| turn.take_fence_gap_suspension(run_id))
                 {
                     drop(turn_guard);
-                    return Err((
-                        self.stop_service_turn_run_at_fence_gap(
+                    return Err(self
+                        .stop_service_turn_run_at_fence_gap(
                             id,
                             protocol,
                             turn_identity,
                             run_id,
                             refusal,
                         )
-                        .await,
-                        None,
-                    ));
+                        .await);
                 }
                 let terminal_error = match machine_terminal_failure.as_ref() {
                     Some(witness) => Self::terminal_surface_error(error, witness),
@@ -12574,10 +12597,10 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                         let _ = self
                             .discard_live_session_under_runtime_turn_boundary(id)
                             .await;
-                        return Err((commit_error, None));
+                        return Err((commit_error, None).into());
                     }
                 }
-                return Err((terminal_error, None));
+                return Err((terminal_error, None).into());
             }
         };
 
@@ -12589,22 +12612,27 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             let _ = self
                 .discard_live_session_under_runtime_turn_boundary(id)
                 .await;
-            return Err((error, None));
+            return Err((error, None).into());
         }
 
         Ok(result)
     }
 
     /// Stop and suspend the run of a direct turn that a store fence gap
-    /// suspended on the actor, through the runtime, and return the error the
-    /// turn answers: `refusal`, the gap's retryable store error. The runtime
+    /// suspended on the actor, through the runtime, and return how the turn
+    /// fails: with `refusal`, the gap's retryable store error. The runtime
     /// records the run's stop, marks it resumable and wakes its loop, which
     /// settles the run as cancelled once the store's fence is back; until
-    /// then a direct turn is refused busy. When the runtime refuses the
+    /// then a direct turn is refused busy. The live session stays, as a
+    /// suspended runtime run's does: the settlement publishes the run's
+    /// terminal through it, and the next turn's entry brings it to the
+    /// settled store. Its image is reported uncommitted now, since no
+    /// boundary commit is coming for it. When the runtime refuses the
     /// suspension (the registration drains for its unregister), the run the
     /// session task dropped stays current with no terminal, so the session's
     /// runtime reloads from the store, as after any write that may have
-    /// diverged, and the turn still answers `refusal`.
+    /// diverged, the live session is discarded as for any other failure, and
+    /// the turn still answers `refusal`.
     async fn stop_service_turn_run_at_fence_gap(
         &self,
         id: &SessionId,
@@ -12612,7 +12640,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         turn_identity: &meerkat_runtime::MachineServiceTurnIdentity,
         run_id: &RunId,
         refusal: AgentError,
-    ) -> SessionError {
+    ) -> ServiceTurnFailure {
         let refused = match protocol
             .runtime_adapter
             .stop_and_suspend_service_turn_for_fence_gap(turn_identity, run_id)
@@ -12625,7 +12653,8 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                     "a store fence gap met the direct turn's run: the run is stopped and \
                      suspended, and its runtime settles it once the store's fence is back"
                 );
-                return SessionError::Agent(refusal);
+                self.report_uncommitted_runtime_turn_image(id, run_id).await;
+                return ServiceTurnFailure::SuspendedAtFenceGap(SessionError::Agent(refusal));
             }
             Ok(false) => "the runtime refused to suspend it".to_string(),
             Err(error) => error.to_string(),
@@ -12655,7 +12684,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 "no persistent runtime registration to degrade for the unsuspended run"
             );
         }
-        SessionError::Agent(refusal)
+        (SessionError::Agent(refusal), None).into()
     }
 
     pub async fn event_log_latest_seq(&self, id: &SessionId) -> Result<Option<u64>, SessionError> {
