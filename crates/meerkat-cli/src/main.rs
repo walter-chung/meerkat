@@ -32,6 +32,7 @@ mod mob_host;
 mod resume_args;
 mod shutdown_signal;
 #[cfg(feature = "comms")]
+mod stdin_blob;
 mod stdin_events;
 mod storage_migrate;
 mod stream_renderer;
@@ -120,7 +121,7 @@ const CLI_ABOUT: &str = "Run agent tasks and manage local Meerkat surfaces from 
 const ROOT_AFTER_HELP: &str = "Command groups:\n  Runtime:      run, help\n  Realm config: init, config, realm, auth\n  Utility:      session, blob, workgraph, models, capabilities, doctor, storage\n  Integrations: mcp, mob, skill (when compiled in)\n\nRealm defaults:\n  - context root: current directory, unless --context-root is supplied\n  - state root: <project-root>/.rkat/realms, where project root is the nearest ancestor containing .rkat (or the context root when none exists), unless --state-root is supplied\n  - realm id: workspace-derived ws-... unless --realm or --isolated is supplied\n\nExamples:\n  rkat \"summarize this repository\"\n  rkat help \"How do I add an mcp server?\"\n  cat story.txt | rkat \"summarize the story\"\n  git diff | rkat run \"review these changes\"\n  tail -f app.log | rkat run --stdin lines \"watch for incidents\"\n  rkat run -t workspace \"fix the failing test\"\n\nUse `rkat <command> -h` for the basic view and `rkat <command> --help` for all options. `rkat help <QUESTION>` answers usage questions with a model.";
 const HELP_AFTER_HELP: &str = "Examples:\n  rkat help \"How do I add an mcp server and schedule to remove it in 30 minutes\"\n  rkat help \"Use gemini with my vertex auth, load ~/codex/skills\" --prompt \"Write a match-3 game in Erlang\"\n\nFor the command reference, run `rkat --help` or `rkat <command> --help`.";
 
-const RUN_AFTER_HELP: &str = "Examples:\n  rkat run \"summarize this repository\"\n  cat story.txt | rkat run \"summarize the story\"\n  git diff | rkat run --json \"review these changes\"\n  rkat run --html \"make a visual explainer\"\n  rkat run --browser \"create an implementation plan\"\n  rkat run --resume last \"keep going\"\n  rkat run --resume ~2 \"pick this thread back up\"\n  tail -f app.log | rkat run --stdin lines \"watch for incidents\"\n  rkat run -t workspace \"fix the failing test\"\n\nDefaults:\n  - realm state under <project-root>/.rkat/realms, using the nearest ancestor containing .rkat or the context root when none exists; use --verbose to print the active realm root\n  - `--tools safe`\n  - provider-native web search on for supporting models; use `--no-web-search` to disable\n  - stream on in a TTY, off in pipes/scripts\n  - piped stdin is read as blob context unless `--stdin lines` is set";
+const RUN_AFTER_HELP: &str = "Examples:\n  rkat run \"summarize this repository\"\n  cat story.txt | rkat run \"summarize the story\"\n  git diff | rkat run --json \"review these changes\"\n  rkat run --html \"make a visual explainer\"\n  rkat run --browser \"create an implementation plan\"\n  rkat run --resume last \"keep going\"\n  rkat run --resume ~2 \"pick this thread back up\"\n  tail -f app.log | rkat run --stdin lines \"watch for incidents\"\n  rkat run -t workspace \"fix the failing test\"\n\nDefaults:\n  - realm state under <project-root>/.rkat/realms, using the nearest ancestor containing .rkat or the context root when none exists; use --verbose to print the active realm root\n  - `--tools safe`\n  - provider-native web search on for supporting models; use `--no-web-search` to disable\n  - stream on in a TTY, off in pipes/scripts\n  - piped stdin is read as blob context unless `--stdin lines` is set; with the default `--stdin auto`, input that has not started within 2 s is skipped (`--stdin blob` waits)";
 
 const DEFAULT_TRACE_FILTER: &str = "off";
 const VERBOSE_TRACE_FILTER: &str = "info";
@@ -1010,16 +1011,39 @@ fn imply_run_resume_last(args: &mut Vec<std::ffi::OsString>, run_index: usize) {
 }
 
 /// Read piped stdin content and prepend it to the prompt as context.
-fn prepend_stdin_blob_context(prompt: String) -> String {
+///
+/// `auto` treats a stdin whose input has not started within
+/// [`stdin_blob::AUTO_GRACE`] as absent and continues without it (an open,
+/// silent stdin, as some launchers pass, would otherwise block the run
+/// forever). `blob` waits for end of file.
+fn prepend_stdin_blob_context(prompt: String, mode: StdinMode) -> String {
     use std::io::IsTerminal;
     if std::io::stdin().is_terminal() {
         return prompt;
     }
-    let mut stdin_content = String::new();
-    if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut stdin_content) {
-        eprintln!("Warning: failed to read stdin: {e}");
-        return prompt;
-    }
+    let wait = match mode {
+        StdinMode::Blob => stdin_blob::Wait::UntilEof {
+            notice_after: stdin_blob::AUTO_GRACE,
+        },
+        _ => stdin_blob::Wait::StartWithin(stdin_blob::AUTO_GRACE),
+    };
+    let notice = || {
+        eprintln!("Waiting for stdin to reach end of file (--stdin blob).");
+    };
+    let stdin_content = match stdin_blob::read_blob(std::io::stdin(), wait, notice) {
+        stdin_blob::Outcome::Read(content) => content,
+        stdin_blob::Outcome::NotStarted => {
+            eprintln!(
+                "Warning: stdin is not a terminal and no input arrived within {} s; continuing without it. Use --stdin blob to wait for piped input, or --stdin off to ignore stdin.",
+                stdin_blob::AUTO_GRACE.as_secs()
+            );
+            return prompt;
+        }
+        stdin_blob::Outcome::Failed(error) => {
+            eprintln!("Warning: failed to read stdin: {error}");
+            return prompt;
+        }
+    };
     let stdin_content = stdin_content.trim();
     if stdin_content.is_empty() {
         return prompt;
@@ -2134,7 +2158,9 @@ enum Commands {
         )]
         agent_labels: Vec<(String, String)>,
 
-        /// How stdin should be handled
+        /// How stdin should be handled. `auto` prepends piped input that
+        /// starts within 2 s and otherwise continues without stdin; `blob`
+        /// waits for end of file; `lines` streams lines; `off` ignores stdin.
         #[arg(
             long,
             value_enum,
@@ -4979,7 +5005,7 @@ async fn handle_run_command(
     };
     prompt = expand_user_prompt_file_mentions(prompt, &prompt_file_base).await?;
     if matches!(stdin, StdinMode::Blob | StdinMode::Auto) {
-        prompt = prepend_stdin_blob_context(prompt);
+        prompt = prepend_stdin_blob_context(prompt, stdin);
     }
     if let Some(request) = &html_output_request {
         append_html_output_instruction(&mut prompt, request);
@@ -15116,7 +15142,7 @@ async fn resume_session(
     };
     prompt = expand_user_prompt_file_mentions(prompt, &prompt_file_base).await?;
     if matches!(stdin, StdinMode::Blob | StdinMode::Auto) {
-        prompt = prepend_stdin_blob_context(prompt);
+        prompt = prepend_stdin_blob_context(prompt, stdin);
     }
     resume_session_with_llm_override(
         session_id,
