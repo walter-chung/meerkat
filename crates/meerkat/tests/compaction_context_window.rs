@@ -865,7 +865,11 @@ mod tests {
     /// stays under the threshold: without the persisted anchor nothing fired
     /// and the provider refused the restored agent's first request. With it
     /// the earlier rows fold first, the prompt stays verbatim and the run
-    /// completes.
+    /// completes. A compaction at a run's first boundary is written from the
+    /// whole transcript, the new prompt included, so its summary request
+    /// carries what the unprojected request would have: past the window by
+    /// this row's construction, it is refused, and the summary is the
+    /// mechanical one. The run's own request is sent once, after it, and fits.
     #[tokio::test]
     async fn a_restored_agent_projects_its_first_request_from_the_persisted_anchor() {
         const RESTORED_WINDOW: u64 = 120_000;
@@ -933,8 +937,13 @@ mod tests {
             "the restored agent compacts before its first request: {seen:?}"
         );
         assert!(
-            !seen.iter().any(|seen| seen.refused),
-            "nothing is refused: {seen:?}"
+            !seen.iter().any(|seen| seen.refused && !seen.summary),
+            "no request of the run itself is refused: {seen:?}"
+        );
+        assert_eq!(
+            seen.iter().filter(|seen| !seen.summary).count(),
+            1,
+            "the run's own request is sent once: {seen:?}"
         );
         let session = committed(&service, &session_id).await;
         assert!(has_compaction_summary(&session), "the compaction committed");
