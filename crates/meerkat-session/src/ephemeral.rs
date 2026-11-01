@@ -2927,8 +2927,7 @@ impl SessionHandle {
 
 /// The runtime a session task runs on: the runtime that created the session,
 /// an embedding host's for a member's or a hosted session's actor. It is kept
-/// to tell, when the task stops taking commands, whether that runtime stopped
-/// and took the task with it (see
+/// to tell whether that runtime has stopped, which ends the task (see
 /// `EphemeralSessionService::session_task_ended_with_its_runtime`).
 #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
 struct SessionTaskRuntime {
@@ -2944,9 +2943,11 @@ impl SessionTaskRuntime {
         }
     }
 
-    /// Whether this runtime has shut down. A runtime that is shutting down
-    /// cancels every task spawned on it before `spawn` returns, so the probe
-    /// answers at once; a live runtime has not run the probe yet, or ran it.
+    /// Whether this runtime has begun to shut down. A runtime's shutdown
+    /// closes its task list before it drops any of the tasks it held, and
+    /// from then on it cancels every task spawned on it before `spawn`
+    /// returns, so the probe answers at once; a live runtime has not run the
+    /// probe yet, or ran it.
     fn has_stopped(&self) -> bool {
         use futures::FutureExt as _;
         self.handle.as_ref().is_some_and(|handle| {
@@ -5368,17 +5369,27 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
 
     /// Whether `id`'s session task ended because the runtime it ran on
     /// stopped: the actor this service still holds for the session (not
-    /// retired or replaced) takes no commands, and its runtime has shut
-    /// down. That runtime is the one that created the session, an embedding
+    /// retired or replaced) runs on a runtime that has begun to shut down.
+    /// That runtime is the one that created the session, an embedding
     /// host's for a member's or a hosted session's actor. A task that
     /// panicked, or that this service retired, ended some other way.
+    ///
+    /// The runtime's stop alone decides it: a runtime that has begun to shut
+    /// down drops every task it holds, the session's included, so the task
+    /// has ended or is ending. Whether its command channel has closed yet is
+    /// not asked. The stopping runtime drops the task's future in pieces,
+    /// and a turn's result sender goes before the task's command receiver,
+    /// so the runtime loop serving the session, which outlives the host's
+    /// runtime, can see the turn's result channel closed while the command
+    /// channel is still open. A check that also required the closed command
+    /// channel would answer `false` there, and the loop would take the failed
+    /// turn's own path (a discarded provisional tail and replayed inputs, or
+    /// an executor stop for a resumed run) after the host's runtime stopped.
     #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
     pub(crate) async fn session_task_ended_with_its_runtime(&self, id: &SessionId) -> bool {
         self.sessions
             .with_handle(id, |handle| {
-                handle.actor_witness.is_live()
-                    && handle.command_tx.is_closed()
-                    && handle.actor_runtime.has_stopped()
+                handle.actor_witness.is_live() && handle.actor_runtime.has_stopped()
             })
             .await
             .unwrap_or(false)
@@ -15280,7 +15291,13 @@ mod archive_shutdown_drain_tests {
         /// transition between admitted preflight and begin.
         yank_shutdown_before_begin: Arc<AtomicBool>,
         turn_admission: Arc<std::sync::Mutex<Option<Arc<std::sync::Mutex<TurnAdmissionSlot>>>>>,
+        /// What the next run holds for as long as its future lives, so a row
+        /// can act when that run is dropped.
+        run_held: Arc<std::sync::Mutex<Option<RunHeld>>>,
     }
+
+    /// An object a probe run holds (see `DrainProbeHooks::run_held`).
+    type RunHeld = Box<dyn std::any::Any + Send>;
 
     impl DrainProbeHooks {
         fn new() -> Self {
@@ -15292,7 +15309,16 @@ mod archive_shutdown_drain_tests {
                 actor_dropped: Arc::new(tokio::sync::Notify::new()),
                 yank_shutdown_before_begin: Arc::new(AtomicBool::new(false)),
                 turn_admission: Arc::new(std::sync::Mutex::new(None)),
+                run_held: Arc::new(std::sync::Mutex::new(None)),
             }
+        }
+
+        /// What the next run holds, taken by that run.
+        fn take_run_held(&self) -> Option<RunHeld> {
+            self.run_held
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
         }
 
         async fn install_turn_admission<B: SessionAgentBuilder + 'static>(
@@ -15357,6 +15383,7 @@ mod archive_shutdown_drain_tests {
             _prompt: ContentInput,
             _event_tx: mpsc::Sender<AgentEvent>,
         ) -> Result<RunResult, AgentError> {
+            let _held = self.hooks.take_run_held();
             self.hooks.entered_run.notify_one();
             self.hooks
                 .release_run
@@ -16211,6 +16238,102 @@ mod archive_shutdown_drain_tests {
 
         let shutdown_output: () = service.shutdown().await;
         assert_eq!(shutdown_output, ());
+    }
+
+    /// A host's runtime that stops while a session's turn is in flight takes
+    /// the session task with it. The runtime loop serving the session runs on
+    /// a runtime that outlives the host's, and before it writes anything for
+    /// the turn it asks whether the task ended with its runtime. The stopping
+    /// runtime closes its task list first, then drops each task's future in
+    /// pieces: the turn's result sender goes before the task's command
+    /// receiver. Here the probe run holds that drop part way, after the
+    /// runtime closed and before the command receiver goes, and the task is
+    /// asked there, then again once the drop has finished. Both times it has
+    /// ended with its runtime: a stopped runtime runs nothing more of it.
+    #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+    #[test]
+    fn a_session_task_ended_with_its_runtime_while_the_runtime_still_drops_it() {
+        // Reports that the run is being dropped, then holds the dropping
+        // thread until the row releases it, for at most the waiter bound so
+        // a red row cannot hold the stopping runtime for good.
+        struct HeldDrop {
+            dropping: std::sync::mpsc::Sender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+
+        impl Drop for HeldDrop {
+            fn drop(&mut self) {
+                let _ = self.dropping.send(());
+                let _ = self.release.recv_timeout(WAITER_TIMEOUT);
+            }
+        }
+
+        // The host's runtime, which creates the session and so runs its
+        // task, and another runtime of the process, which outlives it.
+        let host = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("the host's runtime");
+        let process = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("the process's runtime");
+        let hooks = DrainProbeHooks::new();
+        let service = Arc::new(EphemeralSessionService::new(
+            DrainProbeBuilder {
+                hooks: hooks.clone(),
+            },
+            1,
+        ));
+        let session_id = host
+            .block_on(service.create_session(create_request()))
+            .expect("create the session on the host's runtime")
+            .session_id;
+        let (dropping_tx, dropping_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let held: RunHeld = Box::new(HeldDrop {
+            dropping: dropping_tx,
+            release: release_rx,
+        });
+        *hooks
+            .run_held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(held);
+        let turn = {
+            let service = Arc::clone(&service);
+            let session_id = session_id.clone();
+            process
+                .spawn(async move { service.start_turn(&session_id, start_turn_request()).await })
+        };
+        process.block_on(async {
+            tokio::time::timeout(WAITER_TIMEOUT, hooks.entered_run.notified())
+                .await
+                .expect("the turn enters the held run");
+        });
+
+        let stopping = std::thread::spawn(move || host.shutdown_timeout(WAITER_TIMEOUT));
+        dropping_rx
+            .recv_timeout(WAITER_TIMEOUT)
+            .expect("the stopping runtime drops the session task's run");
+        let while_dropping =
+            process.block_on(service.session_task_ended_with_its_runtime(&session_id));
+        drop(release_tx);
+        stopping.join().expect("the host's runtime stops");
+        let once_dropped =
+            process.block_on(service.session_task_ended_with_its_runtime(&session_id));
+        let turn_result =
+            process.block_on(async move { tokio::time::timeout(WAITER_TIMEOUT, turn).await });
+        let turn_lost_its_result = matches!(turn_result, Ok(Ok(Err(_))));
+
+        assert_eq!(
+            (while_dropping, once_dropped, turn_lost_its_result),
+            (true, true, true),
+            "a session task whose runtime stopped has ended with that runtime while the \
+             runtime still drops it, before its command receiver goes, as after; the \
+             turn's caller lost its result"
+        );
     }
 }
 
