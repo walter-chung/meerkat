@@ -526,6 +526,18 @@ them.
 
 ### Fixed
 
+- `meerkat-openai`: on the GitHub Copilot Responses route, a response with
+  two or more reasoning or message items that are identical apart from their
+  ids and ciphertext (for example reasoning without a summary) no longer
+  fails with "no one-to-one match for re-identified completed reasoning
+  item". Copilot re-identifies completed items in the terminal response,
+  and each completed item had to match exactly one terminal item, which
+  identical items cannot. Such items are now matched as a group when both
+  sides have the same count, each terminal item keeping its own id and
+  ciphertext for replay. A group with more or fewer terminal items than
+  completed ones is still refused, and distinguishable items are still
+  matched by content, never by position.
+
 - `meerkat-session`: a turn in flight when an embedding host's runtime stops
   is now treated as ended with that runtime. The check a runtime loop uses
   for this (`session_task_ended_with_its_runtime`) also required the session
